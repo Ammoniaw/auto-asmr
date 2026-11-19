@@ -1,7 +1,7 @@
-//! 人声预处理：噪声门（响应阈值）、输入降噪（RNNoise）、去齿音、轻声化。都不改变嗓音本身。
+//! 人声预处理：噪声门（响应阈值）、输入降噪（RNNoise）、去齿音、轻声化、贴耳气声。都不改变嗓音本身。
 
-use super::filters::{ema_coef, interp_log, minphase_from_mag, Biquad, BUTTER_Q};
-use super::{db_to_lin, FS};
+use super::filters::{ema_coef, interp_log, minphase_from_mag, Biquad, OnePoleLp, BUTTER_Q};
+use super::{db_to_lin, CTRL_DT, FS};
 use nnnoiseless::DenoiseState;
 
 const DT: f32 = 1.0 / FS;
@@ -177,10 +177,13 @@ const EAR_EQ_DB: [f32; 9] = [0.0, 0.0, -1.5, -4.0, -5.0, -5.5, -4.0, -3.0, -3.0]
 
 pub const EAR_EQ_TAPS: usize = 64;
 
-/// 贴耳时近耳的均衡（最小相位 FIR，64 点）：临场感（3.5 kHz）+ 空气感（9 kHz 以上）−"暗"（5 kHz）。
-/// 全为 0 时返回 None。
-pub fn ear_eq_fir(presence_db: f32, dark_db: f32, ku100_eq: bool) -> Option<Vec<f32>> {
-    if presence_db == 0.0 && dark_db == 0.0 && !ku100_eq {
+/// 耳甲腔深度共振的频率（Shaw 1979：堵住耳道口时 4.3 kHz，各个方向来的声音都能激发）。
+pub const CONCHA_F: f32 = 4300.0;
+
+/// 贴耳时近耳的均衡（最小相位 FIR，64 点）：临场感（3.5 kHz）+ 空气感（9 kHz 以上）−"暗"（5 kHz）
+/// + 耳甲共鸣（4.3 kHz，约 0.8 倍频程宽）。全为 0 时返回 None。
+pub fn ear_eq_fir(presence_db: f32, dark_db: f32, ku100_eq: bool, concha_db: f32) -> Option<Vec<f32>> {
+    if presence_db == 0.0 && dark_db == 0.0 && !ku100_eq && concha_db == 0.0 {
         return None;
     }
     let nfft = 512;
@@ -190,16 +193,239 @@ pub fn ear_eq_fir(presence_db: f32, dark_db: f32, ku100_eq: bool) -> Option<Vec<
             let mut d = if ku100_eq { interp_log(f, &EAR_EQ_F, &EAR_EQ_DB) } else { 0.0 };
             d += presence_db * (-0.5 * ((f / 3500.0).log2() / 0.7).powi(2)).exp() + 0.7 * presence_db / (1.0 + (9000.0 / f).powi(2));
             d -= dark_db * (-0.5 * ((f / 5000.0).log2() / 0.6).powi(2)).exp();
+            d += concha_db * (-0.5 * ((f / CONCHA_F).log2() / 0.33).powi(2)).exp();
             db_to_lin(d)
         })
         .collect();
     Some(minphase_from_mag(&mag, nfft, EAR_EQ_TAPS))
 }
 
+/// 气流脉冲的标定增益（`puff` = 1 时）。
+pub const PUFF_K: f32 = 1.5;
+/// 气声带下限：F3 以上送气噪声取代谐波（Klatt & Klatt 1990）。
+pub const BREATH_FC: f32 = 2500.0;
+
+/// 贴耳气声（与 Python 版 `breath_fx` 相同）：嘴贴近耳朵时把嗓音自己的气声提上来，并加上气流扑到耳朵上的低频脉冲。
+/// 两样都只用嗓音里已有的送气声，不生成任何噪声、不改变嗓音；离开耳边时都为 0。
+///
+/// * 气声增强：气声带 = 2.5 kHz 以上。只把"轻"的部分提上来（频带内向上压缩）：电平比响的齿音低 16 dB 以上的
+///   送气声 / 气息 / 轻辅音提得最多，接近齿音电平的不提，低到底噪附近（低 36–48 dB）的也不提。
+/// * 气流扑耳：气声带瞬时功率在 50–130 Hz 的起伏（除以功率的平方根，幅度与气声成正比），幅度跟着人声的电平走，
+///   送气越强脉冲越强，爆破音开头最明显。加在直达声的输入上，由近场 HRIR 送到贴着的那只耳朵。
+///
+/// 电平每个控制块（1.33 ms）检测一次，下一个控制块生效，没有额外延时。
+pub struct BreathFx {
+    hp: Biquad,
+    s_lp: OnePoleLp,
+    w_hp: Biquad,
+    w_lp: [Biquad; 2],
+    acc_b: f64,
+    acc_x: f64,
+    n: usize,
+    env: f64,
+    lref: f64,
+    envx: f64,
+    vref: f64,
+    /// 当前可用的提升比例（0–1）。
+    g: f32,
+    /// "响的齿音"的功率、"响的人声"的幅度。
+    pref: f32,
+    vamp: f32,
+    lift: (f32, f32),
+    puff: (f32, f32),
+    primed: bool,
+}
+
+/// "响的"电平跟踪的初值（dBFS）：从很低开始，听到第一个响的音就跟上去，与输入音量无关。
+const BREATH_REF0: f64 = -90.0;
+
+impl BreathFx {
+    pub fn new() -> Self {
+        BreathFx {
+            hp: Biquad::highpass(BREATH_FC, BUTTER_Q),
+            s_lp: OnePoleLp::new(30.0),
+            w_hp: Biquad::highpass(50.0, BUTTER_Q),
+            w_lp: [Biquad::lowpass(130.0, BUTTER_Q); 2],
+            acc_b: 0.0,
+            acc_x: 0.0,
+            n: 0,
+            env: 0.0,
+            lref: BREATH_REF0,
+            envx: 0.0,
+            vref: BREATH_REF0,
+            g: 0.0,
+            pref: 10f64.powf(BREATH_REF0 / 10.0) as f32,
+            vamp: 10f64.powf(BREATH_REF0 / 20.0) as f32,
+            lift: (0.0, 0.0),
+            puff: (0.0, 0.0),
+            primed: false,
+        }
+    }
+
+    /// 控制块开始：`cl` = 块末尾的贴耳程度（0–1），算出这一块里气声增益和气流增益走到哪里。
+    pub fn begin_block(&mut self, cl: f32, lift_db: f32, puff: f32) {
+        let t = if lift_db > 0.0 { cl * (db_to_lin(lift_db * self.g) - 1.0) } else { 0.0 };
+        let u = PUFF_K * puff.max(0.0) * cl;
+        if self.primed {
+            self.lift = (self.lift.1, t);
+            self.puff = (self.puff.1, u);
+        } else {
+            self.lift = (t, t);
+            self.puff = (u, u);
+            self.primed = true;
+        }
+    }
+
+    /// 处理一个样本：`a` = 人声，`wp` = 在控制块里的进度（0–1）。返回（加强后的人声，气流脉冲）。
+    #[inline]
+    pub fn process(&mut self, a: f32, wp: f32) -> (f32, f32) {
+        let b = self.hp.process(a);
+        let q = b * b;
+        self.acc_b += q as f64;
+        self.acc_x += (a * a) as f64;
+        self.n += 1;
+        let y = a + (self.lift.0 + (self.lift.1 - self.lift.0) * wp) * b;
+        let s = self.s_lp.process(q).max(0.0);
+        let w = self.w_hp.process(q);
+        let w = self.w_lp[0].process(w);
+        let w = self.w_lp[1].process(w);
+        let gp = self.puff.0 + (self.puff.1 - self.puff.0) * wp;
+        if gp <= 0.0 {
+            return (y, 0.0);
+        }
+        // 气声功率的低频起伏 / 功率的平方根 = 与气声幅度成正比；再除以响的齿音幅度，得到与音色明暗无关的量
+        let raw = w / ((s + 1e-3 * self.pref) * self.pref + 1e-30).sqrt();
+        (y, gp * self.vamp * raw.tanh())
+    }
+
+    /// 控制块结束：用这一块的均方更新电平、"响的"电平和提升比例。
+    pub fn end_block(&mut self) {
+        if self.n == 0 {
+            return;
+        }
+        let dt = CTRL_DT as f64 * self.n as f64 / super::CTRL as f64;
+        let (ca, cr) = (1.0 - (-dt / 0.003).exp(), 1.0 - (-dt / 0.03).exp());
+        // "响的"电平：50 ms 跟上去；有声音时每秒落 0.5 dB，静下来（低 30 dB 以上）就保持
+        let (cu, down) = (1.0 - (-dt / 0.05).exp(), 0.5 * dt);
+        let m = self.acc_b / self.n as f64;
+        self.env += (if m > self.env { ca } else { cr }) * (m - self.env);
+        let lb = 10.0 * (self.env + 1e-12).log10();
+        self.lref = if lb > self.lref {
+            self.lref + cu * (lb - self.lref)
+        } else if lb > self.lref - 30.0 {
+            self.lref - down
+        } else {
+            self.lref
+        };
+        let m = self.acc_x / self.n as f64;
+        self.envx += (if m > self.envx { ca } else { cr }) * (m - self.envx);
+        let lx = 10.0 * (self.envx + 1e-12).log10();
+        self.vref = if lx > self.vref {
+            self.vref + cu * (lx - self.vref)
+        } else if lx > self.vref - 30.0 {
+            self.vref - down
+        } else {
+            self.vref
+        };
+        let d = self.lref - lb;
+        let u = ((d - 4.0) / 12.0).clamp(0.0, 1.0);
+        let v = ((d - 36.0) / 12.0).clamp(0.0, 1.0);
+        self.g = (u * u * (3.0 - 2.0 * u) * (1.0 - v * v * (3.0 - 2.0 * v))) as f32;
+        self.pref = 10f64.powf(self.lref / 10.0) as f32;
+        self.vamp = 10f64.powf(self.vref / 20.0) as f32;
+        self.acc_b = 0.0;
+        self.acc_x = 0.0;
+        self.n = 0;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::dsp::filters::fir_mag;
+
+    /// 耳甲共鸣：4.3 kHz 处约 +4 dB，1 kHz 和 12 kHz 基本不动。
+    #[test]
+    fn concha_peak() {
+        let h = ear_eq_fir(0.0, 0.0, false, 4.0).unwrap();
+        let m = fir_mag(&h, 4096);
+        let db = |f: f32| 20.0 * m[(f / FS * 4096.0).round() as usize].log10();
+        assert!((db(4300.0) - 4.0).abs() < 0.4, "4.3 kHz {}", db(4300.0));
+        assert!(db(1000.0).abs() < 0.4 && db(12000.0).abs() < 0.4, "1k {} 12k {}", db(1000.0), db(12000.0));
+    }
+
+    /// 跑一段信号：返回（提升后 2.5 kHz 以上相对原来的增益 dB，气流脉冲有效值相对输入有效值 dB）。
+    fn run_breath(x: &[f32], cl: f32, lift_db: f32, puff: f32, skip: usize) -> (f32, f32) {
+        let mut fx = BreathFx::new();
+        let mut hp_in = Biquad::highpass(BREATH_FC, BUTTER_Q);
+        let mut hp_out = Biquad::highpass(BREATH_FC, BUTTER_Q);
+        let (mut ei, mut eo, mut ep, mut ex) = (0f64, 0f64, 0f64, 0f64);
+        for (k, blk) in x.chunks(super::super::CTRL).enumerate() {
+            fx.begin_block(cl, lift_db, puff);
+            for (i, &a) in blk.iter().enumerate() {
+                let (y, p) = fx.process(a, i as f32 / super::super::CTRL as f32);
+                let (bi, bo) = (hp_in.process(a), hp_out.process(y));
+                if k * super::super::CTRL + i >= skip {
+                    ei += (bi * bi) as f64;
+                    eo += (bo * bo) as f64;
+                    ep += (p * p) as f64;
+                    ex += (a * a) as f64;
+                }
+            }
+            fx.end_block();
+        }
+        ((10.0 * (eo / ei.max(1e-30)).log10()) as f32, (10.0 * (ep / ex.max(1e-30)).log10()) as f32)
+    }
+
+    /// 气声增强：响的齿音不提，比它低 20 dB 的气声提到接近设定值，离开耳边（贴耳程度 0）时不动，底噪不提。
+    #[test]
+    fn breath_lift_only_soft() {
+        let n = FS as usize * 4;
+        let loud = noise(n, -20.0, true);
+        // 前 2 s 响（让"响的齿音"电平跟上去），后 2 s 低 20 dB / 低 60 dB；从变轻 0.6 s 后开始量
+        let mk = |drop_db: f32| -> Vec<f32> { loud.iter().enumerate().map(|(i, &v)| if i < n / 2 { v } else { v * db_to_lin(-drop_db) }).collect() };
+        let half = n / 2 + FS as usize * 6 / 10;
+        let (g_loud, _) = run_breath(&loud, 1.0, 6.0, 0.0, half);
+        let (g_soft, _) = run_breath(&mk(20.0), 1.0, 6.0, 0.0, half);
+        let (g_floor, _) = run_breath(&mk(60.0), 1.0, 6.0, 0.0, half);
+        let (g_away, _) = run_breath(&mk(20.0), 0.0, 6.0, 0.0, half);
+        assert!(g_loud.abs() < 0.5, "响的不提：{g_loud}");
+        assert!(g_soft > 4.5 && g_soft < 6.2, "轻的提到接近 6 dB：{g_soft}");
+        assert!(g_floor.abs() < 0.5, "底噪不提：{g_floor}");
+        assert!(g_away.abs() < 1e-3, "离开耳边不动：{g_away}");
+    }
+
+    /// 气流扑耳：能量集中在 50–130 Hz，强度随 puff 线性变化，离开耳边时为 0。
+    #[test]
+    fn puff_is_low_frequency() {
+        let n = FS as usize * 2;
+        // 每 0.25 s 一段 60 ms 的"送气"噪声
+        let x: Vec<f32> = noise(n, -20.0, true).iter().enumerate().map(|(i, &v)| if i % 12000 < 2880 { v } else { 0.0 }).collect();
+        let mut fx = BreathFx::new();
+        let (mut lo, mut hi) = (Biquad::lowpass(200.0, BUTTER_Q), Biquad::highpass(400.0, BUTTER_Q));
+        let (mut e_all, mut e_lo, mut e_hi) = (0f64, 0f64, 0f64);
+        for blk in x.chunks(super::super::CTRL) {
+            fx.begin_block(1.0, 0.0, 1.0);
+            for (i, &a) in blk.iter().enumerate() {
+                let (y, p) = fx.process(a, i as f32 / super::super::CTRL as f32);
+                assert_eq!(y, a, "不开气声增强时人声不变");
+                let (l, h) = (lo.process(p), hi.process(p));
+                e_all += (p * p) as f64;
+                e_lo += (l * l) as f64;
+                e_hi += (h * h) as f64;
+            }
+            fx.end_block();
+        }
+        assert!(e_all > 0.0);
+        assert!(e_lo / e_all > 0.8, "200 Hz 以下占 {}", e_lo / e_all);
+        assert!(e_hi / e_all < 0.01, "400 Hz 以上占 {}", e_hi / e_all);
+        let (_, p1) = run_breath(&x, 1.0, 0.0, 1.0, 0);
+        let (_, p2) = run_breath(&x, 1.0, 0.0, 2.0, 0);
+        let (_, p0) = run_breath(&x, 0.0, 0.0, 1.0, 0);
+        assert!((p2 - p1 - 6.02).abs() < 0.1, "puff 加倍 +6 dB：{}", p2 - p1);
+        assert!(p1 > -30.0 && p1 < 0.0, "脉冲电平相对输入 {p1} dB");
+        assert!(p0 < -200.0, "离开耳边没有脉冲：{p0}");
+    }
 
     #[test]
     fn soft_voice_shape() {

@@ -9,7 +9,7 @@ use super::motion::{clock_step, clock_step_live, Motion, Pose};
 use super::params::{Params, Playback};
 use super::room::{conv_energy, Room};
 use super::tables::{tables, Hrir, Tables};
-use super::voice::{ear_eq_fir, soft_voice_fir, DeEsser, Denoiser, Gate, DENOISE_DELAY, EAR_EQ_TAPS};
+use super::voice::{ear_eq_fir, soft_voice_fir, BreathFx, DeEsser, Denoiser, Gate, DENOISE_DELAY, EAR_EQ_TAPS};
 use super::{db_to_lin, lin_to_db, C, CTRL, CTRL_DT, EAR_R, FS, NTAP, R_MAX, R_MIN};
 use std::sync::Arc;
 
@@ -42,10 +42,10 @@ impl EngineConfig {
         let pd = prev.map(|c| &c.derived);
         let same = |f: &dyn Fn(&Params) -> bool| pp.map_or(false, f);
 
-        let ear_eq = if same(&|q| q.presence_db == params.presence_db && q.dark_db == params.dark_db && q.ku100_eq == params.ku100_eq) {
+        let ear_eq = if same(&|q| q.presence_db == params.presence_db && q.dark_db == params.dark_db && q.ku100_eq == params.ku100_eq && q.concha_db == params.concha_db) {
             pd.unwrap().ear_eq.clone()
         } else {
-            ear_eq_fir(params.presence_db, params.dark_db, params.ku100_eq).map(Arc::new)
+            ear_eq_fir(params.presence_db, params.dark_db, params.ku100_eq, params.concha_db).map(Arc::new)
         };
         let soft = if same(&|q| q.soft_voice == params.soft_voice) {
             pd.unwrap().soft.clone()
@@ -149,6 +149,7 @@ pub struct Engine {
     la_buf: Vec<f32>,
     la_pos: usize,
     warm_lp: OnePoleLp,
+    breath: BreathFx,
     direct: DirectRenderer,
     room: Room,
     lf: [EarLf; 2],
@@ -207,6 +208,7 @@ impl Engine {
             la_buf: vec![0.0; la],
             la_pos: 0,
             warm_lp: OnePoleLp::new(220.0),
+            breath: BreathFx::new(),
             direct: DirectRenderer::new(),
             room: Room::new(tables()),
             lf: [EarLf::new(), EarLf::new()],
@@ -377,6 +379,9 @@ impl Engine {
         let d = [rc / C * FS + self.hr.tau[0] + BASE_DELAY, rc / C * FS + self.hr.tau[1] + BASE_DELAY];
         self.direct.set_target(&self.hr.h, d);
 
+        // 贴耳气声：气声增强 + 气流扑耳，随贴耳程度渐入
+        self.breath.begin_block(cl, p.breath_db, p.puff);
+
         // 近讲温暖感（两耳共同）、贴耳低频（近耳加、远耳减）
         let prox = ((0.6 - pose.r) / (0.6 - 0.13)).clamp(0.0, 1.0);
         let warm = if p.warmth_db > 0.0 { db_to_lin(p.warmth_db * prox) - 1.0 } else { 0.0 };
@@ -430,6 +435,7 @@ impl Engine {
             self.phase += m;
             if self.phase == CTRL {
                 self.analyzer.end_block();
+                self.breath.end_block();
                 self.phase = 0;
             }
             i += m;
@@ -443,6 +449,7 @@ impl Engine {
         let ph = self.phase;
         let la = self.la_buf.len();
         let dn_mix = p.denoise_mix();
+        let breath_on = p.breath_db > 0.0 || p.puff > 0.0;
         for i in 0..m {
             let x = input[i];
             self.in_pk = self.in_pk.max(x.abs());
@@ -473,7 +480,13 @@ impl Engine {
             self.room_dl_pos = (self.room_dl_pos + 1) % ROOM_DELAY;
             let wp = (ph + i) as f32 / CTRL as f32;
             let gb = self.warm.0 + (self.warm.1 - self.warm.0) * wp;
-            self.xd[i] = a + gb * self.warm_lp.process(a);
+            self.xd[i] = if breath_on {
+                // 只作用于直达声；房间声仍用原来的人声
+                let (ab, pf) = self.breath.process(a, wp);
+                ab + gb * self.warm_lp.process(ab) + pf
+            } else {
+                a + gb * self.warm_lp.process(a)
+            };
         }
         self.direct.process(&self.xd[..m], ph, &mut self.dl[..m], &mut self.dr[..m]);
         if p.ear_warmth_db > 0.0 || p.far_lf_cut_db > 0.0 {

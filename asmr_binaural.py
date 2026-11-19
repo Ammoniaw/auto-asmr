@@ -21,6 +21,8 @@
   * 人头麦贴耳感（默认 ear 风格）：嘴离耳朵约 1.7 cm，远耳额外压低 32 dB，近耳低频更厚、
     临场感更强；离开耳边时平滑恢复。--style ku100 改为按两段 KU100 实录标定（远耳听得到、
     离耳约 6 cm、真实房间）。不改变原来的嗓音，也不添加任何底噪或呼吸声。
+  * 贴耳气声（默认开启）：贴耳时把嗓音里轻的送气声提上来（--breath），加上气流扑到耳朵上的
+    低频脉冲（--puff，由嗓音自己的送气声导出），并补上近耳 4.3 kHz 的耳甲共鸣（--concha）。
   * 房间（可选）：TH Köln 用同一个 KU100 实测的真实房间，或镜像声源法的合成房间。
   * KU100 公共扩散场均衡（CDFC），然后按 BS.1770 响度归一化。
 
@@ -103,6 +105,11 @@ ANSI_RAISED = (33.81, 33.92, 38.98, 38.57, 39.11, 40.15, 38.78, 36.37, 33.86, 31
 # 以下频谱形状取自 B 站 KU100 贴耳录音的实测（见 README「KU100 实测」），单位 dB
 EAR_EQ_F = (500, 2000, 4000, 6000, 8000, 10000, 12500, 16000, 22000)
 EAR_EQ_DB = (0.0, 0.0, -1.5, -4.0, -5.0, -5.5, -4.0, -3.0, -3.0)              # 近耳音色校正（对齐 KU100 近耳/居中差）
+CONCHA_F = 4300.0          # 耳甲腔深度共振（Shaw 1979：堵住耳道口时 4.3 kHz，各个方向来的声音都能激发）
+BREATH_FC = 2500.0         # 气声带下限：F3 以上送气噪声取代谐波（Klatt & Klatt 1990）
+BREATH_HOP = 64            # 气声电平检测的块长（1.33 ms，与 Rust 版的控制块相同）
+BREATH_REF0 = -90.0        # "响的"电平跟踪的初值（dBFS）：从很低开始，听到第一个响的音就跟上去，与输入音量无关
+PUFF_K = 1.5               # 气流脉冲的标定增益（--puff 1 时）
 
 # 语句模式的落点：(方位角范围, 距离范围)，右侧定义，左侧镜像
 # 风格预设：ear=贴耳加强（默认，远耳额外压低，嘴离耳约 1.7 cm）；
@@ -513,7 +520,8 @@ def frac_delay(x: np.ndarray, idx: np.ndarray, d: np.ndarray, up: int = 4, pad: 
 
 
 def ear_intimacy(h_b: np.ndarray, az_b: np.ndarray, r_b: np.ndarray, iso_db: float, presence_db: float,
-                 ear_eq: bool = True, dark_db: float = 0.0, el_b: np.ndarray | None = None) -> None:
+                 ear_eq: bool = True, dark_db: float = 0.0, el_b: np.ndarray | None = None,
+                 concha_db: float = 0.0) -> None:
     """人头麦贴耳感（原地修改 h_b）：嘴贴近一侧耳朵时，近耳加临场 / 空气感，远耳额外压低（单耳独占）；
     离开耳边、转到脸前时按距离和侧向程度平滑恢复。"""
     p = closeness(az_b, r_b, el_b)
@@ -523,11 +531,12 @@ def ear_intimacy(h_b: np.ndarray, az_b: np.ndarray, r_b: np.ndarray, iso_db: flo
     k = np.arange(len(h_b))
     if iso_db > 0:
         h_b[k, 1 - ipsi] *= (10 ** (-iso_db * p / 20))[:, None].astype(np.float32)
-    if ear_eq or presence_db != 0 or dark_db != 0:
+    if ear_eq or presence_db != 0 or dark_db != 0 or concha_db != 0:
         fz = np.maximum(np.fft.rfftfreq(NFFT_BLK, 1 / FS), 1.0)
         d = np.interp(np.log(fz), np.log(EAR_EQ_F), EAR_EQ_DB) if ear_eq else np.zeros_like(fz)  # KU100 实测近耳校正
         d = d + presence_db * np.exp(-0.5 * (np.log2(fz / 3500) / 0.7) ** 2) + 0.7 * presence_db / (1 + (9000 / fz) ** 2)
         d = d - dark_db * np.exp(-0.5 * (np.log2(fz / 5000) / 0.6) ** 2)   # "暗"：5 kHz 附近压低（Terashima 2024）
+        d = d + concha_db * np.exp(-0.5 * (np.log2(fz / CONCHA_F) / 0.33) ** 2)   # 耳甲共鸣（约 0.8 倍频程宽）
         eq = np.fft.rfft(minphase_from_mag(10 ** (d / 20), NFFT_BLK, 64), NFFT_BLK)
         fade = np.ones(NTAP, np.float32)
         fade[-16:] = 0.5 * (1 + np.cos(np.linspace(0, np.pi, 16)))
@@ -584,67 +593,93 @@ def soften_voice(x: np.ndarray, amount: float) -> np.ndarray:
     return signal.oaconvolve(x, fir)[:len(x)].astype(np.float32)
 
 
-def detect_bursts(x: np.ndarray):
-    """找送气爆破音（p/t/k/q/ch/c）：成阻的静默（约 20 ms）之后 1.5–8 kHz 能量突然跳起、且以高频为主。
-    返回 [(样本位置, 强度)]，强度为随后 40 ms 送气段能量相对典型值的比例。"""
-    from scipy.ndimage import maximum_filter1d
-    hop = int(0.005 * FS)
-    n = len(x) // hop
-    if n < 20:
-        return []
-    hf = signal.sosfilt(signal.butter(4, [1500, 8000], "band", fs=FS, output="sos"), x)
-    lf = signal.sosfilt(signal.butter(4, [100, 1000], "band", fs=FS, output="sos"), x)
-    eh = 10 * np.log10(np.mean(np.square(hf[:n * hop].reshape(n, hop), dtype=np.float64), axis=1) + 1e-12)
-    el = 10 * np.log10(np.mean(np.square(lf[:n * hop].reshape(n, hop), dtype=np.float64), axis=1) + 1e-12)
-    ref = float(np.percentile(eh[eh > eh.max() - 60], 95))
-    mf = maximum_filter1d(np.maximum(eh, el), size=4, origin=1)            # 覆盖 k-3..k
-    prev = np.concatenate([[-np.inf], mf[:-1]])                               # 前 20 ms（k-4..k-1）的最大值
-    cand = np.nonzero((eh - prev > 10) & (eh > ref - 30) & (eh - el > -6))[0]
-    out, last = [], -10 ** 9
-    for k in cand:
-        if k - last < 30 or k + 8 >= n:                                     # 150 ms 内只算一次
-            continue
-        out.append((k * hop, float(np.mean(10 ** ((eh[k:k + 8] - ref) / 10)))))
-        last = k
-    return out
+def _sosfilt32(sos: np.ndarray, x: np.ndarray, chunk: int = 1 << 21) -> np.ndarray:
+    """分块做 sosfilt（带状态），结果存成 float32，长音频不占太多内存。"""
+    y = np.empty(len(x), np.float32)
+    zi = np.zeros((sos.shape[0], 2))
+    for n0 in range(0, len(x), chunk):
+        y[n0:n0 + chunk], zi = signal.sosfilt(sos, x[n0:n0 + chunk], zi=zi)
+    return y
 
 
-def make_puffs(x: np.ndarray, direct: np.ndarray, az_b: np.ndarray, r_b: np.ndarray, amount: float, rng):
-    """爆破音气团：送气音爆破时，气团比声音晚约 10 ms 扑到贴着的那只耳朵上，形成低频压力脉冲
-    （Derrick 等 2009 测量过"pa"的气团和话筒"噗"声的时差；去爆破音工具在 20–80 Hz 检测这类声音）。
-    只在嘴贴近耳边时出现。返回 (2, N) 和次数。"""
-    out = np.zeros((2, len(x)), np.float32)
-    if amount <= 0:
-        return out, 0
-    p = closeness(az_b, r_b)
-    tb = np.arange(len(p)) * BLOCK
-    right = np.mod(az_b, 360.0) < 180.0
-    L = int(0.12 * FS)
-    tt = np.arange(L) / FS
-    rise = 0.006
-    shape = np.where(tt < rise, 0.5 - 0.5 * np.cos(np.pi * tt / rise), np.exp(-(tt - rise) / 0.035))
-    turb_sos = signal.butter(2, 150, "low", fs=FS, output="sos")
-    delay = int(0.010 * FS)
-    n = 0
-    for pos, strength in detect_bursts(x):
-        s0 = pos + delay
-        if s0 + L >= len(x):
-            continue
-        k = min(int(np.searchsorted(tb, s0)), len(p) - 1)
-        if p[k] < 0.05:
-            continue
-        turb = signal.sosfilt(turb_sos, rng.standard_normal(L))
-        turb /= turb.std() + 1e-12
-        out[1 if right[k] else 0, s0:s0 + L] += (shape * (0.7 + 0.3 * turb) * math.sqrt(min(strength, 4.0)) * p[k]).astype(np.float32)
-        n += 1
-    if n:
-        sos = np.vstack([signal.butter(2, 15, "high", fs=FS, output="sos"), signal.butter(2, 200, "low", fs=FS, output="sos")])
-        out = signal.sosfilt(sos, out, axis=1).astype(np.float32)
-        vpk = float(np.percentile(np.abs(direct), 99.5))
-        out *= 0.3 * amount * vpk / (float(np.percentile(np.abs(out[np.abs(out) > 0]), 99)) + 1e-12)
-        cap = 0.2 * vpk * max(amount, 1e-6) ** 0.5                       # 软上限：叠在元音上也不顶到限制器
-        out = (cap * np.tanh(out / cap)).astype(np.float32)
-    return out, n
+def _hop_ramp(vals: np.ndarray, n0: int, n1: int) -> np.ndarray:
+    """每 BREATH_HOP 个样本更新一次的控制量 -> 逐样本：第 k 块里从 vals[k-1] 线性走到 vals[k]（第 0 块保持 vals[0]）。"""
+    xp = np.arange(len(vals) + 1, dtype=float) * BREATH_HOP
+    return np.interp(np.arange(n0, n1, dtype=float), xp, np.concatenate([vals[:1], vals])).astype(np.float32)
+
+
+def breath_fx(x: np.ndarray, p_b: np.ndarray, lift_db: float, puff: float):
+    """贴耳气声：嘴贴近耳朵时把嗓音自己的气声提上来，并加上气流扑到耳朵上的低频脉冲。
+    两样都只用嗓音里已有的送气声，不生成任何噪声、不改变嗓音；p_b 是各块边界处的贴耳程度（0–1），离开耳边时都为 0。
+
+    气声增强（lift_db）：气声带 = 2.5 kHz 以上（F3 以上送气噪声取代谐波，气声感主要靠这部分噪声而不是频谱倾斜，
+      Klatt & Klatt 1990；Hillenbrand 1994）。只把"轻"的部分提上来（频带内向上压缩）：电平比响的齿音低 16 dB 以上的
+      送气声 / 气息 / 轻辅音最多提 lift_db，接近齿音电平的不提，低到底噪附近（低 36–48 dB）的也不提。
+      KU100 贴耳实录里气声段与有声段一样响（差 0…−5 dB），普通配音里气声段要低 12–18 dB。
+    气流扑耳（puff）：送气时气流扑到贴着的耳朵 / 话筒上，形成 200 Hz 以下、20–100 ms 的压力脉冲（喷麦声）；
+      KU100 贴耳实录的近耳 70–150 Hz 有每分钟约 170–200 次、中位 40 ms 的突发。这里取气声带瞬时功率在
+      50–130 Hz 的起伏（除以功率的平方根，幅度与气声成正比），送气越强脉冲越强，爆破音开头最明显。
+    返回 (处理后的人声, 气流脉冲或 None)；脉冲要加在直达声的输入上，由近场 HRIR 送到贴着的那只耳朵。"""
+    if lift_db <= 0 and puff <= 0:
+        return x, None
+    H = BREATH_HOP
+    N = len(x)
+    b = _sosfilt32(signal.butter(2, BREATH_FC, "high", fs=FS, output="sos"), x)
+    nblk = -(-N // H)
+    bp = np.zeros((2, nblk * H), np.float32)
+    bp[0, :N], bp[1, :N] = b, x
+    ms, msx = np.mean(np.square(bp.reshape(2, nblk, H), dtype=np.float64), axis=2)
+    del bp
+    dt = H / FS
+    ca, cr = 1 - math.exp(-dt / 0.003), 1 - math.exp(-dt / 0.03)      # 电平检测：起控 3 ms，释放 30 ms
+    cu, down = 1 - math.exp(-dt / 0.05), 0.5 * dt                      # "响的"电平：50 ms 跟上去；有声音时每秒落 0.5 dB，
+    env, lref = 0.0, BREATH_REF0                                       # 静下来（低 30 dB 以上）就保持。lref = 响的齿音电平
+    envx, vref = 0.0, BREATH_REF0                                      # 整个人声；vref = 响的元音电平
+    G = np.zeros(nblk + 1)                 # 第 k 块开始时可用的提升比例（0–1）
+    P = np.empty(nblk + 1)                 # 第 k 块开始时"响的齿音"的功率
+    V = np.empty(nblk + 1)                 # 第 k 块开始时"响的人声"的幅度
+    P[0], V[0] = 10 ** (lref / 10), 10 ** (vref / 20)
+    for j in range(nblk):
+        m = ms[j]
+        env += (ca if m > env else cr) * (m - env)
+        lb = 10 * math.log10(env + 1e-12)
+        lref = lref + cu * (lb - lref) if lb > lref else (lref - down if lb > lref - 30.0 else lref)
+        m = msx[j]
+        envx += (ca if m > envx else cr) * (m - envx)
+        lx = 10 * math.log10(envx + 1e-12)
+        vref = vref + cu * (lx - vref) if lx > vref else (vref - down if lx > vref - 30.0 else vref)
+        d = lref - lb
+        u = min(max((d - 4.0) / 12.0, 0.0), 1.0)
+        v = min(max((d - 36.0) / 12.0, 0.0), 1.0)
+        G[j + 1] = u * u * (3 - 2 * u) * (1 - v * v * (3 - 2 * v))
+        P[j + 1] = 10 ** (lref / 10)
+        V[j + 1] = 10 ** (vref / 20)
+    tk = (np.arange(nblk + 1) + 1.0) * H
+    p64 = np.interp(tk, np.arange(len(p_b), dtype=float) * BLOCK, p_b)      # 各块末尾的贴耳程度
+    y = x
+    if lift_db > 0:
+        T = p64 * (10 ** (lift_db * G / 20) - 1)
+        y = np.empty_like(x)
+        for n0 in range(0, N, 1 << 22):
+            n1 = min(N, n0 + (1 << 22))
+            y[n0:n1] = x[n0:n1] + _hop_ramp(T, n0, n1) * b[n0:n1]
+    pf = None
+    if puff > 0:
+        q = np.square(b)
+        s = _sosfilt32(signal.butter(1, 30, "low", fs=FS, output="sos"), q)
+        lp = signal.butter(2, 130, "low", fs=FS, output="sos")
+        w = _sosfilt32(np.vstack([signal.butter(2, 50, "high", fs=FS, output="sos"), lp, lp]), q)
+        del q
+        U = PUFF_K * puff * p64
+        pf = np.empty(N, np.float32)
+        for n0 in range(0, N, 1 << 22):
+            n1 = min(N, n0 + (1 << 22))
+            k = np.arange(n0, n1) // H
+            pr = P[k]
+            # 气声功率的低频起伏 / 功率的平方根 = 与气声幅度成正比；再除以响的齿音幅度，得到与音色明暗无关的量
+            raw = w[n0:n1] / np.sqrt((np.maximum(s[n0:n1], 0.0) + 1e-3 * pr) * pr + 1e-30)
+            pf[n0:n1] = _hop_ramp(U, n0, n1) * V[k] * np.tanh(raw)   # 幅度跟人声走，软上限 = 响的人声电平
+    return y, pf
 
 
 def deess(x: np.ndarray, max_db: float, thresh_db: float = -8.0) -> np.ndarray:
@@ -680,7 +715,8 @@ def binaural_power(h: np.ndarray) -> np.ndarray:
 def render_direct(x: np.ndarray, az_b: np.ndarray, r_b: np.ndarray, tab: Tables,
                   level_follow: float = 1.0, iso_db: float = 0.0, presence_db: float = 0.0, ear_eq: bool = True,
                   dark_db: float = 0.0, r_level: np.ndarray | None = None, gain_b: np.ndarray | None = None,
-                  chunk_blocks: int = 2048, el_b: np.ndarray | None = None, level_pos=None) -> np.ndarray:
+                  chunk_blocks: int = 2048, el_b: np.ndarray | None = None, level_pos=None,
+                  concha_db: float = 0.0) -> np.ndarray:
     """时变 HRIR 卷积（重叠保留 + 块内交叉淡化）+ 逐样本分数时延。az_b/r_b 为各块边界处的位置。
     r_level：响度补偿按这条轨迹算（不含忽远忽近，退开时的音量变化另由 gain_b 决定）。
     el_b：各块边界处的仰角（度）；level_pos：带高度时响度补偿所用轨迹的 (方位角, 仰角, 距离)。"""
@@ -704,8 +740,8 @@ def render_direct(x: np.ndarray, az_b: np.ndarray, r_b: np.ndarray, tab: Tables,
         h_b *= ((p / pref) ** (-(1.0 - level_follow) / 2))[:, None, None].astype(np.float32)
     if gain_b is not None:
         h_b *= gain_b[:, None, None].astype(np.float32)
-    if ear_eq or iso_db > 0 or presence_db != 0 or dark_db != 0:
-        ear_intimacy(h_b, az_b, rc, iso_db, presence_db, ear_eq, dark_db, el_b)
+    if ear_eq or iso_db > 0 or presence_db != 0 or dark_db != 0 or concha_db != 0:
+        ear_intimacy(h_b, az_b, rc, iso_db, presence_db, ear_eq, dark_db, el_b, concha_db)
     d_b = (rc / C * FS)[:, None] + tau_b + D0
     tb = np.arange(nb + 1, dtype=float) * BLOCK
     L = NTAP
@@ -1531,7 +1567,14 @@ def main(argv=None) -> int:
     ap.add_argument("--headphone", default=None,
                     help="回放补偿：diffuse=通用扩散场（ear 风格默认）；native=KU100 原机音色（像真实 KU100 录音，ku100 风格默认）；"
                          "或耳机型号（如 HD600、DT770、K701、M50），用 TH Köln 在 KU100 上实测的补偿；list=列出型号")
-    ap.add_argument("--puff", type=float, default=0.0, help="爆破音气团扑到耳朵上的低频脉冲（0=关闭，1=标准）")
+    ap.add_argument("--breath", type=float, default=6.0,
+                    help="贴耳气声增强：嘴贴近耳朵时，嗓音里轻的送气声 / 气息（2.5 kHz 以上）最多提高多少 dB；"
+                         "响的齿音不提（0=关闭）")
+    ap.add_argument("--puff", type=float, default=1.0,
+                    help="气流扑耳：送气时气流扑到贴着的那只耳朵上的低频脉冲（50–130 Hz，由嗓音自己的送气声导出，"
+                         "不加噪声；0=关闭，1=标准）")
+    ap.add_argument("--concha", type=float, default=4.0,
+                    help="耳甲共鸣：贴耳时近耳 4.3 kHz 的耳甲腔共振，dB（KU100 贴耳实录的共有特征；0=关闭）")
     ap.add_argument("--soft-voice", type=float, default=0.0,
                     help="轻声化：按 ANSI S3.5 说话力度频谱，把嗓音往\"压低声音说\"的方向均衡（0=关闭，1=低一档力度）")
     ap.add_argument("--deess", type=float, default=0.0, help="去齿音：齿音最多压低多少 dB（0=关闭，建议 4–8）")
@@ -1564,7 +1607,6 @@ def main(argv=None) -> int:
     del x_all
     x = signal.sosfilt(signal.butter(2, 40, "high", fs=FS, output="sos"), x).astype(np.float32)
     x /= max(float(np.abs(x).max()), 1e-9)
-    rng_fx = np.random.default_rng(a.seed + 101)
     if a.deess > 0:
         x = deess(x, a.deess)
     if a.soft_voice > 0:
@@ -1655,16 +1697,18 @@ def main(argv=None) -> int:
                    delimiter=",", fmt="%.3f", header="t_sec,az_deg,dist_m,el_deg", comments="")
 
     y = np.zeros((2, len(x)), np.float32)
-    xd = apply_warmth(x, r, a.warmth)
+    # 贴耳气声：气声增强 + 气流扑耳，只作用于直达声（房间声仍用原来的人声）
+    xs, puffs = breath_fx(x, closeness(az, r, el), a.breath, a.puff)
+    xd = apply_warmth(xs, r, a.warmth)
+    if puffs is not None:
+        xd = xd + puffs
+        log(f"气流扑耳：脉冲峰值 {20 * np.log10(float(np.abs(puffs).max()) + 1e-12):.1f} dB（相对人声峰值）")
+    del xs, puffs
     direct = render_direct(xd, az, r, tab, a.level_follow, a.isolation, a.presence, a.ku100_eq, a.dark,
-                           r_level=r_base if g_sway is not None else None, gain_b=g_sway, el_b=el, level_pos=base_pos)
+                           r_level=r_base if g_sway is not None else None, gain_b=g_sway, el_b=el, level_pos=base_pos,
+                           concha_db=a.concha)
     del xd
     apply_ear_lf(direct, az, r, a.ear_warmth, a.far_lf_cut, el_b=el)
-    if a.puff > 0:
-        puffs, npf = make_puffs(x, direct, az, r, a.puff, rng_fx)
-        direct += puffs
-        del puffs
-        log(f"爆破音气团：{npf} 次")
     if pb is None:
         y += direct
     else:

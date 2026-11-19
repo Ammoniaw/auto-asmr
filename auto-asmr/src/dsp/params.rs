@@ -61,6 +61,12 @@ pub struct Params {
     pub ear_warmth_db: f32,
     /// 贴耳时远耳 320 Hz 以下再压低多少 dB。
     pub far_lf_cut_db: f32,
+    /// 气声增强：贴耳时嗓音里轻的送气声 / 气息（2.5 kHz 以上）最多提高多少 dB；响的齿音不提。0 = 关闭。
+    pub breath_db: f32,
+    /// 气流扑耳：送气时气流扑到贴着的那只耳朵上的低频脉冲（50–130 Hz，由嗓音自己的送气声导出）。0 = 关闭，1 = 标准。
+    pub puff: f32,
+    /// 耳甲共鸣：贴耳时近耳 4.3 kHz 的耳甲腔共振，dB。0 = 关闭。
+    pub concha_db: f32,
 
     // ---- 左右移动
     pub mode: MotionMode,
@@ -161,6 +167,9 @@ impl Default for Params {
             warmth_db: 6.0,
             ear_warmth_db: 5.0,
             far_lf_cut_db: 12.0,
+            breath_db: 6.0,
+            puff: 1.0,
+            concha_db: 4.0,
             mode: MotionMode::Sweep,
             hold_s: 2.5,
             move_s: 2.5,

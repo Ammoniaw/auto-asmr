@@ -5,7 +5,7 @@
 把任意人声处理成"有人在你耳边 / 身边说话"的效果，用耳机听。立体声输入只取一个声道（默认取更响的那个）再做空间化。
 
 ```bash
-uv run asmr/asmr_binaural.py 输入.wav                          # 默认：贴耳加强，左右耳慢慢穿梭，忽远忽近 → 输入_asmr.wav
+uv run asmr/asmr_binaural.py 输入.wav                          # 默认：贴耳加强，左右耳慢慢穿梭，忽远忽近，贴耳气声 → 输入_asmr.wav
 uv run asmr/asmr_binaural.py 输入.wav --style ku100            # 像真实 KU100 实录：远耳听得到，离耳约 6 cm，有房间
 uv run asmr/asmr_binaural.py 输入.m4a -o 输出.wav --mode wander  # 在你身边走动着说话
 ```
@@ -45,7 +45,7 @@ uv run asmr/asmr_binaural.py 输入.m4a -o 输出.wav --mode wander  # 在你身
 - 最响 1% 的瞬时响度比中位数高 9.9 dB（不晃时 11.3 dB）。
 - 停顿前后的位置差：距离中位变化 1.4 倍（旧版 2.0 倍），方向 90% 在 23° 以内（旧版 90°），不会"跳"到另一侧。
 
-`--sway 0 --sway-follow 0` 关闭忽远忽近；再加 `--pause-motion 1 --updown 0`，结果与旧版默认逐样本相同。
+`--sway 0 --sway-follow 0` 关闭忽远忽近；再加 `--pause-motion 1 --updown 0 --breath 0 --puff 0 --concha 0`，结果与旧版默认逐样本相同。
 
 文献（DOI）：Pelegrín-García 等 2011 JASA [10.1121/1.3552881](https://doi.org/10.1121/1.3552881)；Arend 等 2016 Tonmeistertagung（KU100 近场 HRIR 的感知评测，[Zenodo 4297951](https://zenodo.org/records/4297951)）；Lundbeck 等 2017 Trends Hear [10.1177/2331216517717152](https://doi.org/10.1177/2331216517717152)；Neuhoff 2016 CRPI [10.1186/s41235-016-0017-4](https://doi.org/10.1186/s41235-016-0017-4)；Ghazanfar 等 2002 PNAS [10.1073/pnas.242469699](https://doi.org/10.1073/pnas.242469699)；Serino 等 2015 Sci Rep [10.1038/srep18603](https://doi.org/10.1038/srep18603)；Noel 等 2018 J Neurophysiol [10.1152/jn.00652.2017](https://doi.org/10.1152/jn.00652.2017)；Kolarik 等 2016 APP [10.3758/s13414-015-1015-1](https://doi.org/10.3758/s13414-015-1015-1)；Zahorik 2002 JASA [10.1121/1.1506692](https://doi.org/10.1121/1.1506692)；Brungart & Rabinowitz 1999 JASA [10.1121/1.427180](https://doi.org/10.1121/1.427180)；Kan 等 2009 JASA [10.1121/1.3081395](https://doi.org/10.1121/1.3081395)；Honda 等 2020 Front Psychol [10.3389/fpsyg.2020.00316](https://doi.org/10.3389/fpsyg.2020.00316)；Koumura 等 2021 QJEP [10.1177/1747021820977174](https://doi.org/10.1177/1747021820977174)；Shimokura 2022 Audiol Res [10.3390/audiolres12050056](https://doi.org/10.3390/audiolres12050056)。
 
@@ -81,6 +81,35 @@ uv run asmr/asmr_binaural.py 输入.m4a -o 输出.wav --mode wander  # 在你身
 
 文献（DOI）：Hebrank & Wright 1974 JASA [10.1121/1.1903520](https://doi.org/10.1121/1.1903520)；Wenzel 等 1993 JASA [10.1121/1.407089](https://doi.org/10.1121/1.407089)；Morimoto 2001 JASA [10.1121/1.1352084](https://doi.org/10.1121/1.1352084)；Brungart & Rabinowitz 1999 JASA [10.1121/1.427180](https://doi.org/10.1121/1.427180)。
 
+### 贴耳气声与耳甲共鸣（默认开启）
+
+嘴贴近耳朵时，把嗓音里的气声提上来、加上气流扑到耳朵上的感觉（"耳朵痒"），并补上耳甲腔的共鸣。三样都随贴耳程度渐入，离开耳边时为 0；都只用嗓音里已有的成分，**不生成噪声，不改变嗓音**。
+
+| 做法 | 依据 | 参数（默认值） |
+|---|---|---|
+| 气声增强：2.5 kHz 以上是"气声带"。只把轻的部分提上来（频带内向上压缩）：比响的齿音低 16 dB 以上的送气声 / 气息 / 轻辅音最多提 6 dB，接近齿音电平的不提，低到底噪附近的也不提 | Klatt & Klatt 1990：气声感最主要的线索是 F3 以上取代谐波的送气噪声，而不是频谱倾斜；Hillenbrand 1994：只调频谱倾斜几乎得不到气声感。KU100 贴耳实录（下表）里气声段和有声段一样响，普通配音里气声段低 12–18 dB | `--breath 6`（dB，0 = 关闭） |
+| 气流扑耳：送气时气流扑到贴着的那只耳朵上，形成 50–130 Hz 的压力脉冲。取嗓音自己气声带功率的低频起伏（除以功率的平方根），送气越强脉冲越强，爆破音开头最明显；幅度跟人声电平走，与音色明暗无关 | 喷麦声的能量在 200 Hz 以下、约 100 Hz 最强，持续 20–100 ms；KU100 贴耳实录的近耳 70–150 Hz 是每分钟约 170–200 次、中位 40 ms 的突发，并且只在贴着的那只耳朵里（下表）；Terashima 2024：40 / 80 Hz 的包络越强，刺痛感越强；Tajadura-Jiménez 2009：近处的声音会改变耳垂的触觉 | `--puff 1`（0 = 关闭） |
+| 耳甲共鸣：贴耳时近耳 4.3 kHz 加一个约 0.8 倍频程宽的峰 | Shaw 1979：耳甲腔的深度共振在 4.3 kHz，各个方向来的声音都能激发。8 段 KU100 贴耳实录的近耳都有 4.3–4.6 kHz 的峰（+1…+3 dB）；而本程序在默认贴耳位置（100°、离耳 1.7 cm）用 25 cm 的实测数据外推，近耳 3.6–4.5 kHz 反而凹下去 8–13 dB | `--concha 4`（dB，0 = 关闭） |
+
+"头壳共鸣"：没有找到 KU100 头壳本身有共振的证据（Bernschütz 2013：400 Hz 以下耳廓和头的形状几乎不起作用）。KU100 录音里共有的音色特征是耳甲共鸣（4.3–4.6 kHz 峰）、7–8 kHz 的耳廓谷、10–11.5 kHz 的峰和 1–2 kHz 的小起伏；后几样已经在实测 HRIR 里，缺的是贴耳时的耳甲峰，所以补的是它。听起来"在脑袋里嗡"的那部分，实录里主要是气流打在耳朵上的低频，对应上面的气流扑耳。
+
+三段 KU100 贴耳实录（B 站，各 19–30 分钟）与本程序输出的对比（近耳，病娇音声前 1 分钟）：
+
+| | KU100 实录 | 旧默认 | 新默认 | `--breath 10 --puff 2 --concha 6` |
+|---|---|---|---|---|
+| 有声帧占说话时间 | 5–17%（基本是耳语） | 约 70% | 同左 | 同左 |
+| 气声段比有声段低多少（0.2–8 kHz） | 0…5 dB | 17 dB | 17 dB | 17 dB |
+| 贴耳时 5–12 kHz 相对 0.2–2 kHz | 两段 −17…−20 dB，一段很暗的 −30…−34 dB | −19.9 dB | −15.5 dB | −11.0 dB |
+| 近耳 4 kHz 相对 1 kHz（有声帧） | 两段 −7…−9 dB，一段很暗的 −18 dB | −11.6 dB | −7.4 dB | −4.0 dB |
+| 贴耳时近耳 30–70 Hz 相对 0.5–8 kHz | −2…+15 dB | −32 dB | −15 dB | −11 dB |
+| 低频突发：每分钟次数，中位时长 | 170–200 次，40 ms | — | 约 220 次，40 ms | 约 210 次，60 ms |
+
+实录是耳语，普通配音是有声的嗓音，这个差别程序不去改（把嗓音改成耳语的做法试过，听起来不自然，已删除）；气流脉冲也比实录轻得多，想更明显可以调大 `--puff`。输入有底噪时气声增强会把贴耳时的高频底噪一起提高，先降噪。
+
+`--breath 0 --puff 0 --concha 0` 时结果与加入这三项之前逐样本相同。
+
+文献：Klatt & Klatt 1990 JASA [10.1121/1.398894](https://doi.org/10.1121/1.398894)；Hillenbrand 等 1994 JSHR [10.1044/jshr.3704.769](https://doi.org/10.1044/jshr.3704.769)；Shaw 1979 [The external ear: new knowledge](https://jcaa.caa-aca.ca/index.php/jcaa/article/download/441/103/493)；Terashima 等 2024 [PMC11444235](https://pmc.ncbi.nlm.nih.gov/articles/PMC11444235/)（该研究排除了耳语视频）；Tajadura-Jiménez 等 2009 Neuropsychologia 47:195；Bernschütz 2013 [DAGA](https://audiogroup.web.th-koeln.de/FILES/AIA-DAGA2013_HRIRs.pdf)；Monson & Ananthanarayana 2023（语音正前方 7–9 kHz 指向性最强，[Forum Acusticum](https://dael.euracoustics.org/confs/fa2023/data/articles/000414.pdf)）。喷麦声的频段和时长来自录音工程资料（[The Broadcast Bridge](https://thebroadcastbridge.com/content/entry/10570/getting-rid-of-plosives-in-your-audio)），不是论文。
+
 ### KU100 实录风格 `--style ku100`
 
 按两段 KU100 实录（B 站 BV1X4ZyBREqr、BV1XHBXBaEmt，五月织姬）标定。这两段有明显底噪（低频比说话低 30–36 dB），统计前先按频段扣除了底噪；它们的音频不会混入输出，程序本身也不加任何底噪。与默认的贴耳加强相比：远耳不额外压低（`--isolation 0`）、贴耳距离约 6 cm（`--dist 0.15`）、远耳低频不额外压（`--far-lf-cut 0`）、KU100 实测真实房间（`--room real`）、KU100 原机音色（`--headphone native`），忽远忽近照常。每一项都可以单独再指定来覆盖。
@@ -106,7 +135,7 @@ uv run asmr/asmr_binaural.py 输入.m4a -o 输出.wav --mode wander  # 在你身
 | `--room real` | 用 TH Köln 以同一个 KU100 在真实房间实测的双耳房间脉冲响应（12 个方向，去掉直达声，混响时间按频段缩短到卧室水平约 0.35 s），电平按 KU100 贴耳录音实测定：贴耳时远耳听到的房间声比近耳低约 28 dB，且两耳不相关 | 真实 KU100 贴耳录音里远耳并不安静：比近耳低 23–35 dB，主要是房间声（本项目实测）；Larsson、Västfjäll、Kleiner 2008：房间线索提升临场感与头外感；Werner 等：房间声学与预期不符会降低头外感 |
 | `--soft-voice 1` | 轻声化：按 ANSI S3.5 不同说话力度的标准频谱，把嗓音均衡到"压低声音说话"（中频略收、低频更饱满、最高频气声略多），只做均衡 | Brungart & Scott 2001（JASA）：说话声的距离感主要取决于说话力度，力度每增加 15 dB 听起来远一倍，播放音量几乎不影响；耳语 / 轻声听起来最近 |
 
-`--style ku100` 默认就带 `--room real`。人为合成的底噪（`--room-tone`）、吸气声（`--breath`）、气音（`--breathy`）、气流声（`--airflow`）听起来不真实，已从程序中删除。
+`--style ku100` 默认就带 `--room real`。人为合成的底噪、吸气声、气音、气流声（用噪声合成的那几种）听起来不真实，已从程序中删除；现在的 `--breath` / `--puff` 是另一回事，只用嗓音自己的气声，见上面"贴耳气声与耳甲共鸣"。
 
 数据来源：`data/room_audiolab_ku100.npz` 提取自 Lübeck, Arend, Pörschmann (2021) "A High-Resolution Spatial Room Impulse Response Database"（[Zenodo 5031335](https://zenodo.org/records/5031335)，BRIR_Audiolab_LSC_KU100_P1，CC BY 4.0），去掉了直达声并缩短了混响时间。
 
@@ -116,7 +145,6 @@ uv run asmr/asmr_binaural.py 输入.m4a -o 输出.wav --mode wander  # 在你身
 |---|---|---|
 | `--headphone native` | KU100 原机音色：不做扩散场补偿，保留 KU100 出厂内置均衡后的音色，和真实 KU100 录音一样（3–12 kHz 比默认暗 2–4.5 dB） | KU100 出厂即扩散场均衡；TH Köln 的 CDFC 是为了抹掉人头本身的音色（Bernschütz 2013）；"暗"的音色与 ASMR 相关（Koumura；Terashima 2024） |
 | `--headphone HD600` 等 | 按耳机型号补偿：用 TH Köln 在同一个 KU100 上实测的 23 款耳机滤波器（`--headphone list` 查看） | Engel 等 2019：通用耳机补偿能减少染色、提升整体质量、改善距离感，效果接近个人化补偿 |
-| `--puff 1` | 爆破音气团：送气音（p/t/k/q/ch/c）爆破后约 10 ms，气团扑到贴着的那只耳朵上，形成 20–200 Hz 的压力脉冲；嘴离开耳边时不出现 | Derrick 等 2009（JASA）测量了"pa"的气团和话筒"噗"声；去爆破音工具在 20–80 Hz 检测这类声音 |
 | `--deess 6` | 去齿音器：只在"s/sh/x"等齿音出现时，把 4.5–11 kHz 动态压低（最多 6 dB），其他时刻和其他频段不动 | 贴耳的齿音很刺耳；Terashima 2024：5 kHz 附近能量越低，刺痛感越强 |
 
 ### 近耳高频校正（默认关闭）

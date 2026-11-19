@@ -28,6 +28,9 @@ convert 的选项（括号里是默认值）：
   --warmth <dB>           凑近的低频温暖感（6）  --ear-warmth <dB>   近耳低频（5）
   --far-lf-cut <dB>       远耳低频再压低（12）    --dark <dB>         近耳 5 kHz 压低（0）
   --ku100-eq              近耳用 KU100 实测校正曲线
+  --breath <dB>           气声增强：贴耳时轻的送气声 / 气息最多提高多少，响的齿音不提（6，0=关闭）
+  --puff <x>              气流扑耳：送气时气流扑到耳朵上的低频脉冲，由嗓音自己的送气声导出（1，0=关闭）
+  --concha <dB>           耳甲共鸣：贴耳时近耳 4.3 kHz 的耳甲腔共振（4，0=关闭）
  左右移动
   --mode sweep|random|orbit|static  穿梭 / 随机走位 / 环绕 / 固定（sweep）
   --hold-time <秒> --move-time <秒> 停留、移动时长（2.5、2.5）
@@ -174,6 +177,9 @@ fn run_convert(args: &[String]) -> Result<(), String> {
             "--far-lf-cut" => p.far_lf_cut_db = f(&mut it)?,
             "--dark" => p.dark_db = f(&mut it)?,
             "--ku100-eq" => p.ku100_eq = true,
+            "--breath" => p.breath_db = f(&mut it)?.max(0.0),
+            "--puff" => p.puff = f(&mut it)?.max(0.0),
+            "--concha" => p.concha_db = f(&mut it)?,
             "--mode" => {
                 p.mode = match it.next().map(|s| s.as_str()) {
                     Some("sweep") => MotionMode::Sweep,

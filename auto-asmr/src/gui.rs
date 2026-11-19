@@ -759,6 +759,9 @@ impl App {
                 row(ui, t("温暖感", "Warmth"), t("凑近时两耳共同的低频", "Low-frequency warmth in both ears when close"), egui::Slider::new(&mut p.warmth_db, 0.0..=12.0).suffix(" dB").fixed_decimals(1));
                 row(ui, t("近耳低频", "Near-ear bass"), t("贴耳时只给近耳加的低频", "Bass added only to the near ear"), egui::Slider::new(&mut p.ear_warmth_db, 0.0..=10.0).suffix(" dB").fixed_decimals(1));
                 row(ui, t("远耳低频削减", "Far-ear bass cut"), t("贴耳时远耳 320 Hz 以下再压低", "Extra cut below 320 Hz at the far ear"), egui::Slider::new(&mut p.far_lf_cut_db, 0.0..=18.0).suffix(" dB").fixed_decimals(0));
+                row(ui, t("气声增强", "Breath lift"), t("贴耳时把嗓音里轻的送气声 / 气息提上来（最多这么多），响的齿音不提；只用嗓音自己的气声，不加噪声。0 = 关闭", "Lifts the soft breathy part of the voice when close (by at most this much); loud sibilants are left alone. No noise is added. 0 = off"), egui::Slider::new(&mut p.breath_db, 0.0..=12.0).suffix(" dB").fixed_decimals(1));
+                row(ui, t("气流扑耳", "Breath puff"), t("送气时气流扑到耳朵上的低频脉冲（耳朵痒的感觉），由嗓音自己的送气声导出。0 = 关闭，1 = 标准", "Low-frequency pulses of breath hitting the ear, derived from the voice's own aspiration. 0 = off, 1 = standard"), egui::Slider::new(&mut p.puff, 0.0..=3.0).fixed_decimals(2));
+                row(ui, t("耳甲共鸣", "Concha resonance"), t("贴耳时近耳 4.3 kHz 的耳甲腔共振（KU100 贴耳实录的共有特征）。0 = 关闭", "4.3 kHz concha resonance at the near ear when close. 0 = off"), egui::Slider::new(&mut p.concha_db, 0.0..=8.0).suffix(" dB").fixed_decimals(1));
             });
             ui.checkbox(&mut p.ku100_eq, t("近耳用 KU100 实测校正曲线（高频更收）", "KU100-calibrated near-ear EQ (softer highs)"));
         });
