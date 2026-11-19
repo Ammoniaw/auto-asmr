@@ -18,6 +18,41 @@ use std::f32::consts::TAU;
 const DEF_YAW: f32 = -30.0;
 const DEF_PITCH: f32 = 20.0;
 
+/// 多音频合成时画的一个音源：位置（头部坐标，米）、颜色、编号、是否在说话。
+pub struct Dot {
+    pub xyz: [f32; 3],
+    pub col: Color32,
+    pub label: String,
+    pub speaking: bool,
+}
+
+/// 画一个音源：到耳朵高度水平面的垂线和影子、从头表面指向它的虚线、实心圆点。返回圆点的屏幕位置、深度和半径。
+fn draw_source(ly: &mut Layers, cam: &Cam, src: [f32; 3], col: Color32, speaking: bool, extent: f32) -> (Pos2, f32, f32) {
+    let r = HEAD_A;
+    let ground = [src[0], src[1], 0.0];
+    if src[2].abs() > 0.003 {
+        for s in Shape::dashed_line(&[cam.pt(src), cam.pt(ground)], Stroke::new(1.0, col.gamma_multiply(0.7)), 4.0, 3.0) {
+            ly.put(cam.depth(ground).max(cam.depth(src)), s);
+        }
+    }
+    let shadow: Vec<Pos2> = (0..14)
+        .map(|i| {
+            let a = i as f32 / 14.0 * TAU;
+            cam.pt([src[0] + 0.012 * a.cos(), src[1] + 0.012 * a.sin(), 0.0])
+        })
+        .collect();
+    ly.put(cam.depth(ground), Shape::convex_polygon(shadow, col.gamma_multiply(0.35), Stroke::NONE));
+    let len = (src[0] * src[0] + src[1] * src[1] + src[2] * src[2]).sqrt().max(1e-6);
+    let surf = [src[0] / len * r, src[1] / len * r, src[2] / len * r];
+    for s in Shape::dashed_line(&[cam.pt(surf), cam.pt(src)], Stroke::new(1.2, col.gamma_multiply(0.8)), 5.0, 3.0) {
+        ly.put(cam.depth([(surf[0] + src[0]) * 0.5, (surf[1] + src[1]) * 0.5, (surf[2] + src[2]) * 0.5]), s);
+    }
+    let (sp, sd) = cam.proj(src);
+    let rad = (if speaking { 7.5 } else { 6.0 }) * (1.0 + 0.25 * (sd / extent).clamp(-1.0, 1.0));
+    ly.put(sd, Shape::circle_filled(sp, rad, col));
+    (sp, sd, rad)
+}
+
 pub struct View3d {
     /// 视角：偏航（度，0 = 从脑后看，屏幕右边就是人的右边）、俯仰（度，90 = 从头顶往下看）。
     pub yaw: f32,
@@ -126,7 +161,9 @@ impl View3d {
     }
 
     /// 画一帧。`active`：引擎在运行（实时或试听）。左键拖动会改 `params` 里的手动摆位。
-    pub fn ui(&mut self, ui: &mut egui::Ui, tele: &Telemetry, active: bool, params: &mut Params) {
+    /// `dots` 不为空时是多音频合成：画这几个音源（只看不拖，位置在左边的位置图上拖）。
+    pub fn ui(&mut self, ui: &mut egui::Ui, tele: &Telemetry, active: bool, params: &mut Params, dots: &[Dot]) {
+        let mix = !dots.is_empty();
         ui.horizontal(|ui| {
             for (zh, en, y, p) in [("背后", "Back", 0.0, 0.0), ("正面", "Front", 180.0, 0.0), ("头顶", "Top", 0.0, 90.0), ("左侧", "Left", 90.0, 0.0), ("右侧", "Right", -90.0, 0.0), ("默认", "Default", DEF_YAW, DEF_PITCH)] {
                 if ui.small_button(t(zh, en)).clicked() {
@@ -149,7 +186,7 @@ impl View3d {
         if resp.double_clicked_by(egui::PointerButton::Secondary) {
             (self.yaw, self.pitch, self.zoom) = (DEF_YAW, DEF_PITCH, None);
         }
-        let moving = resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down());
+        let moving = !mix && resp.is_pointer_button_down_on() && ui.input(|i| i.pointer.primary_down());
         if resp.hovered() {
             let s = ui.input(|i| i.smooth_scroll_delta.y);
             if s != 0.0 {
@@ -165,7 +202,9 @@ impl View3d {
         }
 
         let src = to_xyz(tele.az, tele.el, tele.r);
-        if active {
+        if mix {
+            self.trail.clear();
+        } else if active {
             self.trail.push(src);
             if self.trail.len() > 120 {
                 self.trail.remove(0);
@@ -181,8 +220,13 @@ impl View3d {
             let want = match self.zoom {
                 Some(z) => z,
                 None => {
-                    let tgt = (params.mode == MotionMode::Manual).then(|| manual_xyz(params));
-                    let far = self.trail.iter().chain(std::iter::once(&src)).chain(tgt.iter()).map(|p| (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt()).fold(0.0f32, f32::max);
+                    let norm = |p: &[f32; 3]| (p[0] * p[0] + p[1] * p[1] + p[2] * p[2]).sqrt();
+                    let far = if mix {
+                        dots.iter().map(|d| norm(&d.xyz)).fold(0.0f32, f32::max)
+                    } else {
+                        let tgt = (params.mode == MotionMode::Manual).then(|| manual_xyz(params));
+                        self.trail.iter().chain(std::iter::once(&src)).chain(tgt.iter()).map(norm).fold(0.0f32, f32::max)
+                    };
                     // 留一段缓冲：音源快出画面或画面空得太多时才缩放，拖完松手画面不会马上跟着变
                     let fit = (far * 1.25).clamp(0.22, 3.2);
                     if fit > self.extent || fit < 0.55 * self.extent { fit } else { self.extent }
@@ -211,7 +255,7 @@ impl View3d {
                 (params.manual_az, params.manual_dist, params.manual_tilt) = to_manual([cur[0] + d[0], cur[1] + d[1], cur[2] + d[2]]);
             }
         }
-        let tgt = (params.mode == MotionMode::Manual).then(|| manual_xyz(params));
+        let tgt = (!mix && params.mode == MotionMode::Manual).then(|| manual_xyz(params));
 
         let dark = ui.visuals().dark_mode;
         let grid = if dark { Color32::from_gray(75) } else { Color32::from_gray(185) };
@@ -260,28 +304,21 @@ impl View3d {
             ly.polyline(&cam, w, Stroke::new(2.0, Color32::from_rgba_unmultiplied(255, 140, 60, a)));
         }
 
-        // 音源：到地面（耳朵高度的水平面）的垂线和影子、从头指向音源的虚线
+        // 音源：到地面（耳朵高度的水平面）的垂线和影子、从头指向音源的虚线。合成时每个音源各画一个
         let speaking = active && tele.act > 0.5;
         let col = if !active { Color32::from_gray(140) } else if speaking { Color32::from_rgb(255, 120, 40) } else { Color32::from_rgb(190, 130, 95) };
-        let ground = [src[0], src[1], 0.0];
-        if src[2].abs() > 0.003 {
-            for s in Shape::dashed_line(&[cam.pt(src), cam.pt(ground)], Stroke::new(1.0, col.gamma_multiply(0.7)), 4.0, 3.0) {
-                ly.put(cam.depth(ground).max(cam.depth(src)), s);
+        let mut drawn: Vec<(Pos2, f32, f32, Color32)> = Vec::new(); // 屏幕位置、深度、半径、颜色
+        if mix {
+            for d in dots {
+                let c = if active { d.col } else { d.col.gamma_multiply(0.8) };
+                let (p, dd, rad) = draw_source(&mut ly, &cam, d.xyz, c, d.speaking, self.extent);
+                drawn.push((p, dd, rad, c));
             }
+        } else {
+            let (sp, sd, rad) = draw_source(&mut ly, &cam, src, col, speaking, self.extent);
+            drawn.push((sp, sd, rad, col));
         }
-        let shadow: Vec<Pos2> = (0..14).map(|i| {
-            let a = i as f32 / 14.0 * TAU;
-            cam.pt([src[0] + 0.012 * a.cos(), src[1] + 0.012 * a.sin(), 0.0])
-        }).collect();
-        ly.put(cam.depth(ground), Shape::convex_polygon(shadow, col.gamma_multiply(0.35), Stroke::NONE));
         let len = (src[0] * src[0] + src[1] * src[1] + src[2] * src[2]).sqrt().max(1e-6);
-        let surf = [src[0] / len * r, src[1] / len * r, src[2] / len * r];
-        for s in Shape::dashed_line(&[cam.pt(surf), cam.pt(src)], Stroke::new(1.2, col.gamma_multiply(0.8)), 5.0, 3.0) {
-            ly.put(cam.depth([(surf[0] + src[0]) * 0.5, (surf[1] + src[1]) * 0.5, (surf[2] + src[2]) * 0.5]), s);
-        }
-        let (sp, sd) = cam.proj(src);
-        let rad = (if speaking { 7.5 } else { 6.0 }) * (1.0 + 0.25 * (sd / self.extent).clamp(-1.0, 1.0));
-        ly.put(sd, Shape::circle_filled(sp, rad, col));
         let accent = Color32::from_rgb(70, 150, 240);
         if let Some(tp) = tgt {
             let (p, d) = cam.proj(tp);
@@ -306,8 +343,14 @@ impl View3d {
         }
         painter.extend(ly.front);
         // 音源在头后面被挡住时，画一个虚的圈，仍然看得到它在哪
-        if sd < 0.0 && (sp - hc).length() < hr {
-            painter.circle_stroke(sp, rad, Stroke::new(1.2, col.gamma_multiply(0.8)));
+        for &(sp, sd, rad, c) in &drawn {
+            if sd < 0.0 && (sp - hc).length() < hr {
+                painter.circle_stroke(sp, rad, Stroke::new(1.2, c.gamma_multiply(0.8)));
+            }
+        }
+        // 合成：每个音源旁边写上编号（与左边列表、位置图一致）
+        for (d, &(sp, _, rad, _)) in dots.iter().zip(&drawn) {
+            painter.text(sp + egui::vec2(rad + 2.0, -rad - 2.0), egui::Align2::LEFT_BOTTOM, &d.label, egui::FontId::proportional(11.0), d.col);
         }
 
         let small = egui::FontId::proportional(10.0);
@@ -317,6 +360,11 @@ impl View3d {
                 continue; // 被头挡住的刻度文字不画
             }
             painter.text(p, egui::Align2::CENTER_CENTER, s, small.clone(), grid);
+        }
+        if mix {
+            painter.text(rect.left_top() + egui::vec2(8.0, 6.0), egui::Align2::LEFT_TOP, format!("{} {} {}", t("多音频合成：", "Mixing "), dots.len(), t("个音频", "files")), egui::FontId::proportional(12.0), fg);
+            painter.text(rect.left_bottom() + egui::vec2(8.0, -5.0), egui::Align2::LEFT_BOTTOM, t("右键拖视角 · 滚轮缩放 · 右键双击复位 · 位置在左边的位置图上拖", "right: rotate · scroll: zoom · right double-click: reset · move sources on the map"), egui::FontId::proportional(10.5), grid);
+            return;
         }
         // 读数与左边的位置图一致：高度以耳朵为支点（声源在正前 / 正后方时以头中心），离耳 = 未抬高时离头表面的距离
         let (up, _, plan_r) = up_angle(tele.az, tele.el, tele.r);

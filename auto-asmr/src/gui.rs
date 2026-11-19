@@ -1,6 +1,7 @@
 //! 图形界面（egui）：实时页 + 文件转换页，右侧是两种模式共用的效果参数。
 
 use crate::dsp::engine::{EngineConfig, Telemetry};
+use crate::dsp::mix::{self, MixSetup, Voice, MAX_VOICES, PRESETS};
 use crate::dsp::params::{MotionMode, Params, Playback, Via, DENOISE_MAX_DB};
 use crate::dsp::tables::tables;
 use crate::dsp::motion::lift_tilt;
@@ -8,7 +9,7 @@ use crate::dsp::{FS, HEAD_A, R_MIN, R_MAX};
 mod view3d;
 
 use crate::batch;
-use crate::offline::{default_output, load_mono, Channel, ConvertOptions, ConvertReport};
+use crate::offline::{convert_mix, default_mix_output, default_output, load_mono, Channel, ConvertOptions, ConvertReport, MixInput};
 use crate::realtime::{self, DeviceInfo, DeviceList, Realtime, RtOptions};
 use eframe::egui;
 use egui::{Color32, RichText};
@@ -25,6 +26,35 @@ static ENGLISH: AtomicBool = AtomicBool::new(false);
 const COL: f32 = 104.0;
 
 const CONFIG_FILE: &str = "auto-asmr.ron";
+
+/// 项目主页（窗口右下角的"给个star"）。
+const GITHUB_URL: &str = "https://github.com/nasuiyile/auto-asmr";
+
+/// 多音频合成时各音源的颜色：文件列表、位置图、3D 视图里一致。
+const VOICE_COLORS: [Color32; MAX_VOICES] = [Color32::from_rgb(255, 120, 40), Color32::from_rgb(70, 150, 240), Color32::from_rgb(70, 180, 100), Color32::from_rgb(190, 100, 225)];
+
+fn file_name(p: &Path) -> String {
+    p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
+}
+
+/// 左右移动方式的名字。
+fn motion_name(m: MotionMode) -> &'static str {
+    match m {
+        MotionMode::Sweep => t("穿梭", "sweep"),
+        MotionMode::Random => t("随机走位", "random"),
+        MotionMode::Orbit => t("环绕", "orbit"),
+        MotionMode::Static => t("固定", "static"),
+        MotionMode::Manual => t("手动", "manual"),
+    }
+}
+
+/// 合成音源的位置名：预设位置用它的名字，拖出来的位置用方位角。
+fn voice_name(v: &Voice) -> String {
+    match v.preset_index() {
+        Some(k) => t(PRESETS[k].0, PRESETS[k].1).to_string(),
+        None => format!("{:.0}°", v.az),
+    }
+}
 
 /// 位置图的半径刻度：到头中心的距离（米）→ 离图中心的比例（0–1）。对数压缩：2 cm 在中心，80 cm 在边上。
 fn radar_map(r: f32) -> f32 {
@@ -112,11 +142,15 @@ struct Saved {
     out_dir: Option<PathBuf>,
     /// 是否显示 3D 观察窗（默认隐藏；隐藏时不绘制）。
     view3d: bool,
+    /// 多音频合成：列表里的前几个音频（最多 [`MAX_VOICES`] 个）各放一个位置，同时播放、合成一个文件。
+    mix: bool,
+    /// 合成的排布：false = 各自固定在自己的位置；true = 一起移动（按"左右移动"的方式走，彼此错开 360°/N）。
+    mix_follow: bool,
 }
 
 impl Default for Saved {
     fn default() -> Self {
-        Saved { params: Params::default(), english: false, tab: Tab::Realtime, host: String::new(), input: None, output: None, buffer: 256, in_channel: 0, dry: false, bits: 24, file_lufs: -16.0, file_channel: 0, jobs: 0, out_dir: None, view3d: false }
+        Saved { params: Params::default(), english: false, tab: Tab::Realtime, host: String::new(), input: None, output: None, buffer: 256, in_channel: 0, dry: false, bits: 24, file_lufs: -16.0, file_channel: 0, jobs: 0, out_dir: None, view3d: false, mix: false, mix_follow: false }
     }
 }
 
@@ -139,9 +173,29 @@ struct Job {
     finished: Arc<AtomicBool>,
     workers: usize,
     t0: std::time::Instant,
+    /// 多音频合成的任务：参与合成的音频和位置（写进完成后的说明）；普通转换为 None。
+    mix: Option<String>,
 }
 
 type Decoded = Result<(PathBuf, u8, Arc<Vec<f32>>), String>;
+
+/// 合成试听用的解码结果：参与合成的文件、取的声道、各段 48 kHz 单声道、各段的响度（对齐用）。
+struct MixAudio {
+    paths: Vec<PathBuf>,
+    ch: u8,
+    data: Vec<Arc<Vec<f32>>>,
+    lufs: Vec<Option<f32>>,
+}
+
+impl MixAudio {
+    /// 最长那段的样本数（试听的总长）。
+    fn len(&self) -> usize {
+        self.data.iter().map(|d| d.len()).max().unwrap_or(0)
+    }
+}
+
+/// 合成解码失败时带上是哪一组文件、哪个声道，免得界面对同一组反复重试。
+type MixDecoded = Result<MixAudio, (Vec<PathBuf>, u8, String)>;
 
 pub struct App {
     s: Saved,
@@ -178,6 +232,27 @@ pub struct App {
     shot_drag_right: bool,
     shot_drag_frame: u32,
     demo: Option<PathBuf>,
+    /// 截图自检要等多少帧（AUTO_ASMR_SHOT_WAIT 可改）。
+    shot_wait: Option<u32>,
+    // ---- 多音频合成
+    /// 每个音频的位置和音量（按文件记：删掉别的文件、列表顺序变了都不影响）。
+    voices: HashMap<PathBuf, Voice>,
+    mix_audio: Option<MixAudio>,
+    mix_decoding: Option<Receiver<MixDecoded>>,
+    /// 解码失败过的那一组（文件, 声道）：不自动重试，点"试听"时再试。
+    mix_failed: Option<(Vec<PathBuf>, u8)>,
+    /// 合成的输出文件；None = 默认（第一个音频旁边，名字加 _mix_asmr）。
+    mix_out: Option<PathBuf>,
+    /// 正在运行的试听是合成试听。
+    rt_mix: bool,
+    /// 最近一次交给音频线程的各音源位置和合成配置（参数或位置变了才重发）。
+    mix_sent: Option<(Vec<Voice>, Arc<MixSetup>)>,
+    /// 合成试听时各音源此刻的 [方位角, 仰角, 距离, 说话活动]，以及位置图上的轨迹。
+    mix_tele: Vec<[f32; 4]>,
+    mix_trails: Vec<Vec<(f32, f32)>>,
+    /// 位置图上正在拖动的音源、最近选中的音源（读数显示它）。
+    mix_drag: Option<usize>,
+    mix_sel: Option<usize>,
 }
 
 /// `screenshot`：(PNG 路径, 是否切到文件页, 演示文件)——自检用：打开界面、可选地试听演示文件几秒、截图后退出。
@@ -208,6 +283,26 @@ impl App {
             Ok(()) => format!("{}：{}", t("配置已导出", "Configuration exported"), path.display()),
             Err(e) => format!("{}：{e}", t("配置导出失败", "Configuration export failed")),
         };
+    }
+
+    fn import_config(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(t("配置文件", "Configuration"), &["ron"])
+            .pick_file() else { return };
+        match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|text| parse_config(&text)) {
+            Ok(s) => {
+                // 先停掉正在运行的实时 / 试听（设备、缓冲可能都变了），再整体换成导入的设置
+                self.stop();
+                let mode = s.params.mode;
+                self.s = s;
+                self.last_mode = mode;
+                self.auto_mode = if mode == MotionMode::Manual { MotionMode::Sweep } else { mode };
+                self.reload_devices();
+                // 参数由 sync_params 和 self.sent 比较后提交给引擎
+                self.status = format!("{}：{}", t("配置已导入", "Configuration imported"), path.display());
+            }
+            Err(e) => self.status = format!("{}：{e}", t("配置导入失败", "Configuration import failed")),
+        }
     }
 
     fn new(cc: &eframe::CreationContext<'_>, screenshot: Option<(PathBuf, bool, Option<PathBuf>)>) -> Self {
@@ -277,8 +372,31 @@ impl App {
             shot_drag_right: std::env::var("AUTO_ASMR_SHOT_DRAG").map_or(false, |v| v.trim_end().ends_with("right")),
             shot_drag_frame: 0,
             demo,
+            shot_wait: std::env::var("AUTO_ASMR_SHOT_WAIT").ok().and_then(|v| v.trim().parse().ok()),
+            voices: HashMap::new(),
+            mix_audio: None,
+            mix_decoding: None,
+            mix_failed: None,
+            mix_out: None,
+            rt_mix: false,
+            mix_sent: None,
+            mix_tele: Vec::new(),
+            mix_trails: Vec::new(),
+            mix_drag: None,
+            mix_sel: None,
         };
         if is_shot {
+            // AUTO_ASMR_SHOT_MIX=1：打开多音频合成（配合 AUTO_ASMR_SHOT_FILES 预先放进的文件）；AUTO_ASMR_SHOT_EN=1：英文界面
+            if std::env::var("AUTO_ASMR_SHOT_MIX").is_ok() {
+                app.s.mix = true;
+            }
+            // AUTO_ASMR_SHOT_FOLLOW=1：合成用"一起移动"
+            if std::env::var("AUTO_ASMR_SHOT_FOLLOW").is_ok() {
+                app.s.mix_follow = true;
+            }
+            if std::env::var("AUTO_ASMR_SHOT_EN").is_ok() {
+                app.s.english = true;
+            }
             // AUTO_ASMR_SHOT_3D="偏航,俯仰"（可留空用默认视角）：打开 3D 观察窗
             if let Ok(v) = std::env::var("AUTO_ASMR_SHOT_3D") {
                 app.s.view3d = true;
@@ -322,7 +440,260 @@ impl App {
         }
         self.rt = None;
         self.rt_preview = false;
+        self.rt_mix = false;
+        self.mix_sent = None;
+        self.mix_tele.clear();
+        self.mix_trails.clear();
         self.preview_pending = false;
+    }
+
+    // ------------------------------------------------------------------ 多音频合成
+
+    /// 多音频合成是否生效：勾上了，并且列表里至少有两个音频。
+    fn mixing(&self) -> bool {
+        self.s.mix && self.files.len() >= 2
+    }
+
+    /// 位置图、右侧参数是否按合成显示（只在文件页）。
+    fn mix_view(&self) -> bool {
+        self.s.tab == Tab::File && self.mixing()
+    }
+
+    /// 参与合成的音频：列表里的前 [`MAX_VOICES`] 个。
+    fn mix_paths(&self) -> Vec<PathBuf> {
+        self.files.iter().take(MAX_VOICES).cloned().collect()
+    }
+
+    /// 参与合成的每个音频的位置和音量。
+    fn mix_voices(&self) -> Vec<Voice> {
+        let mut used: Vec<Voice> = Vec::new();
+        self.files
+            .iter()
+            .take(MAX_VOICES)
+            .map(|p| {
+                let v = self.voices.get(p).copied().unwrap_or_else(|| mix::default_voice(&used));
+                used.push(v);
+                v
+            })
+            .collect()
+    }
+
+    /// 给新进入合成的音频分配位置：按"左耳、右耳、正前、正后"取第一个空着的方向（两个音频时一左一右）。
+    fn ensure_voices(&mut self) {
+        let paths = self.mix_paths();
+        let mut used: Vec<Voice> = paths.iter().filter_map(|p| self.voices.get(p).copied()).collect();
+        for p in paths {
+            if !self.voices.contains_key(&p) {
+                let v = mix::default_voice(&used);
+                used.push(v);
+                self.voices.insert(p, v);
+            }
+        }
+    }
+
+    /// 合成的输出文件。
+    fn mix_output(&self) -> PathBuf {
+        self.mix_out.clone().unwrap_or_else(|| self.files.first().map(|p| default_mix_output(p)).unwrap_or_default())
+    }
+
+    /// 由当前参数和各音源的位置、音量、排布算出交给引擎的合成配置。`lufs`：各音源的响度（对齐用）。
+    fn mix_setup(&self, lufs: &[Option<f32>]) -> (Vec<Voice>, Arc<MixSetup>) {
+        let voices = self.mix_voices();
+        let prev = self.mix_sent.as_ref().map(|(_, s)| s.as_ref());
+        let setup = MixSetup::new(&self.cfg, &voices, lufs, self.s.mix_follow, prev);
+        (voices, Arc::new(setup))
+    }
+
+    /// 合成时各音源此刻的位置 [方位角, 仰角, 距离, 说话活动]：试听中用引擎报告的；没在试听时，各自固定是各自摆好的
+    /// 位置（带上"高度"），一起移动是开始时的队形（走位的起点，再错开 360°/N）。
+    fn mix_positions(&self) -> Vec<[f32; 4]> {
+        let active = self.rt.is_some() && self.rt_mix;
+        let p = &self.s.params;
+        let voices = self.mix_voices();
+        let start = self.s.mix_follow.then(|| crate::dsp::motion::Motion::new(p.seed).step(p, 0.0, 1.0, 0.0));
+        let offsets = mix::follow_offsets(voices.len(), self.s.mix_follow);
+        voices
+            .iter()
+            .enumerate()
+            .map(|(k, v)| match (self.mix_tele.get(k).filter(|_| active), start) {
+                (Some(q), _) => *q,
+                (None, Some(s)) => [(s.az + offsets[k]).rem_euclid(360.0), s.el, s.r, 0.0],
+                (None, None) => {
+                    let (a, e, r) = lift_tilt(v.az, v.distance(p.ear_dist), 0.0, p.height.clamp(-80.0, 85.0));
+                    [a, e, r, 0.0]
+                }
+            })
+            .collect()
+    }
+
+    /// 切换合成的排布（各自固定 / 一起移动）。合成试听中切换时从当前位置重新开始（几个引擎的走位要从头对齐）。
+    fn set_mix_follow(&mut self, follow: bool) {
+        if follow == self.s.mix_follow {
+            return;
+        }
+        self.s.mix_follow = follow;
+        self.mix_trails.clear();
+        if self.rt_mix && self.rt.is_some() {
+            self.start_mix_preview();
+        }
+    }
+
+    /// 打开 / 关闭多音频合成。
+    fn set_mix_mode(&mut self, on: bool) {
+        self.s.mix = on;
+        self.stop();
+        if on {
+            self.ensure_voices();
+        } else if self.file_in.is_some() && self.decoded.is_none() && self.decoding.is_none() {
+            self.decode_file();
+        }
+    }
+
+    /// 后台解码参与合成的几个文件（同时解码），并测各自的响度。
+    fn decode_mix(&mut self) {
+        let paths = self.mix_paths();
+        let ch = self.s.file_channel;
+        let chan = self.file_channel();
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let res: Vec<Result<(Arc<Vec<f32>>, Option<f32>), String>> = std::thread::scope(|s| {
+                let hs: Vec<_> = paths
+                    .iter()
+                    .map(|p| {
+                        s.spawn(move || {
+                            let mut o = ConvertOptions::new(p.clone());
+                            o.channel = chan;
+                            let (m, _) = load_mono(&o, &AtomicBool::new(false)).map_err(|e| format!("{}：{e}", file_name(p)))?;
+                            let l = mix::loudness(&m);
+                            Ok((Arc::new(m), l))
+                        })
+                    })
+                    .collect();
+                hs.into_iter().map(|h| h.join().unwrap_or_else(|_| Err("解码出错".to_string()))).collect()
+            });
+            let r: MixDecoded = match res.into_iter().collect::<Result<Vec<_>, String>>() {
+                Ok(v) => {
+                    let (data, lufs) = v.into_iter().unzip();
+                    Ok(MixAudio { paths, ch, data, lufs })
+                }
+                Err(e) => Err((paths, ch, e)),
+            };
+            let _ = tx.send(r);
+        });
+        self.mix_decoding = Some(rx);
+        self.status = t("正在解码要合成的音频…", "Decoding the files to mix…").to_string();
+    }
+
+    /// 每帧检查：合成的文件组或声道变了就停掉旧的合成试听、重新解码（之前在播的话解码完接着播）；
+    /// 不在合成时释放解码结果。普通试听在合成生效时停掉。
+    fn sync_mix(&mut self) {
+        if !self.mixing() {
+            if self.rt_mix {
+                self.stop();
+            }
+            self.mix_audio = None;
+            return;
+        }
+        if self.rt.is_some() && self.rt_preview && !self.rt_mix {
+            self.stop();
+        }
+        let paths = self.mix_paths();
+        let ch = self.s.file_channel;
+        if self.mix_audio.as_ref().map_or(false, |m| m.paths == paths && m.ch == ch) {
+            return;
+        }
+        let resume = self.rt_mix || self.preview_pending;
+        if self.rt_mix {
+            self.stop();
+        }
+        self.preview_pending = resume;
+        self.mix_audio = None;
+        if self.mix_decoding.is_none() && self.mix_failed.as_ref() != Some(&(paths, ch)) {
+            self.decode_mix();
+        }
+    }
+
+    /// 合成试听：几个音频同时播放，各在自己的位置；先在后台解码（解码过同一组就直接用）。
+    fn start_mix_preview(&mut self) {
+        let selected_s = self.preview_s;
+        self.stop();
+        self.preview_s = selected_s;
+        self.sync_params();
+        let paths = self.mix_paths();
+        let ch = self.s.file_channel;
+        let ready = self.mix_audio.as_ref().filter(|m| m.paths == paths && m.ch == ch).map(|m| (m.data.clone(), m.lufs.clone(), m.len()));
+        if let Some((data, lufs, len)) = ready {
+            let start = ((self.preview_s.max(0.0) * FS as f64) as usize).min(len);
+            let (voices, setup) = self.mix_setup(&lufs);
+            match Realtime::start_preview_mix(&self.rt_options(), setup.clone(), data, start) {
+                Ok(rt) => {
+                    self.status = format!("{}：{}（{} Hz），{} {}", t("合成试听中", "Previewing the mix"), rt.info.output_name, rt.info.out_rate, voices.len(), t("个音频同时播放", "files at once"));
+                    self.rt = Some(rt);
+                    self.rt_preview = true;
+                    self.rt_mix = true;
+                    self.mix_sent = Some((voices, setup));
+                }
+                Err(e) => self.status = e,
+            }
+            return;
+        }
+        self.preview_pending = true;
+        if self.mix_decoding.is_none() {
+            self.mix_failed = None; // 点了试听：解码失败过的也再试一次
+            self.decode_mix();
+        }
+    }
+
+    /// 合成并保存：参与合成的音频各放各的位置，输出一个文件。
+    fn start_mix_convert(&mut self) {
+        if self.job.is_some() || !self.mixing() {
+            return;
+        }
+        let paths = self.mix_paths();
+        let out = self.mix_output();
+        let voices = self.mix_voices();
+        let inputs: Vec<MixInput> = paths.iter().cloned().zip(voices.iter().copied()).map(|(path, voice)| MixInput { path, voice }).collect();
+        let follow = self.s.mix_follow;
+        let offsets = mix::follow_offsets(inputs.len(), follow);
+        let list = inputs
+            .iter()
+            .enumerate()
+            .map(|(k, i)| {
+                let g = if i.voice.gain_db != 0.0 { format!("，{:+.1} dB", i.voice.gain_db) } else { String::new() };
+                let pos = if follow { format!("+{:.0}°", offsets[k]) } else { voice_name(&i.voice) };
+                format!("{}. {}（{pos}{g}）", k + 1, file_name(&i.path))
+            })
+            .collect::<Vec<_>>()
+            .join("  ");
+        let desc = if follow { format!("{}（{}）  {list}", t("一起移动", "moving together"), motion_name(self.s.params.mode)) } else { list };
+        let opts = self.convert_options(paths[0].clone(), out.clone());
+        let job = Job {
+            paths: vec![out.clone()],
+            status: Arc::new(vec![Mutex::new(ItemStatus::Waiting)]),
+            est: Arc::new(Mutex::new(vec![1.0])),
+            cancel: Arc::new(AtomicBool::new(false)),
+            finished: Arc::new(AtomicBool::new(false)),
+            workers: inputs.len(),
+            t0: std::time::Instant::now(),
+            mix: Some(desc),
+        };
+        let (st, ca, fin, params) = (job.status.clone(), job.cancel.clone(), job.finished.clone(), self.s.params.clone());
+        std::thread::spawn(move || {
+            let r = convert_mix(&opts, &inputs, &params, follow, ca, |f, stage| {
+                if let Ok(mut g) = st[0].lock() {
+                    *g = ItemStatus::Running(f, stage.to_string());
+                }
+            });
+            if let Ok(mut g) = st[0].lock() {
+                *g = match r {
+                    Ok(rep) => ItemStatus::Done(Box::new(rep), out),
+                    Err(e) => ItemStatus::Failed(e),
+                };
+            }
+            fin.store(true, Ordering::Release);
+        });
+        self.report.clear();
+        self.job = Some(job);
     }
 
     fn start_mic(&mut self) {
@@ -371,6 +742,10 @@ impl App {
     /// 转换列表里的全部文件：一个文件时按"输出到…"选的位置保存；多个文件时放进输出文件夹（或各自源文件旁边），
     /// 后台按 CPU 核数并行，长的文件先做。
     fn start_convert(&mut self) {
+        if self.mixing() {
+            self.start_mix_convert();
+            return;
+        }
         let paths = self.files.clone();
         if paths.is_empty() || self.job.is_some() {
             return;
@@ -397,6 +772,7 @@ impl App {
             finished: Arc::new(AtomicBool::new(false)),
             workers,
             t0: std::time::Instant::now(),
+            mix: None,
         };
         let (st, est, ca, fin, params) = (job.status.clone(), job.est.clone(), job.cancel.clone(), job.finished.clone(), self.s.params.clone());
         std::thread::spawn(move || {
@@ -433,8 +809,12 @@ impl App {
         self.job = Some(job);
     }
 
-    /// 试听：先在后台解码（已解码过同一个文件就直接用），再用实时引擎播放。
+    /// 试听：先在后台解码（已解码过同一个文件就直接用），再用实时引擎播放。合成时几个音频一起播。
     fn start_preview(&mut self) {
+        if self.mixing() {
+            self.start_mix_preview();
+            return;
+        }
         let Some(input) = self.file_in.clone() else { return };
         let selected_s = self.preview_s;
         self.stop();
@@ -489,6 +869,7 @@ impl App {
                 self.files.push(p);
             }
         }
+        self.ensure_voices();
         if let Some(p) = first {
             if select || self.file_in.is_none() {
                 self.set_file(p);
@@ -501,6 +882,10 @@ impl App {
     fn remove_file(&mut self, i: usize) {
         let p = self.files.remove(i);
         self.statuses.remove(&p);
+        // 它的位置空出来，留给补进合成的下一个音频
+        self.voices.remove(&p);
+        self.ensure_voices();
+        self.mix_sel = None;
         if self.file_in.as_ref() == Some(&p) {
             self.stop();
             self.file_in = None;
@@ -524,12 +909,19 @@ impl App {
         self.decoding = None;
         self.preview_pending = false;
         self.report.clear();
+        self.voices.clear();
+        self.mix_audio = None;
+        self.mix_decoding = None;
+        self.mix_failed = None;
+        self.mix_out = None;
+        self.mix_sel = None;
     }
 
-    /// 选中一个文件用来试听（不在列表里就加进去）。
+    /// 选中一个文件用来试听（不在列表里就加进去）。合成时不单独解码它（试听的是几个音频的合成）。
     fn set_file(&mut self, p: PathBuf) {
         if !self.files.contains(&p) {
             self.files.push(p.clone());
+            self.ensure_voices();
         }
         if self.file_in.as_ref() == Some(&p) {
             return;
@@ -540,7 +932,9 @@ impl App {
         self.decoded = None;
         self.preview_s = self.start_s.max(0.0) as f64;
         self.preview_dragging = false;
-        self.decode_file();
+        if !self.mixing() {
+            self.decode_file();
+        }
     }
 
     // ------------------------------------------------------------------ 各块界面
@@ -616,34 +1010,56 @@ impl App {
 
     /// 头顶俯视图：声源相对头的位置（上 = 正前方），半径按对数压缩，贴耳的细节看得清。
     /// 右侧的竖条是高度：从耳朵（声源在正前 / 正后方时从头中心）看过去，嘴在上方还是下方多少度。
+    /// 多音频合成时每个音源一个彩色圆点：各自固定时各自可以拖；一起移动时跟着走位动（手动时拖任意一个就是挪整组）。
     fn ui_radar(&mut self, ui: &mut egui::Ui, size: f32) {
         const GAUGE_W: f32 = 20.0;
-        let manual = self.s.params.mode == MotionMode::Manual;
-        let sense = if manual { egui::Sense::click_and_drag() } else { egui::Sense::hover() };
+        let mixing = self.mix_view();
+        let follow = mixing && self.s.mix_follow;
+        let fixed_mix = mixing && !follow;
+        let manual = !fixed_mix && self.s.params.mode == MotionMode::Manual;
+        let sense = if manual || fixed_mix { egui::Sense::click_and_drag() } else { egui::Sense::hover() };
         let (resp, p) = ui.allocate_painter(egui::vec2(size + GAUGE_W, size), sense);
         let rect = egui::Rect::from_min_size(resp.rect.min, egui::vec2(size, size));
         let c = rect.center();
         let rmax = size * 0.47;
         let map = |r: f32| -> f32 { radar_map(r) * rmax };
+        // （方位角, 水平距离）→ 图上的点
+        let pos = |az: f32, r: f32| {
+            let a = az.to_radians();
+            c + egui::vec2(a.sin(), -a.cos()) * map(r)
+        };
         // 右侧的高度标尺
         let (gx, g0, g1) = (rect.right() + 0.5 * GAUGE_W - 2.0, rect.top() + 30.0, rect.bottom() - 18.0);
         let gm = 0.5 * (g0 + g1);
         if self.shot.as_ref().map_or(false, |s| s.1 == 2) {
             eprintln!("位置图：中心 ({:.0}, {:.0})，满刻度 {:.0} px；高度标尺 x={:.0}，y={:.0}…{:.0}", c.x, c.y, rmax, gx, g0, g1);
         }
+        let on_gauge = |pt: egui::Pos2| pt.x > rect.right();
         if manual {
-            // 手动摆位：在俯视图里点 / 拖改方位和距离，在右侧竖条上点 / 拖改高度（双击竖条回到与耳朵齐平）
+            // 手动摆位：在俯视图里点 / 拖改方位和距离，在右侧竖条上点 / 拖改高度（双击竖条回到与耳朵齐平）。
+            // 合成"一起移动"时抓住离按下点最近的那个音源，拖它就是挪整组（其余音源保持错开的角度）
             let origin = ui.input(|i| i.pointer.press_origin());
-            let on_gauge = |pt: egui::Pos2| pt.x > rect.right();
+            let offsets = if follow { mix::follow_offsets(self.files.len().min(MAX_VOICES), true) } else { Vec::new() };
             if resp.is_pointer_button_down_on() {
+                if follow && self.mix_drag.is_none() {
+                    if let Some(o) = origin.filter(|&o| !on_gauge(o)) {
+                        let cur = self.mix_positions();
+                        let d = |q: &[f32; 4]| (pos(q[0], q[2] * q[1].to_radians().cos()) - o).length();
+                        self.mix_drag = cur.iter().enumerate().min_by(|a, b| d(a.1).total_cmp(&d(b.1))).map(|(k, _)| k);
+                    }
+                }
                 if let (Some(pt), Some(o)) = (resp.interact_pointer_pos(), origin) {
+                    let off = self.mix_drag.and_then(|k| offsets.get(k).copied()).unwrap_or(0.0);
                     let pr = &mut self.s.params;
                     if on_gauge(o) {
                         pr.manual_tilt = ((gm - pt.y) / (0.5 * (g1 - g0)) * 90.0).clamp(-80.0, 85.0);
                     } else {
-                        (pr.manual_az, pr.manual_dist) = radar_pick(pt - c, rmax);
+                        let (az, r) = radar_pick(pt - c, rmax);
+                        (pr.manual_az, pr.manual_dist) = ((az - off).rem_euclid(360.0), r);
                     }
                 }
+            } else if follow {
+                self.mix_drag = None;
             }
             if resp.double_clicked() && resp.interact_pointer_pos().map_or(false, on_gauge) {
                 self.s.params.manual_tilt = 0.0;
@@ -651,11 +1067,41 @@ impl App {
             if resp.hovered() {
                 ui.ctx().set_cursor_icon(if resp.is_pointer_button_down_on() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
             }
-            if self.rt.is_none() {
+            if self.rt.is_none() && !mixing {
                 // 没在运行：圆点直接显示摆好的位置
                 let pr = &self.s.params;
                 let (az, el, r) = lift_tilt(pr.manual_az, pr.manual_dist, 0.0, pr.manual_tilt);
                 (self.tele.az, self.tele.el, self.tele.r) = (az, el, r);
+            }
+        }
+        if fixed_mix {
+            // 多音频合成（各自固定）：按下时抓住离按下点最近的那个音源，拖到哪里它就摆到哪里（方位和距离）
+            let voices = self.mix_voices();
+            let ear = self.s.params.ear_dist;
+            let home = |v: &Voice| {
+                let a = v.az.to_radians();
+                c + egui::vec2(a.sin(), -a.cos()) * map(v.distance(ear))
+            };
+            if resp.is_pointer_button_down_on() {
+                if self.mix_drag.is_none() {
+                    if let Some(o) = ui.input(|i| i.pointer.press_origin()).filter(|&o| !on_gauge(o)) {
+                        self.mix_drag = voices.iter().enumerate().min_by(|a, b| (home(a.1) - o).length().total_cmp(&(home(b.1) - o).length())).map(|(k, _)| k);
+                        self.mix_sel = self.mix_drag.or(self.mix_sel);
+                    }
+                }
+                if let (Some(k), Some(pt)) = (self.mix_drag, resp.interact_pointer_pos()) {
+                    if let (Some(path), Some(&v0)) = (self.files.get(k).cloned(), voices.get(k)) {
+                        let (az, r) = radar_pick(pt - c, rmax);
+                        let v = self.voices.entry(path).or_insert(v0);
+                        v.az = az;
+                        v.dist = Some(r);
+                    }
+                }
+            } else {
+                self.mix_drag = None;
+            }
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(if resp.is_pointer_button_down_on() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
             }
         }
         let dark = ui.visuals().dark_mode;
@@ -679,10 +1125,87 @@ impl App {
         p.text(c + egui::vec2(-hr * 1.5, hr * 0.9), egui::Align2::RIGHT_TOP, t("左", "L"), egui::FontId::proportional(11.0), grid);
         p.text(c + egui::vec2(hr * 1.5, hr * 0.9), egui::Align2::LEFT_TOP, t("右", "R"), egui::FontId::proportional(11.0), grid);
         // 声源（嘴）和它的轨迹
-        let pos = |az: f32, r: f32| {
-            let a = az.to_radians();
-            c + egui::vec2(a.sin(), -a.cos()) * map(r)
-        };
+        let accent = Color32::from_rgb(70, 150, 240);
+        // 高度标尺：竖线、与耳朵齐平的刻度、上 / 下
+        p.line_segment([egui::pos2(gx, g0), egui::pos2(gx, g1)], egui::Stroke::new(2.0, grid));
+        p.line_segment([egui::pos2(gx - 4.0, gm), egui::pos2(gx + 4.0, gm)], egui::Stroke::new(1.5, grid));
+        p.text(egui::pos2(gx, g0 - 3.0), egui::Align2::CENTER_BOTTOM, t("上", "up"), egui::FontId::proportional(10.0), grid);
+        p.text(egui::pos2(gx, g1 + 2.0), egui::Align2::CENTER_TOP, t("下", "dn"), egui::FontId::proportional(10.0), grid);
+        let gauge_y = |up: f32| gm - (up / 90.0).clamp(-1.0, 1.0) * 0.5 * (g1 - g0);
+        let hgt_text = |up: f32| if up.abs() < 1.0 { String::new() } else { format!("   {} {:.0}°", if up > 0.0 { t("上", "up") } else { t("下", "down") }, up.abs()) };
+
+        if mixing {
+            // 每个音源：彩色实心点 = 此刻的位置（俯视投影），同色的圈 = 摆好的位置（拖它；一起移动时只有手动才有圈），
+            // 右侧竖条上是各自的高度
+            let active = self.rt.is_some() && self.rt_mix;
+            let pr = &self.s.params;
+            let offsets = mix::follow_offsets(self.files.len().min(MAX_VOICES), follow);
+            let voices = self.mix_voices();
+            let cur = self.mix_positions();
+            let ear = self.s.params.ear_dist;
+            if active {
+                self.mix_trails.resize(voices.len(), Vec::new());
+                for (tr, q) in self.mix_trails.iter_mut().zip(&cur) {
+                    tr.push((q[0], q[2] * q[1].to_radians().cos()));
+                    if tr.len() > 90 {
+                        tr.remove(0);
+                    }
+                }
+            }
+            for (k, tr) in self.mix_trails.iter().enumerate().take(voices.len()) {
+                let col = VOICE_COLORS[k];
+                let n = tr.len();
+                for (i, w) in tr.windows(2).enumerate() {
+                    let a = (i as f32 / n.max(1) as f32 * 150.0) as u8;
+                    p.line_segment([pos(w[0].0, w[0].1), pos(w[1].0, w[1].1)], egui::Stroke::new(2.0, Color32::from_rgba_unmultiplied(col.r(), col.g(), col.b(), a)));
+                }
+            }
+            let dot_at = |q: &[f32; 4]| pos(q[0], q[2] * q[1].to_radians().cos());
+            for (k, (v, q)) in voices.iter().zip(&cur).enumerate() {
+                let col = VOICE_COLORS[k];
+                let speaking = active && q[3] > 0.5;
+                let sel = self.mix_sel == Some(k) || self.mix_drag == Some(k);
+                let ring = if !follow {
+                    Some(pos(v.az, v.distance(ear)))
+                } else if manual {
+                    Some(pos(pr.manual_az + offsets[k], pr.manual_dist))
+                } else {
+                    None
+                };
+                if let Some(h) = ring {
+                    p.circle_stroke(h, 10.0, egui::Stroke::new(if sel { 2.5 } else { 1.5 }, col));
+                }
+                let label_at = ring.unwrap_or_else(|| dot_at(q));
+                p.text(label_at + egui::vec2(8.0, -8.0), egui::Align2::LEFT_BOTTOM, (k + 1).to_string(), egui::FontId::proportional(11.0), col);
+                let dot = if active { col } else { col.gamma_multiply(0.75) };
+                p.circle_filled(dot_at(q), if speaking { 7.0 } else { 5.5 }, dot);
+                let (up, _, _) = up_angle(q[0], q[1], q[2]);
+                p.circle_filled(egui::pos2(gx, gauge_y(up)), if speaking { 5.0 } else { 4.0 }, dot);
+            }
+            if follow && manual {
+                p.circle_stroke(egui::pos2(gx, gauge_y(pr.manual_tilt)), 7.0, egui::Stroke::new(1.5, accent));
+            }
+            // 读数：拖动时显示被拖的那个，鼠标停在图上时显示离鼠标最近的那个；平时不显示，免得挡住正前方的音源
+            let d = |k: usize, h: egui::Pos2| match (follow, voices.get(k)) {
+                (false, Some(v)) => (pos(v.az, v.distance(ear)) - h).length(),
+                _ => cur.get(k).map_or(f32::MAX, |q| (dot_at(q) - h).length()),
+            };
+            let hover_k = resp.hover_pos().and_then(|h| (0..cur.len()).min_by(|&a, &b| d(a, h).total_cmp(&d(b, h))));
+            if let Some((k, q)) = self.mix_drag.or(hover_k).and_then(|k| cur.get(k).map(|q| (k, q))) {
+                let (up, _, plan_r) = up_angle(q[0], q[1], q[2]);
+                p.text(rect.left_top() + egui::vec2(8.0, 6.0), egui::Align2::LEFT_TOP, format!("{} {}  {} {:.1} cm   {:.0}°{}", t("音源", "Source"), k + 1, t("离耳", "from ear"), ((plan_r - HEAD_A) * 100.0).max(0.0), q[0], hgt_text(up)), egui::FontId::proportional(12.0), VOICE_COLORS[k]);
+            }
+            let hint = if !follow {
+                t("拖动圆圈，改各音频的位置", "drag a ring to move that file")
+            } else if manual {
+                t("拖任意一个，整组一起挪 · 右侧拖高度", "drag any dot to move the group · height at right")
+            } else {
+                t("一起移动：按右侧「左右移动」走", "moving together: see Left / right motion")
+            };
+            p.text(rect.left_bottom() + egui::vec2(8.0, -5.0), egui::Align2::LEFT_BOTTOM, hint, egui::FontId::proportional(10.5), accent);
+            return;
+        }
+
         let active = self.rt.is_some();
         // 俯视图里画的是水平投影：声源升高时向头中心靠拢，从头顶绕过去时会穿过头的上方
         let (el, r3) = (self.tele.el.to_radians(), self.tele.r);
@@ -708,23 +1231,17 @@ impl App {
         };
         let sp = pos(self.tele.az, r_h);
         p.circle_filled(sp, if speaking && active { 7.0 } else { 5.5 }, col);
-        let accent = Color32::from_rgb(70, 150, 240);
         if manual {
             // 手动的目标位置：一个可以拖的圈（声音稍微滞后一点跟过来）
             let pr = &self.s.params;
             p.circle_stroke(pos(pr.manual_az, pr.manual_dist), 10.0, egui::Stroke::new(1.5, accent));
-            p.circle_stroke(egui::pos2(gx, gm - (pr.manual_tilt / 90.0).clamp(-1.0, 1.0) * 0.5 * (g1 - g0)), 7.0, egui::Stroke::new(1.5, accent));
+            p.circle_stroke(egui::pos2(gx, gauge_y(pr.manual_tilt)), 7.0, egui::Stroke::new(1.5, accent));
             p.text(rect.left_bottom() + egui::vec2(8.0, -5.0), egui::Align2::LEFT_BOTTOM, t("拖动圆点 · 右侧拖高度", "drag the dot · height at right"), egui::FontId::proportional(10.5), accent);
         }
         // 高度角：以"耳朵"为支点（与运动里倾斜的支点相同：正侧方时是那只耳朵，正前 / 正后方时是头中心）
         let (up, _, plan_r) = up_angle(self.tele.az, self.tele.el, r3);
-        p.line_segment([egui::pos2(gx, g0), egui::pos2(gx, g1)], egui::Stroke::new(2.0, grid));
-        p.line_segment([egui::pos2(gx - 4.0, gm), egui::pos2(gx + 4.0, gm)], egui::Stroke::new(1.5, grid));
-        p.text(egui::pos2(gx, g0 - 3.0), egui::Align2::CENTER_BOTTOM, t("上", "up"), egui::FontId::proportional(10.0), grid);
-        p.text(egui::pos2(gx, g1 + 2.0), egui::Align2::CENTER_TOP, t("下", "dn"), egui::FontId::proportional(10.0), grid);
-        p.circle_filled(egui::pos2(gx, gm - (up / 90.0).clamp(-1.0, 1.0) * 0.5 * (g1 - g0)), if speaking && active { 5.0 } else { 4.0 }, col);
-        let hgt = if up.abs() < 1.0 { String::new() } else { format!("   {} {:.0}°", if up > 0.0 { t("上", "up") } else { t("下", "down") }, up.abs()) };
-        p.text(rect.left_top() + egui::vec2(8.0, 6.0), egui::Align2::LEFT_TOP, format!("{} {:.1} cm   {:.0}°{}", t("离耳", "from ear"), ((plan_r - HEAD_A) * 100.0).max(0.0), self.tele.az, hgt), egui::FontId::proportional(12.0), fg);
+        p.circle_filled(egui::pos2(gx, gauge_y(up)), if speaking && active { 5.0 } else { 4.0 }, col);
+        p.text(rect.left_top() + egui::vec2(8.0, 6.0), egui::Align2::LEFT_TOP, format!("{} {:.1} cm   {:.0}°{}", t("离耳", "from ear"), ((plan_r - HEAD_A) * 100.0).max(0.0), self.tele.az, hgt_text(up)), egui::FontId::proportional(12.0), fg);
     }
 
     /// 电平条：`frac` 0–1 是填充比例，`hot` 时变红。
@@ -771,7 +1288,10 @@ impl App {
                 "打开后，穿梭、忽远忽近、自动上下、自然晃动全部停掉，声源停在你摆的位置：在位置图里点或拖改方位和距离，在右侧竖条上拖改高度（双击竖条回到与耳朵齐平）。运行中打开时，声源就停在此刻所在的位置。文件转换时相当于固定在这个位置",
                 "When on, all automatic motion stops (sweeps, near / far sway, auto up / down, micro motion) and the source stays where you put it: click or drag on the map for direction and distance, drag the bar at the right for height (double-click it for ear level). Turned on while running, the source stays where it is at that moment. For file conversion this is a fixed position",
             );
-            if ui.checkbox(&mut manual, t("手动摆位：关闭自动移动，拖动位置图里的声源", "Manual: stop automatic motion and drag the source on the map")).on_hover_text(tip).changed() {
+            // 合成·各自固定时没有手动摆位（直接拖各音频的圆圈）；一起移动时手动摆位就是拖整组
+            let fixed_mix = self.mix_view() && !self.s.mix_follow;
+            let r = ui.add_enabled(!fixed_mix, egui::Checkbox::new(&mut manual, t("手动摆位：关闭自动移动，拖动位置图里的声源", "Manual: stop automatic motion and drag the source on the map")));
+            if r.on_hover_text(tip).on_disabled_hover_text(t("多音频合成·各自固定时，直接在位置图上拖各音频的圆圈", "While mixing with fixed positions, drag each file's ring on the map")).changed() {
                 let p = &mut self.s.params;
                 p.mode = if manual { MotionMode::Manual } else { self.auto_mode };
                 p.level_follow = Params::default_level_follow(p.mode);
@@ -840,37 +1360,142 @@ impl App {
             ui.label(RichText::new(t("点「添加文件…」可以一次多选，也可以把文件或文件夹拖进窗口", "Use “Add files…” to pick several at once, or drop files / folders onto the window")).weak());
         } else {
             let (mut select, mut remove) = (None, None);
+            let mut edits: Vec<(PathBuf, Voice)> = Vec::new();
             let row_h = 22.0;
+            let mixing = self.mixing();
+            let follow = mixing && self.s.mix_follow;
+            let offsets = mix::follow_offsets(self.files.len().min(MAX_VOICES), true);
+            let files = self.files.clone();
             egui::Frame::new().fill(ui.visuals().extreme_bg_color).corner_radius(4.0).inner_margin(4.0).show(ui, |ui| {
                 egui::ScrollArea::vertical().id_salt("filelist").max_height(row_h * 5.0).auto_shrink([false, true]).show(ui, |ui| {
-                    for (i, p) in self.files.iter().enumerate() {
+                    for (i, p) in files.iter().enumerate() {
                         ui.horizontal(|ui| {
                             ui.set_min_height(row_h - 4.0);
                             if ui.add_enabled(!busy, egui::Button::new("×").small().frame(false)).on_hover_text(t("从列表移除", "Remove from list")).clicked() {
                                 remove = Some(i);
                             }
+                            let in_mix = mixing && i < MAX_VOICES;
+                            if in_mix {
+                                // 合成：行首是这个音源在位置图里的颜色和编号
+                                let (rect, _) = ui.allocate_exact_size(egui::vec2(18.0, 18.0), egui::Sense::hover());
+                                ui.painter().circle_filled(rect.center(), 8.0, VOICE_COLORS[i]);
+                                ui.painter().text(rect.center(), egui::Align2::CENTER_CENTER, (i + 1).to_string(), egui::FontId::proportional(11.0), Color32::WHITE);
+                            }
                             let status_w = 150.0;
-                            let name_w = (ui.available_width() - status_w - 8.0).max(60.0);
-                            let name = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
-                            let sel = self.file_in.as_ref() == Some(p);
-                            let r = ui.add_sized([name_w, row_h - 4.0], egui::Button::selectable(sel, name).truncate().right_text(""));
-                            if r.on_hover_text(format!("{}\n{}", p.display(), t("点击选中，用来试听", "Click to select for preview"))).clicked() {
+                            // 合成时右边是位置下拉框（宽度按界面语言里最长的位置名）和音量
+                            let combo_w = if ENGLISH.load(Ordering::Relaxed) { 104.0 } else { 64.0 };
+                            let ctl_w = if in_mix { combo_w + 70.0 + ui.spacing().item_spacing.x } else { status_w };
+                            let name_w = (ui.available_width() - ctl_w - 8.0).max(60.0);
+                            let name = file_name(p);
+                            let sel = if in_mix { self.mix_sel == Some(i) } else { self.file_in.as_ref() == Some(p) };
+                            let tip = if in_mix {
+                                t("合成时几个音频一起播放；点击选中它，位置图左上角显示它的位置", "Mixed files play together; click to show this one's position on the map")
+                            } else if mixing {
+                                t("合成最多用前 4 个音频，这个不参与", "Only the first 4 files are mixed; this one is not")
+                            } else {
+                                t("点击选中，用来试听", "Click to select for preview")
+                            };
+                            let text = if mixing && !in_mix { RichText::new(name).weak() } else { RichText::new(name) };
+                            let r = ui.add_sized([name_w, row_h - 4.0], egui::Button::selectable(sel, text).truncate().right_text(""));
+                            if r.on_hover_text(format!("{}\n{tip}", p.display())).clicked() && (!mixing || in_mix) {
                                 select = Some(i);
                             }
-                            Self::status_cell(ui, status_w, self.statuses.get(p));
+                            if in_mix {
+                                let mut v = self.voices.get(p).copied().unwrap_or_else(|| Voice::preset(i.min(1)));
+                                let before = v;
+                                // 一起移动：位置由走位决定，这里显示它比 1 号转过多少度（只有音量可调）
+                                let follow_off = follow.then(|| offsets[i]);
+                                ui.add_enabled_ui(!busy, |ui| Self::voice_controls(ui, i, &mut v, combo_w, follow_off));
+                                if v != before {
+                                    edits.push((p.clone(), v));
+                                }
+                            } else if mixing {
+                                ui.add_sized([status_w, 16.0], egui::Label::new(RichText::new(t("不参与合成", "not mixed")).small().weak()));
+                            } else {
+                                Self::status_cell(ui, status_w, self.statuses.get(p));
+                            }
                         });
                     }
                 });
             });
+            for (p, v) in edits {
+                self.voices.insert(p, v);
+            }
             if let Some(i) = remove {
                 self.remove_file(i);
             } else if let Some(i) = select {
                 let p = self.files[i].clone();
-                self.set_file(p);
+                if mixing {
+                    // 合成时点一行只是选中它（位置图显示它的读数），不打断正在播放的合成试听
+                    self.mix_sel = Some(i);
+                    self.file_out = Some(default_output(&p));
+                    self.file_in = Some(p);
+                } else {
+                    self.set_file(p);
+                }
             }
         }
-        // 输出位置：一个文件时可以指定文件名；多个文件时指定文件夹
-        if self.files.len() == 1 {
+        // 多音频合成开关
+        ui.horizontal(|ui| {
+            let mut on = self.s.mix;
+            let tip = t(
+                "勾上后，列表里的前 4 个音频各放一个位置（默认一个在左耳、一个在右耳，再多就放正前、正后），「试听」时一起播放，「合成并保存」输出一个文件。下面的「排布」可以选各自固定（位置在列表里选或在位置图上拖）或一起移动（按右侧「左右移动」的方式一起走，彼此始终相对）。各音频先自动对齐到一样响，列表里的 dB 是在这之上的加减",
+                "When on, the first 4 files each get a position (left ear and right ear by default, then front and back), play together in Preview, and Mix & save writes one file. Below, Layout picks Fixed (positions from the list or dragged on the map) or Together (they follow Left / right motion and always stay opposite). The files are matched in loudness first; the dB in the list is added on top",
+            );
+            if ui.add_enabled(!busy, egui::Checkbox::new(&mut on, t("多音频合成：几个音频各在一个位置，同时播放", "Multi-audio mix: files at different positions, played together"))).on_hover_text(tip).changed() {
+                self.set_mix_mode(on);
+            }
+            if self.s.mix {
+                let n = self.files.len();
+                let note = if n < 2 {
+                    t("再添加一个音频", "add another file").to_string()
+                } else if n > MAX_VOICES {
+                    format!("{} {MAX_VOICES} {}", t("只用前", "first"), t("个", "only"))
+                } else {
+                    format!("{} {MAX_VOICES} {}", t("最多", "up to"), t("个", "files"))
+                };
+                ui.label(RichText::new(note).small().weak());
+            }
+        });
+        // 合成的排布：各自固定 / 一起移动
+        if self.s.mix {
+            ui.horizontal(|ui| {
+                ui.label(t("排布", "Layout"));
+                let mut follow = self.s.mix_follow;
+                ui.selectable_value(&mut follow, false, t("各自固定", "Fixed")).on_hover_text(t(
+                    "每个音频固定在自己的位置（在列表里选，或在位置图上拖），只做忽远忽近、上下、自然晃动，不会跑到别的音频那边去",
+                    "Each file stays at its own position (pick it in the list or drag it on the map), with only near / far sway, up / down and micro motion",
+                ));
+                ui.selectable_value(&mut follow, true, t("一起移动", "Together")).on_hover_text(t(
+                    "几个音频按右侧「左右移动」的方式（穿梭、随机走位、环绕、固定、手动）一起走，彼此始终相隔 360°/个数：两个时正好在头的两侧相对，一个贴左耳时另一个贴右耳，换边时一个从脸前、一个从脑后绕过去，不会撞在一起。说话时钟按任何一个音频在说话来走",
+                    "The files follow Left / right motion (sweep, random, orbit, static, manual) together and always stay 360° / count apart: two files sit on opposite sides, one at the left ear while the other is at the right, and when they switch sides one passes in front and the other behind, so they never meet. Motion runs while any of the files is speaking",
+                ));
+                if follow != self.s.mix_follow {
+                    self.set_mix_follow(follow);
+                }
+                let note = if self.s.mix_follow { t("按右侧「左右移动」走，彼此相对", "follows Left / right motion, opposite") } else { t("位置在列表里选或在图上拖", "set in the list or on the map") };
+                ui.label(RichText::new(note).small().weak());
+            });
+        }
+        // 输出位置：合成时是一个文件；一个文件时可以指定文件名；多个文件时指定文件夹
+        if self.mixing() {
+            let out = self.mix_output();
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!busy, egui::Button::new(t("输出到…", "Save as…"))).clicked() {
+                    let mut dlg = rfd::FileDialog::new().add_filter("WAV", &["wav"]).set_file_name(file_name(&out));
+                    if let Some(d) = out.parent().filter(|d| d.is_dir()) {
+                        dlg = dlg.set_directory(d);
+                    }
+                    if let Some(p) = dlg.save_file() {
+                        self.mix_out = Some(p);
+                    }
+                }
+                ui.add(egui::Label::new(file_name(&out)).truncate()).on_hover_text(out.display().to_string());
+                if self.mix_out.is_some() && ui.add_enabled(!busy, egui::Button::new(t("默认名", "Default")).small()).on_hover_text(t("放回第一个音频旁边，名字加 _mix_asmr", "Back to the default: beside the first file, named …_mix_asmr")).clicked() {
+                    self.mix_out = None;
+                }
+            });
+        } else if self.files.len() == 1 {
             if let Some(out) = self.file_out.clone() {
                 ui.horizontal(|ui| {
                     if ui.add_enabled(!busy, egui::Button::new(t("输出到…", "Save as…"))).clicked() {
@@ -948,6 +1573,37 @@ impl App {
         }
     }
 
+    /// 文件列表里一个合成音源的位置下拉框（固定宽度 `combo_w`，放不下的字截断）和音量。
+    /// `follow_off`：一起移动时它比 1 号转过的角度（位置由走位决定，下拉框换成这个角度）。
+    fn voice_controls(ui: &mut egui::Ui, i: usize, v: &mut Voice, combo_w: f32, follow_off: Option<f32>) {
+        ui.allocate_ui_with_layout(egui::vec2(combo_w, 18.0), egui::Layout::left_to_right(egui::Align::Center), |ui| {
+            ui.set_max_width(combo_w);
+            if let Some(off) = follow_off {
+                let text = if i == 0 { t("领头", "lead").to_string() } else { format!("+{off:.0}°") };
+                ui.add_sized([combo_w, 18.0], egui::Label::new(RichText::new(text).weak())).on_hover_text(t(
+                    "一起移动：几个音频按同一套走位一起走，这个音频的位置比 1 号绕头转过这么多度（两个时 +180° 就是正对面）",
+                    "Moving together: the files share one path; this one is rotated around the head by this much from file 1 (+180° = directly opposite)",
+                ));
+                return;
+            }
+            egui::ComboBox::from_id_salt(("voice_pos", i))
+                .width(combo_w)
+                .truncate()
+                .selected_text(voice_name(v))
+                .show_ui(ui, |ui| {
+                    for (k, &(zh, en, _, _)) in PRESETS.iter().enumerate() {
+                        if ui.selectable_label(v.preset_index() == Some(k), t(zh, en)).clicked() {
+                            *v = Voice { gain_db: v.gain_db, ..Voice::preset(k) };
+                        }
+                    }
+                })
+                .response
+                .on_hover_text(t("这个音频放在哪里。也可以在位置图上直接拖它的圆圈", "Where this file sits. You can also drag its ring on the map"));
+        });
+        ui.add_sized([70.0, 18.0], egui::DragValue::new(&mut v.gain_db).range(-30.0..=12.0).speed(0.1).fixed_decimals(1).suffix(" dB"))
+            .on_hover_text(t("音量增减：几个音频先自动对齐到一样响，再按这个数加减（0 = 不变）。拖动或点击输入", "Volume offset: the files are first matched in loudness, then this is added (0 = unchanged). Drag or click to type"));
+    }
+
     fn ui_file(&mut self, ui: &mut egui::Ui) {
         let channel_before = self.s.file_channel;
         ui.group(|ui| {
@@ -977,6 +1633,9 @@ impl App {
                 ui.label(t("目标响度", "Loudness"));
                 ui.add(egui::Slider::new(&mut self.s.file_lufs, -24.0..=-10.0).clamping(egui::SliderClamping::Never).suffix(" LUFS").fixed_decimals(0));
                 ui.end_row();
+                if self.mixing() {
+                    return; // 合成只输出一个文件（几个音源的引擎已经各用一个核并行），没有"同时转换几个文件"
+                }
                 ui.label(t("同时转换", "Parallel"));
                 let cores = batch::default_threads();
                 let mut n = self.threads();
@@ -998,16 +1657,27 @@ impl App {
             let resume = self.rt_preview || self.preview_pending;
             self.stop();
             self.decoded = None;
+            self.mix_audio = None;
             self.preview_pending = resume;
-            self.decode_file();
+            if self.mixing() {
+                self.decode_mix();
+            } else {
+                self.decode_file();
+            }
         }
         self.ui_devices(ui, false);
         self.ui_status(ui);
         let has = self.file_in.is_some();
         let n_files = self.files.len();
+        let mixing = self.mixing();
         ui.horizontal(|ui| {
             let previewing = self.rt.is_some() && self.rt_preview;
-            if ui.add_enabled(has && !previewing && self.decoding.is_none(), egui::Button::new(t("试听", "Preview")).min_size(egui::vec2(96.0, 30.0))).on_hover_text(t("用实时引擎直接播放，可以边听边调右边的参数", "Plays through the real-time engine; tweak the parameters while listening")).clicked() {
+            let (can, tip) = if mixing {
+                (self.mix_decoding.is_none(), t("几个音频同时播放，各在自己的位置；可以边听边调右边的参数、在位置图上拖位置、改列表里的音量", "Plays the files together, each at its position; tweak parameters, drag positions on the map and change volumes while listening"))
+            } else {
+                (has && self.decoding.is_none(), t("用实时引擎直接播放，可以边听边调右边的参数", "Plays through the real-time engine; tweak the parameters while listening"))
+            };
+            if ui.add_enabled(can && !previewing, egui::Button::new(t("试听", "Preview")).min_size(egui::vec2(96.0, 30.0))).on_hover_text(tip).clicked() {
                 self.start_preview();
             }
             if ui.add_enabled(previewing, egui::Button::new(t("停止", "Stop")).min_size(egui::vec2(72.0, 30.0))).clicked() {
@@ -1015,8 +1685,18 @@ impl App {
                 self.status = t("已停止", "Stopped").to_string();
             }
             let busy = self.job.is_some();
-            let label = if n_files > 1 { format!("{}（{n_files}）", t("全部转换并保存", "Convert all")) } else { t("转换并保存", "Convert & save").to_string() };
-            if ui.add_enabled(n_files > 0 && !busy, egui::Button::new(RichText::new(label).strong()).min_size(egui::vec2(120.0, 30.0))).clicked() {
+            let label = if mixing {
+                format!("{}（{}）", t("合成并保存", "Mix & save"), n_files.min(MAX_VOICES))
+            } else if n_files > 1 {
+                format!("{}（{n_files}）", t("全部转换并保存", "Convert all"))
+            } else {
+                t("转换并保存", "Convert & save").to_string()
+            };
+            let mut r = ui.add_enabled(n_files > 0 && !busy, egui::Button::new(RichText::new(label).strong()).min_size(egui::vec2(120.0, 30.0)));
+            if mixing {
+                r = r.on_hover_text(t("把参与合成的音频合成一个双耳 WAV（长度按最长的那个）", "Mixes the files into one binaural WAV (as long as the longest file)"));
+            }
+            if r.clicked() {
                 self.start_convert();
             }
             if busy && ui.button(t("取消", "Cancel")).clicked() {
@@ -1025,8 +1705,9 @@ impl App {
                 }
             }
         });
-        if let Some((_, _, audio)) = &self.decoded {
-            let duration = audio.len() as f64 / FS as f64;
+        let preview_len = if mixing { self.mix_audio.as_ref().map(|m| m.len()) } else { self.decoded.as_ref().map(|(_, _, a)| a.len()) };
+        if let Some(len) = preview_len {
+            let duration = len as f64 / FS as f64;
             self.preview_s = self.preview_s.clamp(0.0, duration);
             ui.label(format!("{}  {} / {}", t("试听位置", "Preview position"), playback_time(self.preview_s), playback_time(duration)));
             let response = ui.scope(|ui| {
@@ -1085,8 +1766,9 @@ impl App {
         ui.add_space(3.0);
     }
 
-    /// 右侧第一栏：风格、贴耳感、左右移动。
-    fn params_left(ui: &mut egui::Ui, p: &mut Params) {
+    /// 右侧第一栏：风格、贴耳感、左右移动。`mix`：多音频合成中时是 Some(是否一起移动)——各自固定时左右移动不起作用，
+    /// 一起移动时几个音频按这里的方式一起走。
+    fn params_left(ui: &mut egui::Ui, p: &mut Params, mix: Option<bool>) {
         ui.horizontal(|ui| {
             ui.label(RichText::new(t("风格", "Style")).strong());
             if ui.button(t("贴耳加强", "Close to ear")).on_hover_text(t("嘴离耳约 1.7 cm，另一只耳朵几乎听不到，不加房间", "Mouth ≈1.7 cm from the ear, far ear almost silent, no room")).clicked() {
@@ -1121,6 +1803,29 @@ impl App {
             ui.checkbox(&mut p.ku100_eq, t("近耳用 KU100 实测校正曲线（高频更收）", "KU100-calibrated near-ear EQ (softer highs)"));
         });
         egui::CollapsingHeader::new(RichText::new(t("左右移动", "Left / right motion")).strong()).default_open(true).show(ui, |ui| {
+            let accent = Color32::from_rgb(70, 150, 240);
+            match mix {
+                Some(false) => {
+                    ui.add(egui::Label::new(RichText::new(t("多音频合成·各自固定：每个音频固定在自己的位置（在左边的列表里选，或在位置图上拖），下面的移动方式暂不起作用；忽远忽近、上下、自然晃动照常。想让它们一起动，把左边的「排布」改成「一起移动」", "Mixing, fixed: each file stays at its own position (pick it in the list or drag it on the map), so the motion modes below are inactive; near / far sway, up / down and micro motion still apply. Set Layout to Together on the left to move them")).small().color(accent)).wrap());
+                }
+                Some(true) => {
+                    ui.add(egui::Label::new(RichText::new(t("多音频合成·一起移动：几个音频按下面的方式一起走，彼此始终相隔 360°/个数（两个时正好相对：一个贴左耳时另一个贴右耳）", "Mixing, together: the files follow the motion below together and always stay 360° / count apart (two files: one at the left ear while the other is at the right)")).small().color(accent)).wrap());
+                }
+                None => {}
+            }
+            ui.add_enabled_ui(mix != Some(false), |ui| Self::motion_controls(ui, p));
+            egui::Grid::new("g2b").num_columns(2).min_col_width(COL).spacing([10.0, 6.0]).show(ui, |ui| {
+                row(ui, t("响度随位置变化", "Level follows position"), t("1 = 物理真实（贴耳很响、到脸前会弱很多），0 = 处处一样响", "1 = physical (loud at the ear, much quieter in front), 0 = constant"), egui::Slider::new(&mut p.level_follow, 0.0..=1.0).fixed_decimals(2));
+            });
+            if p.mode == MotionMode::Manual && mix != Some(false) {
+                ui.add(egui::Label::new(RichText::new(t("手动：声源停在你摆的位置，在左边的位置图上拖动。忽远忽近、上下、自然晃动此时不起作用", "Manual: the source stays where you put it; drag it on the map at the left. Near / far sway, up / down and micro motion are inactive")).weak().small()).wrap());
+            }
+        });
+    }
+
+    /// "左右移动"里的模式按钮和各模式的参数（合成时整块变灰）。
+    fn motion_controls(ui: &mut egui::Ui, p: &mut Params) {
+        {
             ui.horizontal(|ui| {
                 let before = p.mode;
                 for (m, zh, en) in [(MotionMode::Sweep, "穿梭", "Sweep"), (MotionMode::Random, "随机走位", "Random"), (MotionMode::Orbit, "环绕", "Orbit"), (MotionMode::Static, "固定", "Static"), (MotionMode::Manual, "手动", "Manual")] {
@@ -1165,11 +1870,7 @@ impl App {
                         row(ui, t("高度", "Height"), t("以耳朵为支点向上（正）/ 向下（负）偏多少度。也可以拖位置图右侧的竖条", "Above (+) / below (−) the ear, in degrees. Or drag the bar at the right of the map"), egui::Slider::new(&mut p.manual_tilt, -80.0..=85.0).suffix("°").fixed_decimals(0));
                     }
                 }
-                row(ui, t("响度随位置变化", "Level follows position"), t("1 = 物理真实（贴耳很响、到脸前会弱很多），0 = 处处一样响", "1 = physical (loud at the ear, much quieter in front), 0 = constant"), egui::Slider::new(&mut p.level_follow, 0.0..=1.0).fixed_decimals(2));
             });
-            if p.mode == MotionMode::Manual {
-                ui.add(egui::Label::new(RichText::new(t("手动：声源停在你摆的位置，在左边的位置图上拖动。忽远忽近、上下、自然晃动此时不起作用", "Manual: the source stays where you put it; drag it on the map at the left. Near / far sway, up / down and micro motion are inactive")).weak().small()).wrap());
-            }
             if matches!(p.mode, MotionMode::Sweep) {
                 ui.horizontal(|ui| {
                     ui.label(t("换边时从哪里绕", "Cross via"));
@@ -1178,14 +1879,15 @@ impl App {
                     }
                 });
             }
-        });
+        }
     }
 
-    /// 右侧第二栏：忽远忽近、KU100 临场感、人声处理、输出。
-    fn params_right(ui: &mut egui::Ui, p: &mut Params) {
+    /// 右侧第二栏：忽远忽近、KU100 临场感、人声处理、输出。`fixed_mix`：多音频合成·各自固定中（各音源用"固定"，
+    /// 手动摆位不起作用，忽远忽近、上下照常）。
+    fn params_right(ui: &mut egui::Ui, p: &mut Params, fixed_mix: bool) {
         egui::CollapsingHeader::new(RichText::new(t("忽远忽近", "Near / far sway")).strong()).default_open(true).show(ui, |ui| {
-            if p.mode == MotionMode::Manual {
-                ui.disable(); // 手动摆位时不起作用
+            if p.mode == MotionMode::Manual && !fixed_mix {
+                ui.disable(); // 手动摆位时不起作用（多音频合成·各自固定时各音源照常忽远忽近）
             }
             egui::Grid::new("g3").num_columns(2).min_col_width(COL).spacing([10.0, 6.0]).show(ui, |ui| {
                 row(ui, t("幅度", "Amount"), t("随机地凑近、往后让的幅度（0 = 关闭）", "How far it leans in and out (0 = off)"), egui::Slider::new(&mut p.sway, 0.0..=2.0).fixed_decimals(2));
@@ -1198,7 +1900,7 @@ impl App {
             });
         });
         egui::CollapsingHeader::new(RichText::new(t("上下", "Up / down")).strong()).default_open(true).show(ui, |ui| {
-            if p.mode == MotionMode::Manual {
+            if p.mode == MotionMode::Manual && !fixed_mix {
                 ui.disable(); // 手动摆位时不起作用（高度在"左右移动"里调，或拖位置图右侧的竖条）
             }
             egui::Grid::new("g7").num_columns(2).min_col_width(COL).spacing([10.0, 6.0]).show(ui, |ui| {
@@ -1287,19 +1989,56 @@ impl App {
             }
             self.last_mode = mode;
         }
-        if self.s.params != self.sent {
+        let changed = self.s.params != self.sent;
+        if changed {
             let cfg = Arc::new(EngineConfig::new(self.s.params.clone(), Some(&self.cfg)));
-            if let Some(rt) = &self.rt {
+            if let Some(rt) = self.rt.as_ref().filter(|_| !self.rt_mix) {
                 rt.set_config(cfg.clone());
             }
             self.cfg = cfg;
             self.sent = self.s.params.clone();
+        }
+        // 合成试听：参数、位置或音量变了，重新算各音源的配置交给音频线程（文件组变了时 sync_mix 会停掉重来）
+        if self.rt_mix && self.rt.is_some() {
+            let lufs = self.mix_audio.as_ref().filter(|m| m.paths == self.mix_paths()).map(|m| m.lufs.clone());
+            if let Some(lufs) = lufs {
+                if changed || self.mix_sent.as_ref().map_or(true, |(v, _)| *v != self.mix_voices()) {
+                    let (voices, setup) = self.mix_setup(&lufs);
+                    if let Some(rt) = &self.rt {
+                        rt.set_mix(setup.clone());
+                    }
+                    self.mix_sent = Some((voices, setup));
+                }
+            }
         }
     }
 
     /// 每帧的后台事务：试听解码完成、转换完成、设备出错。
     fn poll(&mut self, ctx: &egui::Context) {
         ENGLISH.store(self.s.english, Ordering::Relaxed);
+        if let Some(rx) = &self.mix_decoding {
+            if let Ok(r) = rx.try_recv() {
+                self.mix_decoding = None;
+                match r {
+                    Ok(m) => {
+                        if self.mixing() && m.paths == self.mix_paths() && m.ch == self.s.file_channel {
+                            self.mix_audio = Some(m);
+                            if self.preview_pending {
+                                self.start_preview();
+                            } else {
+                                self.status = t("要合成的音频已就绪：点「试听」或拖动播放条，几个音频会同时播放", "Files ready to mix: press Preview or drag the timeline to hear them together").to_string();
+                            }
+                        }
+                        // 否则解码期间文件组或声道变了：丢掉，sync_mix 会按新的重新解码
+                    }
+                    Err((paths, ch, e)) => {
+                        self.mix_failed = Some((paths, ch));
+                        self.preview_pending = false;
+                        self.status = e;
+                    }
+                }
+            }
+        }
         if let Some(rx) = &self.decoding {
             if let Ok(r) = rx.try_recv() {
                 self.decoding = None;
@@ -1333,7 +2072,10 @@ impl App {
             let ok = all.iter().filter(|s| matches!(s, ItemStatus::Done(..))).count();
             let n = all.len();
             self.report = match (n, all.first()) {
-                (1, Some(ItemStatus::Done(rep, out))) => report_text(rep, out),
+                (1, Some(ItemStatus::Done(rep, out))) => match &j.mix {
+                    Some(desc) => mix_report_text(rep, out, desc),
+                    None => report_text(rep, out),
+                },
                 (1, Some(ItemStatus::Failed(e))) => format!("{}：{e}", t("失败", "Failed")),
                 _ => {
                     let cancelled = all.iter().filter(|s| matches!(s, ItemStatus::Failed(e) if e == "已取消")).count();
@@ -1355,6 +2097,9 @@ impl App {
         let mut stop = false;
         if let Some(rt) = &self.rt {
             self.tele = rt.shared.telemetry();
+            if self.rt_mix {
+                self.mix_tele = rt.shared.voice_telemetry();
+            }
             if let Some(e) = rt.shared.take_error() {
                 self.status = e;
                 stop = true;
@@ -1382,7 +2127,7 @@ impl App {
             self.add_files(dropped, true);
             self.s.tab = Tab::File;
         }
-        if self.rt.is_some() || self.job.is_some() || self.decoding.is_some() {
+        if self.rt.is_some() || self.job.is_some() || self.decoding.is_some() || self.mix_decoding.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(33));
         }
     }
@@ -1395,7 +2140,8 @@ impl eframe::App for App {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
         if let (Some((_, frame)), Some([x0, y0, x1, y1])) = (&self.shot, self.shot_drag) {
             let frame = if self.file_in.is_some() {
-                if self.decoded.is_none() {
+                let ready = if self.mixing() { self.mix_audio.is_some() } else { self.decoded.is_some() };
+                if !ready {
                     return;
                 }
                 self.shot_drag_frame += 1;
@@ -1438,12 +2184,23 @@ impl eframe::App for App {
                     if ui.button(t("导出配置", "Export config")).clicked() {
                         self.export_config();
                     }
+                    if ui.button(t("导入配置", "Import config")).clicked() {
+                        self.import_config();
+                    }
                 });
             });
             ui.add_space(4.0);
         });
+        if self.s.tab == Tab::File {
+            self.sync_mix();
+        }
         egui::Panel::bottom("bottom").show(ui, |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                // 最右下角：项目的 GitHub
+                ui.hyperlink_to(RichText::new(t("给个star", "Give it a star")).strong().small(), GITHUB_URL)
+                    .on_hover_text(format!("{}\n{GITHUB_URL}", t("打开本项目的 GitHub 页面，觉得好用就点个 Star", "Open this project on GitHub; star it if you find it useful")));
+                ui.label(RichText::new("GitHub").small());
+                ui.separator();
                 ui.hyperlink_to(RichText::new("随意Official").strong().small(), "https://space.bilibili.com/79356601")
                     .on_hover_text(t("打开研发人的 B 站主页", "Open the developer's Bilibili profile"));
                 ui.label(RichText::new("研发人 B站").small());
@@ -1464,20 +2221,28 @@ impl eframe::App for App {
                 }
             });
         });
+        let mix = self.mix_view();
+        let layout = mix.then_some(self.s.mix_follow);
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().id_salt("rightscroll").show(ui, |ui| {
                 let p = &mut self.s.params;
                 ui.columns(2, |c| {
-                    Self::params_left(&mut c[0], p);
-                    Self::params_right(&mut c[1], p);
+                    Self::params_left(&mut c[0], p, layout);
+                    Self::params_right(&mut c[1], p, layout == Some(false));
                 });
             });
         });
 
-        // 3D 观察窗：只有打开时才绘制
+        // 3D 观察窗：只有打开时才绘制。合成时画每个音源（各自的颜色和编号）
         if self.s.view3d {
             let mut open = true;
             let (tele, active) = (self.tele, self.rt.is_some());
+            let dots: Vec<view3d::Dot> = if mix {
+                let live = active && self.rt_mix;
+                self.mix_positions().iter().enumerate().map(|(k, q)| view3d::Dot { xyz: view3d::to_xyz(q[0], q[1], q[2]), col: VOICE_COLORS[k], label: (k + 1).to_string(), speaking: live && q[3] > 0.5 }).collect()
+            } else {
+                Vec::new()
+            };
             let (v, params) = (&mut self.view3d, &mut self.s.params);
             egui::Window::new(t("3D 视图", "3D view"))
                 .id(egui::Id::unique("view3d_window"))
@@ -1486,7 +2251,7 @@ impl eframe::App for App {
                 .default_size([360.0, 400.0])
                 .min_size([240.0, 280.0])
                 .resizable(true)
-                .show(&ctx, |ui| v.ui(ui, &tele, active, params));
+                .show(&ctx, |ui| v.ui(ui, &tele, active, params, &dots));
             if !open {
                 self.s.view3d = false;
             }
@@ -1496,7 +2261,7 @@ impl eframe::App for App {
 
         self.sync_params();
 
-        if self.rt.is_some() || self.job.is_some() || self.decoding.is_some() {
+        if self.rt.is_some() || self.job.is_some() || self.decoding.is_some() || self.mix_decoding.is_some() {
             ctx.request_repaint_after(std::time::Duration::from_millis(16));
         }
         // 截图自检：等界面稳定后截一张图存成 PNG，然后退出
@@ -1506,8 +2271,16 @@ impl eframe::App for App {
             self.preview_s = 4.0;
             self.start_preview();
         }
-        let wait = if self.file_in.is_some() { 150 } else { 20 };
-        let drag_note = self.shot_drag.map(|_| format!("手动位置：方位角 {:.1}°，到头中心 {:.3} m，高度 {:.1}°", self.s.params.manual_az, self.s.params.manual_dist, self.s.params.manual_tilt));
+        let wait = self.shot_wait.unwrap_or(if self.file_in.is_some() { 150 } else { 20 });
+        let drag_note = self.shot_drag.map(|_| {
+            let mut s = format!("手动位置：方位角 {:.1}°，到头中心 {:.3} m，高度 {:.1}°", self.s.params.manual_az, self.s.params.manual_dist, self.s.params.manual_tilt);
+            if self.mixing() {
+                for (k, v) in self.mix_voices().iter().enumerate() {
+                    s.push_str(&format!("\n合成音源 {}：方位角 {:.1}°，到头中心 {}", k + 1, v.az, v.dist.map_or("贴耳".to_string(), |d| format!("{d:.3} m"))));
+                }
+            }
+            s
+        });
         if let Some((path, frames)) = &mut self.shot {
             *frames += 1;
             if *frames == wait {
@@ -1541,6 +2314,16 @@ impl eframe::App for App {
             eframe::set_value(storage, eframe::APP_KEY, &self.s);
         }
     }
+}
+
+/// 读取配置文件：既接受"导出配置"/自动保存的 eframe 键值格式（`{"app": "<Saved>"}`），
+/// 也接受直接写的 `Saved`（RON）。缺的项用默认值。
+fn parse_config(text: &str) -> Result<Saved, String> {
+    if let Ok(map) = ron::from_str::<std::collections::BTreeMap<String, String>>(text) {
+        let inner = map.get(eframe::APP_KEY).ok_or_else(|| t("文件里没有 auto-asmr 的配置", "No auto-asmr configuration in this file").to_string())?;
+        return ron::from_str::<Saved>(inner).map_err(|e| e.to_string());
+    }
+    ron::from_str::<Saved>(text).map_err(|e| e.to_string())
 }
 
 /// 总进度（按估计时长加权，0–1）、已结束的文件数、正在转换的文件数。
@@ -1594,6 +2377,26 @@ fn report_text(rep: &ConvertReport, out: &Path) -> String {
     )
 }
 
+/// 合成完成后的说明。`desc`：参与合成的音频和各自的位置。
+fn mix_report_text(rep: &ConvertReport, out: &Path, desc: &str) -> String {
+    format!(
+        "{}：{}\n{:.1} s，{:.1} LUFS，{} {:.1} dBTP，{} {:.1} dB；{} {:.1} s\n{}：{}{}",
+        t("已保存", "Saved"),
+        out.display(),
+        rep.seconds,
+        rep.lufs,
+        t("真峰值", "true peak"),
+        rep.true_peak_db,
+        t("限制器最多压", "limiter max"),
+        rep.max_gr_db,
+        t("用时", "took"),
+        rep.elapsed_s,
+        t("合成", "Mixed"),
+        desc,
+        if rep.channel_note.is_empty() { String::new() } else { format!("\n{}", rep.channel_note) }
+    )
+}
+
 fn playback_time(seconds: f64) -> String {
     let seconds = seconds.max(0.0) as u64;
     format!("{}:{:02}", seconds / 60, seconds % 60)
@@ -1631,14 +2434,16 @@ mod tests {
             };
             let expected = params.clone();
             let ctx = egui::Context::default();
-            for _ in 0..3 {
+            // 普通、合成·各自固定、合成·一起移动三种画法都画几遍
+            for k in 0..9 {
                 let _ = ctx.run_ui(egui::RawInput {
                     screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(2000.0, 3000.0))),
                     ..Default::default()
                 }, |ui| {
                     ui.columns(2, |columns| {
-                        App::params_left(&mut columns[0], &mut params);
-                        App::params_right(&mut columns[1], &mut params);
+                        let layout = [None, Some(false), Some(true)][k % 3];
+                        App::params_left(&mut columns[0], &mut params, layout);
+                        App::params_right(&mut columns[1], &mut params, layout == Some(false));
                     });
                 });
                 assert_eq!(params, expected, "drawing controls changed a manually entered value");
@@ -1647,6 +2452,39 @@ mod tests {
             let restored: Saved = ron::from_str(&ron::to_string(&saved).unwrap()).unwrap();
             assert_eq!(restored.params, expected);
         }
+    }
+
+    #[test]
+    fn mix_setting_and_voices_survive_serialization() {
+        // 合成开关随配置保存；Voice（位置、贴耳 / 固定距离、音量）可以序列化
+        let saved = Saved { mix: true, mix_follow: true, ..Saved::default() };
+        let restored: Saved = ron::from_str(&ron::to_string(&saved).unwrap()).unwrap();
+        assert!(restored.mix && restored.mix_follow);
+        // 旧配置文件里没有这两项：默认关、各自固定
+        let old: Saved = ron::from_str("(english:false)").unwrap();
+        assert!(!old.mix && !old.mix_follow);
+        let v = Voice { az: 45.0, dist: Some(0.3), gain_db: -3.0 };
+        assert_eq!(ron::from_str::<Voice>(&ron::to_string(&v).unwrap()).unwrap(), v);
+        assert_eq!(voice_name(&Voice::preset(0)), "左耳");
+        assert_eq!(voice_name(&Voice { az: 33.0, dist: Some(0.5), gain_db: 0.0 }), "33°");
+    }
+
+    #[test]
+    fn exported_config_can_be_imported() {
+        let saved = Saved { english: true, mix: true, buffer: 512, params: Params { puff: 2.5, ..Params::default() }, ..Saved::default() };
+        // 和 export_config 一样的写法
+        let inner = ron::ser::to_string_pretty(&saved, Default::default()).unwrap();
+        let text = ron::ser::to_string_pretty(&std::collections::BTreeMap::from([(eframe::APP_KEY, inner)]), Default::default()).unwrap();
+        let back = parse_config(&text).unwrap();
+        assert!(back.english && back.mix && back.buffer == 512);
+        assert_eq!(back.params, saved.params);
+        // 直接写的 Saved，只写几项
+        let bare = parse_config("(english:true,bits:16)").unwrap();
+        assert!(bare.english && bare.bits == 16);
+        assert_eq!(bare.params, Params::default());
+        // 别的程序的键值文件、乱写的文件：报错
+        assert!(parse_config("{\"other\": \"()\"}").is_err());
+        assert!(parse_config("not ron").is_err());
     }
 
     #[test]

@@ -228,6 +228,10 @@ pub struct Engine {
     pub n_speech: u64,
     /// 打开后记录每个控制块的 [时间 s, 方位角, 距离, 不含忽远忽近的距离, 说话活动, 仰角]（导出轨迹用）。
     pub trace: Option<Vec<[f32; 6]>>,
+    /// 多音频合成"一起移动"：整个位置绕头转这么多度（几个音源按同一套走位、彼此错开）。0 = 不转。
+    pub az_offset: f32,
+    /// 多音频合成"一起移动"：说话时钟按这个说话活动走，几个音源共用一个时钟、步调完全一致；None = 按自己的说话活动。
+    pub clock_act: Option<f32>,
     amp_ms: f32,
     live: bool,
     pause_s: f32,
@@ -289,6 +293,8 @@ impl Engine {
             n_blocks: 0,
             n_speech: 0,
             trace: None,
+            az_offset: 0.0,
+            clock_act: None,
             amp_ms: 1.0,
             live: false,
             pause_s: 0.0,
@@ -339,6 +345,12 @@ impl Engine {
         self.analyzer.set_fixed(thr_db, median_db);
     }
 
+    /// 下一个控制块的说话活动（0–1）。只在控制块边界上（刚处理完整数个控制块时）有意义：
+    /// 下一次 `process` 开始那一块用的就是这个值。多音频合成"一起移动"用它算几个音源共同的说话时钟。
+    pub fn upcoming_act(&self) -> f32 {
+        self.analyzer.features().act
+    }
+
     /// 算法本身的延时（样本，48 kHz）：降噪 20 ms（开启时）+ 预读 + 分数延时插值 + 限制器。
     /// 声音从嘴传到耳朵的传播时间（贴耳时约 0.3 ms）是效果的一部分，不算在内。
     pub fn latency_samples(&self) -> usize {
@@ -362,15 +374,17 @@ impl Engine {
             if f.act > 0.5 {
                 self.amp_ms += super::filters::ema_coef(8.0, CTRL_DT) * (a * a - self.amp_ms);
             }
+            // 说话时钟：平时按自己的说话活动走；"一起移动"时按几个音源共同的说话活动走
+            let ca = self.clock_act.unwrap_or(f.act);
             let step = if self.live {
-                if f.act > 0.5 {
+                if ca > 0.5 {
                     self.pause_s = 0.0;
                 } else {
                     self.pause_s += CTRL_DT;
                 }
-                clock_step_live(f.act, p.pause_motion, self.pause_s)
+                clock_step_live(ca, p.pause_motion, self.pause_s)
             } else {
-                clock_step(f.act, p.pause_motion)
+                clock_step(ca, p.pause_motion)
             };
             (step, a / self.amp_ms.max(0.25).sqrt())
         } else {
@@ -380,7 +394,12 @@ impl Engine {
         if self.n_blocks > (self.la_buf.len() / CTRL) as u64 {
             self.tm += step;
         }
-        let pose = self.motion.step(p, self.tm, amp, f.follow_db);
+        let mut pose = self.motion.step(p, self.tm, amp, f.follow_db);
+        if self.az_offset != 0.0 {
+            // 整个位置绕竖直轴转过去（刚体旋转，贴耳、上下的几何关系都不变）
+            pose.az = (pose.az + self.az_offset).rem_euclid(360.0);
+            pose.az_base = (pose.az_base + self.az_offset).rem_euclid(360.0);
+        }
         self.pose = pose;
         if let Some(tr) = &mut self.trace {
             let t = (self.n_blocks.saturating_sub((self.la_buf.len() / CTRL) as u64)) as f32 * CTRL_DT;

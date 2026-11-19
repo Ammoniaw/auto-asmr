@@ -4,6 +4,7 @@
 //! 输出设备的采样率。两个设备的时钟不会完全一致，用输出端重采样比例的微调（±0.5%）把缓冲量稳在目标值。
 
 use crate::dsp::engine::{Engine, EngineConfig, PostMode, Telemetry};
+use crate::dsp::mix::{MixSetup, Mixer, MAX_VOICES};
 use crate::dsp::resample::Resampler;
 use crate::dsp::{FS, FS_USIZE};
 use crate::spsc;
@@ -113,11 +114,19 @@ pub struct Shared {
     /// 待执行的文件跳转；音频回调取走最新请求，不重新打开输出设备。
     seek_sample: AtomicU64,
     error: Mutex<Option<String>>,
+    /// 多音频合成试听：当前的合成配置（与 `cfg` 共用版本号 `cfg_ver`）。
+    mix: Mutex<Option<Arc<MixSetup>>>,
+    /// 多音频合成试听时各音源此刻的位置：每个音源 [方位角, 仰角, 距离, 说话活动]。
+    vtele: [AtomicU32; MAX_VOICES * 4],
+    n_voices: AtomicU32,
 }
 
 impl Shared {
     fn new(cfg: Arc<EngineConfig>) -> Self {
         Shared {
+            mix: Mutex::new(None),
+            vtele: Default::default(),
+            n_voices: AtomicU32::new(0),
             cfg: Mutex::new(cfg),
             cfg_ver: AtomicU64::new(1),
             monitor_dry: AtomicBool::new(false),
@@ -181,6 +190,30 @@ impl Shared {
             *g = cfg;
             self.cfg_ver.fetch_add(1, Ordering::Release);
         }
+    }
+
+    fn set_mix(&self, setup: Arc<MixSetup>) {
+        if let Ok(mut g) = self.mix.lock() {
+            *g = Some(setup);
+            self.cfg_ver.fetch_add(1, Ordering::Release);
+        }
+    }
+
+    fn store_voice_tele(&self, mx: &Mixer) {
+        let n = mx.voices().min(MAX_VOICES);
+        for k in 0..n {
+            let t = mx.engine(k).tele;
+            for (j, x) in [t.az, t.el, t.r, t.act].into_iter().enumerate() {
+                self.vtele[k * 4 + j].store(x.to_bits(), Ordering::Relaxed);
+            }
+        }
+        self.n_voices.store(n as u32, Ordering::Relaxed);
+    }
+
+    /// 多音频合成试听时各音源此刻的 [方位角, 仰角, 距离, 说话活动]；不是合成试听时为空。
+    pub fn voice_telemetry(&self) -> Vec<[f32; 4]> {
+        let n = (self.n_voices.load(Ordering::Relaxed) as usize).min(MAX_VOICES);
+        (0..n).map(|k| std::array::from_fn(|j| f32::from_bits(self.vtele[k * 4 + j].load(Ordering::Relaxed)))).collect()
     }
 }
 
@@ -306,12 +339,38 @@ enum Source {
     Ring(spsc::Consumer),
     /// 试听文件：整段已解码成 48 kHz 单声道。
     Memory { data: Arc<Vec<f32>>, pos: usize },
+    /// 多音频合成的试听：几段音频（各自已解码成 48 kHz 单声道）同时播放，总长按最长的那段。
+    Multi { data: Vec<Arc<Vec<f32>>>, pos: usize, len: usize },
+}
+
+/// 输出回调里的处理器：一个引擎（麦克风 / 试听一个文件），或多音频合成（每个音源一个引擎，相加后统一收尾）。
+enum Proc {
+    One(Engine),
+    Mix(Mixer),
+}
+
+impl Proc {
+    fn latency_samples(&self) -> usize {
+        match self {
+            Proc::One(e) => e.latency_samples(),
+            Proc::Mix(m) => m.latency_samples(),
+        }
+    }
+
+    fn tele(&self) -> &Telemetry {
+        match self {
+            Proc::One(e) => &e.tele,
+            Proc::Mix(m) => &m.tele,
+        }
+    }
 }
 
 /// 输出回调里做的全部工作（不依赖声卡驱动，可以单独测试）。
 struct Pump {
     src: Source,
-    eng: Engine,
+    proc: Proc,
+    /// 多音频合成时每个音源的一块输入。
+    inbs: Vec<Vec<f32>>,
     shared: Arc<Shared>,
     cfg_ver: u64,
     rs: [Resampler; 2],
@@ -332,15 +391,29 @@ struct Pump {
 const N: usize = 64;
 
 impl Pump {
+    #[cfg(test)]
     fn new(src: Source, eng: Engine, shared: Arc<Shared>, out_rate: f64) -> Self {
-        shared.algo_samples.store(eng.latency_samples() as u32, Ordering::Relaxed);
-        if let Source::Memory { data, pos } = &src {
-            shared.play_len.store(data.len() as u64, Ordering::Relaxed);
-            shared.play_pos.store((*pos).min(data.len()) as u64, Ordering::Relaxed);
+        Self::with_proc(src, Proc::One(eng), shared, out_rate)
+    }
+
+    fn with_proc(src: Source, proc: Proc, shared: Arc<Shared>, out_rate: f64) -> Self {
+        shared.algo_samples.store(proc.latency_samples() as u32, Ordering::Relaxed);
+        match &src {
+            Source::Memory { data, pos } => {
+                shared.play_len.store(data.len() as u64, Ordering::Relaxed);
+                shared.play_pos.store((*pos).min(data.len()) as u64, Ordering::Relaxed);
+            }
+            Source::Multi { pos, len, .. } => {
+                shared.play_len.store(*len as u64, Ordering::Relaxed);
+                shared.play_pos.store((*pos).min(*len) as u64, Ordering::Relaxed);
+            }
+            Source::Ring(_) => {}
         }
+        let n_in = if let Source::Multi { data, .. } = &src { data.len() } else { 0 };
         Pump {
             src,
-            eng,
+            proc,
+            inbs: (0..n_in).map(|_| vec![0.0; N]).collect(),
             shared,
             cfg_ver: 1,
             rs: [Resampler::new(FS as f64, out_rate), Resampler::new(FS as f64, out_rate)],
@@ -376,6 +449,20 @@ impl Pump {
                 }
                 true
             }
+            Source::Multi { data, pos, len } => {
+                for (d, b) in data.iter().zip(self.inbs.iter_mut()) {
+                    let n = d.len();
+                    for (i, v) in b[..N].iter_mut().enumerate() {
+                        *v = if *pos + i < n { d[*pos + i] } else { 0.0 };
+                    }
+                }
+                *pos += N;
+                self.shared.play_pos.store((*pos).min(*len) as u64, Ordering::Relaxed);
+                if *pos > *len + FS_USIZE {
+                    self.shared.finished.store(true, Ordering::Relaxed);
+                }
+                true
+            }
         }
     }
 
@@ -385,16 +472,39 @@ impl Pump {
         // 界面改了参数：换一份配置（拿不到锁就下次再说，绝不等待）
         let ver = self.shared.cfg_ver.load(Ordering::Acquire);
         if ver != self.cfg_ver {
-            if let Ok(g) = self.shared.cfg.try_lock() {
-                self.eng.set_config(g.clone());
+            let applied = match &mut self.proc {
+                Proc::One(e) => match self.shared.cfg.try_lock() {
+                    Ok(g) => {
+                        e.set_config(g.clone());
+                        true
+                    }
+                    Err(_) => false,
+                },
+                // 合成：各音源的配置和增益（界面线程里已经算好，这里只换指针、抄增益，不分配内存）
+                Proc::Mix(m) => match self.shared.mix.try_lock() {
+                    Ok(g) => {
+                        if let Some(s) = g.as_ref() {
+                            m.set_setup(s);
+                        }
+                        true
+                    }
+                    Err(_) => false,
+                },
+            };
+            if applied {
                 self.cfg_ver = ver;
-                self.shared.algo_samples.store(self.eng.latency_samples() as u32, Ordering::Relaxed);
+                self.shared.algo_samples.store(self.proc.latency_samples() as u32, Ordering::Relaxed);
             }
         }
         let seek = self.shared.seek_sample.load(Ordering::Acquire);
         if seek != u64::MAX {
-            if let Source::Memory { data, pos } = &mut self.src {
-                *pos = seek.min(data.len() as u64) as usize;
+            let len = match &self.src {
+                Source::Memory { data, .. } => Some(data.len()),
+                Source::Multi { len, .. } => Some(*len),
+                Source::Ring(_) => None,
+            };
+            if let (Some(len), Source::Memory { pos, .. } | Source::Multi { pos, .. }) = (len, &mut self.src) {
+                *pos = seek.min(len as u64) as usize;
                 self.shared.play_pos.store(*pos as u64, Ordering::Relaxed);
                 self.shared.finished.store(false, Ordering::Relaxed);
                 for q in &mut self.q {
@@ -433,12 +543,27 @@ impl Pump {
                 stalled = true; // 输入还没到：这次先输出静音，引擎不往前走
                 break;
             }
-            if dry {
-                self.el[..N].copy_from_slice(&self.inb[..N]);
-                self.er[..N].copy_from_slice(&self.inb[..N]);
-            } else {
-                let (l, r) = (&mut self.el[..N], &mut self.er[..N]);
-                self.eng.process(&self.inb[..N], l, r);
+            match &mut self.proc {
+                Proc::One(eng) => {
+                    if dry {
+                        self.el[..N].copy_from_slice(&self.inb[..N]);
+                        self.er[..N].copy_from_slice(&self.inb[..N]);
+                    } else {
+                        eng.process(&self.inb[..N], &mut self.el[..N], &mut self.er[..N]);
+                    }
+                }
+                Proc::Mix(mx) => {
+                    if dry {
+                        for i in 0..N {
+                            let s: f32 = self.inbs.iter().map(|b| b[i]).sum();
+                            self.el[i] = s;
+                            self.er[i] = s;
+                        }
+                    } else {
+                        let ins: [&[f32]; MAX_VOICES] = std::array::from_fn(|k| self.inbs.get(k).map_or(&[][..], |b| &b[..N]));
+                        mx.process(&ins[..self.inbs.len().min(MAX_VOICES)], &mut self.el[..N], &mut self.er[..N]);
+                    }
+                }
             }
             if self.qpos > 0 && self.qpos == self.q[0].len() {
                 self.q[0].clear();
@@ -491,7 +616,10 @@ impl Pump {
             }
             self.shared.fill_us.store((self.fill_avg / FS * 1e6) as u32, Ordering::Relaxed);
         }
-        self.shared.store_tele(&self.eng.tele);
+        self.shared.store_tele(self.proc.tele());
+        if let Proc::Mix(mx) = &self.proc {
+            self.shared.store_voice_tele(mx);
+        }
         let us = t0.elapsed().as_secs_f32() * 1e6;
         self.proc_avg += 0.05 * (us - self.proc_avg);
         self.shared.proc_us.store(self.proc_avg as u32, Ordering::Relaxed);
@@ -520,18 +648,37 @@ fn mic_sink(in_rate: u32, mut tx: spsc::Producer, shared: Arc<Shared>) -> impl F
     }
 }
 
+/// 实时引擎的输入从哪里来。
+enum Feed {
+    Mic,
+    /// 试听一个文件：（48 kHz 单声道, 从第几个样本开始）。
+    File(Arc<Vec<f32>>, usize),
+    /// 多音频合成的试听：（各段 48 kHz 单声道, 合成配置, 从第几个样本开始）。
+    Mix(Vec<Arc<Vec<f32>>>, Arc<MixSetup>, usize),
+}
+
 impl Realtime {
     /// 麦克风 → 引擎 → 输出设备。
     pub fn start(opts: &RtOptions, cfg: Arc<EngineConfig>) -> Result<Realtime, String> {
-        Self::start_inner(opts, cfg, None)
+        Self::start_inner(opts, cfg, Feed::Mic)
     }
 
     /// 试听：用实时引擎把一段已解码的音频（48 kHz 单声道）播到输出设备，可以边听边调参数。
     pub fn start_preview(opts: &RtOptions, cfg: Arc<EngineConfig>, audio: Arc<Vec<f32>>, start_sample: usize) -> Result<Realtime, String> {
-        Self::start_inner(opts, cfg, Some((audio, start_sample)))
+        Self::start_inner(opts, cfg, Feed::File(audio, start_sample))
     }
 
-    fn start_inner(opts: &RtOptions, cfg: Arc<EngineConfig>, preview: Option<(Arc<Vec<f32>>, usize)>) -> Result<Realtime, String> {
+    /// 多音频合成的试听：几段已解码的音频（48 kHz 单声道，与 `setup` 里的音源一一对应）各在自己的位置，同时播放。
+    /// 播放中可以用 [`Realtime::set_mix`] 换参数、挪位置、改音量，不用重新开始。
+    pub fn start_preview_mix(opts: &RtOptions, setup: Arc<MixSetup>, audio: Vec<Arc<Vec<f32>>>, start_sample: usize) -> Result<Realtime, String> {
+        if audio.is_empty() || audio.len() != setup.cfgs.len() || audio.len() > MAX_VOICES {
+            return Err(format!("合成试听需要 1–{MAX_VOICES} 段音频，且与位置一一对应"));
+        }
+        let cfg = setup.cfgs[0].clone();
+        Self::start_inner(opts, cfg, Feed::Mix(audio, setup, start_sample))
+    }
+
+    fn start_inner(opts: &RtOptions, cfg: Arc<EngineConfig>, feed: Feed) -> Result<Realtime, String> {
         let host = host_of(opts.host);
         let find = |id: &Option<String>, input: bool| -> Result<cpal::Device, String> {
             let none = if input { "没有可用的输入设备（麦克风）" } else { "没有可用的输出设备" };
@@ -546,20 +693,33 @@ impl Realtime {
         let name = |d: &cpal::Device| d.description().map(|x| x.name().to_string()).unwrap_or_default();
         let out_dev = find(&opts.output, false)?;
         let (out_cfg, out_fmt) = pick_config(&out_dev, false, opts.buffer_frames)?;
-        let shared = Arc::new(Shared::new(cfg.clone()));
-        let mut eng = Engine::new(cfg, PostMode::Realtime, 0.0);
-        eng.set_live(preview.is_none());
+        let sh = Shared::new(cfg.clone());
+        if let Feed::Mix(_, setup, _) = &feed {
+            if let Ok(mut g) = sh.mix.lock() {
+                *g = Some(setup.clone());
+            }
+        }
+        let shared = Arc::new(sh);
         let out_rate = out_cfg.sample_rate as f64;
         let mut info = RtInfo { output_name: name(&out_dev), out_rate: out_cfg.sample_rate, out_channels: out_cfg.channels, ..Default::default() };
 
-        let (input, src) = match preview {
-            Some((audio, pos)) => {
+        let (input, src, proc) = match feed {
+            Feed::File(audio, pos) => {
                 info.input_name = "文件".into();
                 info.in_rate = FS_USIZE as u32;
                 info.in_channels = 1;
-                (None, Source::Memory { data: audio, pos })
+                // 试听不开主播模式的"话少时也一直在动"：动作严格跟着说话走，与文件转换一致
+                let eng = Engine::new(cfg, PostMode::Realtime, 0.0);
+                (None, Source::Memory { data: audio, pos }, Proc::One(eng))
             }
-            None => {
+            Feed::Mix(audio, setup, pos) => {
+                info.input_name = format!("{} 个文件合成", audio.len());
+                info.in_rate = FS_USIZE as u32;
+                info.in_channels = audio.len() as u16;
+                let len = audio.iter().map(|a| a.len()).max().unwrap_or(0);
+                (None, Source::Multi { data: audio, pos, len }, Proc::Mix(Mixer::new(&setup, PostMode::Realtime, 0.0)))
+            }
+            Feed::Mic => {
                 let in_dev = find(&opts.input, true)?;
                 let (in_cfg, in_fmt) = pick_config(&in_dev, true, opts.buffer_frames).map_err(|e| format!("{e}（可能没有麦克风，或没有授予麦克风权限）"))?;
                 info.input_name = name(&in_dev);
@@ -568,10 +728,12 @@ impl Realtime {
                 let (tx, rx) = spsc::channel(FS_USIZE); // 最多积压 1 秒
                 let sink = mic_sink(in_cfg.sample_rate, tx, shared.clone());
                 let st = by_format!(in_fmt, build_in, &in_dev, in_cfg, opts.input_channel, sink, shared.clone()).map_err(|e| err_text("打开输入设备失败（检查麦克风权限，或换一个缓冲大小）", e))?;
-                (Some(st), Source::Ring(rx))
+                let mut eng = Engine::new(cfg, PostMode::Realtime, 0.0);
+                eng.set_live(true);
+                (Some(st), Source::Ring(rx), Proc::One(eng))
             }
         };
-        let mut pump = Pump::new(src, eng, shared.clone(), out_rate);
+        let mut pump = Pump::with_proc(src, proc, shared.clone(), out_rate);
         let fill = move |l: &mut [f32], r: &mut [f32]| pump.fill(l, r);
         let output = by_format!(out_fmt, build_out, &out_dev, out_cfg, fill, shared.clone()).map_err(|e| err_text("打开输出设备失败（换一个缓冲大小试试）", e))?;
         if let Some(i) = &input {
@@ -584,6 +746,11 @@ impl Realtime {
     /// 界面改了参数后调用。
     pub fn set_config(&self, cfg: Arc<EngineConfig>) {
         self.shared.set_config(cfg);
+    }
+
+    /// 合成试听中改了参数、位置或音量后调用（音源数要与开始时相同）。
+    pub fn set_mix(&self, setup: Arc<MixSetup>) {
+        self.shared.set_mix(setup);
     }
 
     /// 估计的总延迟（毫秒）：输入缓冲 + 环形缓冲积压 + 算法 + 重采样 + 输出缓冲。不含声卡驱动自身的延迟。
@@ -708,6 +875,83 @@ mod tests {
         assert!(after < before * 0.02, "gain did not change: {before} -> {after}");
         assert!(shared.play_pos.load(Ordering::Relaxed) > position);
         assert!(!shared.preview_finished());
+    }
+
+    #[test]
+    fn mix_preview_keeps_sources_apart_follows_changes_and_seeks() {
+        use crate::dsp::mix::{voice_configs, Voice};
+        let energy = |v: &[f32]| v.iter().map(|x| (x * x) as f64).sum::<f64>() + 1e-30;
+        // 左耳的音源比右耳的短、而且是静音；右耳的在说话：输出几乎都在右耳，总长按长的那段
+        let x = crate::cli::test_voice(8.0);
+        let len = x.len();
+        let base = EngineConfig::new(Params { auto_level: false, ..Params::default() }, None);
+        let setup = |v: [Voice; 2]| Arc::new(MixSetup { cfgs: voice_configs(&base, &v, None), gains: vec![1.0, 1.0], offsets: vec![0.0; 2], follow: false });
+        let first = setup([Voice::preset(0), Voice::preset(1)]);
+        let shared = Arc::new(Shared::new(first.cfgs[0].clone()));
+        *shared.mix.lock().unwrap() = Some(first.clone());
+        let src = Source::Multi { data: vec![Arc::new(vec![0.0; len / 2]), Arc::new(x)], pos: 0, len };
+        let mut pump = Pump::with_proc(src, Proc::Mix(Mixer::new(&first, PostMode::Realtime, 0.0)), shared.clone(), 48_000.0);
+        assert_eq!(shared.play_len.load(Ordering::Relaxed), len as u64);
+        let (mut l, mut r) = (vec![0f32; 1024], vec![0f32; 1024]);
+        let mut run = |pump: &mut Pump, blocks: usize| {
+            let (mut el, mut er) = (0f64, 0f64);
+            for _ in 0..blocks {
+                pump.fill(&mut l, &mut r);
+                el += energy(&l);
+                er += energy(&r);
+            }
+            10.0 * (er / el).log10()
+        };
+        let right_over_left = run(&mut pump, 140); // 约 3 秒
+        assert!(right_over_left > 20.0, "右耳应比左耳响得多：{right_over_left:.1} dB");
+        let vt = shared.voice_telemetry();
+        assert_eq!(vt.len(), 2);
+        assert!(vt[0][0] > 180.0 && vt[1][0] < 180.0, "{vt:?}");
+        // 播放中把两个音源对调：说话的那个挪到左耳，不用重新开始；跳回开头对两个音源同时生效
+        shared.set_mix(setup([Voice::preset(1), Voice::preset(0)]));
+        shared.seek_preview(0);
+        run(&mut pump, 1);
+        assert!(shared.play_pos.load(Ordering::Relaxed) < 2048);
+        run(&mut pump, 90); // 等它挪过去
+        let after = run(&mut pump, 90);
+        assert!(after < -10.0, "挪到左耳后应左耳更响：右比左 {after:.1} dB");
+        assert!(shared.voice_telemetry()[1][0] > 180.0);
+        // 播到最长那段的结尾（再加 1 秒尾音）就结束
+        shared.seek_preview(u64::MAX);
+        run(&mut pump, 60);
+        assert!(shared.preview_finished());
+    }
+
+    #[test]
+    fn mix_preview_follow_mode_keeps_voices_opposite() {
+        use crate::dsp::mix::Voice;
+        // 一起移动的试听：两个音源始终在头的两侧相对；中途改移动方式（穿梭 → 环绕）也一样
+        let x = crate::cli::test_voice(16.0);
+        let len = x.len();
+        let base = Arc::new(EngineConfig::new(Params { auto_level: false, ..Params::default() }, None));
+        let voices = [Voice::preset(0), Voice::preset(1)];
+        let st = Arc::new(MixSetup::new(&base, &voices, &[None, None], true, None));
+        let shared = Arc::new(Shared::new(base.clone()));
+        *shared.mix.lock().unwrap() = Some(st.clone());
+        let audio = Arc::new(x);
+        let src = Source::Multi { data: vec![audio.clone(), audio], pos: 0, len };
+        let mut pump = Pump::with_proc(src, Proc::Mix(Mixer::new(&st, PostMode::Realtime, 0.0)), shared.clone(), 44_100.0);
+        let (mut l, mut r) = (vec![0f32; 512], vec![0f32; 512]);
+        let mut min_gap = 180.0f32;
+        let gap = |v: &[[f32; 4]]| ((v[0][0] - v[1][0] + 180.0).rem_euclid(360.0) - 180.0).abs();
+        for i in 0..1200 {
+            if i == 600 {
+                let p = Params { mode: crate::dsp::params::MotionMode::Orbit, auto_level: false, ..Params::default() };
+                let orbit = Arc::new(EngineConfig::new(p, Some(&base)));
+                shared.set_mix(Arc::new(MixSetup::new(&orbit, &voices, &[None, None], true, Some(&st))));
+            }
+            pump.fill(&mut l, &mut r);
+            let vt = shared.voice_telemetry();
+            if i > 5 {
+                min_gap = min_gap.min(gap(&vt));
+            }
+        }
+        assert!(min_gap > 150.0, "最近时只相隔 {min_gap:.0}°");
     }
 
     /// 用虚拟时钟模拟"输入回调每次 `n_in` 帧、输出回调每次 `n_out` 帧、输出设备时钟快 `drift`"，

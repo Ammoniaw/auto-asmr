@@ -1,10 +1,11 @@
 //! 命令行：不带参数启动图形界面；`convert` 转换文件；`devices` 列出音频设备；`bench` 测处理速度。
 
 use crate::dsp::engine::{Engine, EngineConfig, PostMode};
+use crate::dsp::mix::{self, Voice, MAX_VOICES, PRESETS};
 use crate::dsp::params::{MotionMode, Params, Playback, Via};
 use crate::dsp::tables::tables;
-use crate::dsp::{FS, FS_USIZE};
-use crate::offline::{convert, default_output, Channel, ConvertOptions};
+use crate::dsp::{FS, FS_USIZE, R_MAX, R_MIN};
+use crate::offline::{convert, convert_mix, default_mix_output, default_output, Channel, ConvertOptions, MixInput};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -15,6 +16,7 @@ pub const HELP: &str = "auto-asmr —— KU100 双耳 ASMR 空间化（纯 CPU�
   auto-asmr                          启动图形界面（实时 + 文件转换）
   auto-asmr convert <输入> [选项]    转换一个音频文件（wav / m4a / mp3 / flac / ogg …），输出 WAV
   auto-asmr convert <输入1> <输入2> … [选项]   批量转换：多个文件或文件夹，多线程并行
+  auto-asmr convert <输入1> <输入2> --mix [选项]   多音频合成：2–4 个音频各放一个位置（默认一左一右），合成一个文件
   auto-asmr devices                  列出本机的音频输入 / 输出设备
   auto-asmr bench                    测试处理速度
 
@@ -23,6 +25,14 @@ convert 的选项（括号里是默认值）：
  批量（多个输入，或输入是文件夹）
   --out-dir <文件夹>      输出都放进这个文件夹（默认放在各自源文件旁边，重名自动加 _2、_3）
   -j, --jobs <n>          同时转换几个文件（默认 = CPU 逻辑核数）
+ 多音频合成（几个音频同时播放，各在一个位置；左右移动换成各自固定，忽远忽近 / 上下 / 晃动照常）
+  --mix                   把输入的 2–4 个音频合成一个文件（输出：第一个输入名_mix_asmr.wav，或用 -o 指定）
+  --pos <位置,…>          各音源的位置，按输入顺序：left / right / front / back / front-left / front-right /
+                          back-left / back-right（也可写 左耳 / 右耳 / 正前 / 正后 / 左前 / 右前 / 左后 / 右后），
+                          或“方位角[:到头中心的距离 米]”，如 270、45:0.3（0 前 90 右 180 后 270 左）。默认 left,right,front,back
+  --mix-gain <dB,…>       各音源的音量增减，在自动对齐响度之后再加（默认都是 0），如 0,-3
+  --mix-follow            一起移动：几个音源按 --mode 的方式（穿梭 / 随机走位 / 环绕 / 固定）一起走，彼此相隔 360°/个数
+                          （两个时正好相对：一个贴左耳时另一个贴右耳，换边时一个从脸前、一个从脑后绕）；不加就是各自固定
   --style ear|ku100       ear=贴耳加强；ku100=像真实 KU100 实录（远耳听得到、离耳约 6 cm、真实房间）
   --start <秒> --duration <秒>      只处理一段
   --channel auto|left|right|mix     立体声取哪个声道（auto=更响的那个）
@@ -70,6 +80,42 @@ convert 的选项（括号里是默认值）：
 
 fn parse_f(v: Option<&String>, name: &str) -> Result<f32, String> {
     v.ok_or(format!("{name} 后面缺少数值"))?.parse::<f32>().map_err(|_| format!("{name} 的值不是数字"))
+}
+
+/// `--pos` 里的一个位置：预设名（英文或中文），或"方位角[:到头中心的距离 米]"。
+fn parse_pos(s: &str) -> Result<Voice, String> {
+    const EN: [&str; 8] = ["left", "right", "front", "back", "front-left", "front-right", "back-left", "back-right"];
+    let t = s.trim();
+    if let Some(i) = EN.iter().position(|n| n.eq_ignore_ascii_case(t)).or_else(|| PRESETS.iter().position(|p| p.0 == t)) {
+        return Ok(Voice::preset(i));
+    }
+    let bad = || format!("--pos 里的 {t:?} 不认识：写 left / right / front / back …，或 方位角[:距离]");
+    let (a, d) = match t.split_once(':') {
+        Some((a, d)) => (a, Some(d)),
+        None => (t, None),
+    };
+    let az = a.trim().parse::<f32>().map_err(|_| bad())?;
+    let dist = match d {
+        Some(d) => Some(d.trim().parse::<f32>().map_err(|_| bad())?.clamp(R_MIN, R_MAX)),
+        None => None,
+    };
+    Ok(Voice { az: az.rem_euclid(360.0), dist, gain_db: 0.0 })
+}
+
+/// 命令行输出里一个音源的位置说明。
+fn voice_text(v: &Voice) -> String {
+    let pos = match v.preset_index() {
+        Some(i) => PRESETS[i].0.to_string(),
+        None => match v.dist {
+            Some(d) => format!("方位 {:.0}°、离头中心 {:.0} cm", v.az, d * 100.0),
+            None => format!("方位 {:.0}°、贴耳", v.az),
+        },
+    };
+    if v.gain_db != 0.0 {
+        format!("{pos}，{:+.1} dB", v.gain_db)
+    } else {
+        pos
+    }
 }
 
 pub fn run(args: Vec<String>) -> i32 {
@@ -151,6 +197,8 @@ fn run_convert(args: &[String]) -> Result<(), String> {
     let (mut bits, mut lufs, mut peak, mut max_gr) = (24u16, -16.0f32, -1.0f32, 8.0f32);
     let mut level_follow: Option<f32> = None;
     let mut save_traj: Option<PathBuf> = None;
+    let (mut mix_on, mut mix_follow) = (false, false);
+    let (mut pos_list, mut gain_list): (Option<String>, Option<String>) = (None, None);
     // 风格先生效，后面的参数再覆盖
     if let Some(i) = args.iter().position(|a| a == "--style") {
         match args.get(i + 1).map(|s| s.as_str()) {
@@ -167,6 +215,10 @@ fn run_convert(args: &[String]) -> Result<(), String> {
             "-o" | "--output" => output = Some(PathBuf::from(it.next().ok_or("-o 后面缺少文件名")?)),
             "--out-dir" => out_dir = Some(PathBuf::from(it.next().ok_or("--out-dir 后面缺少文件夹")?)),
             "-j" | "--jobs" => jobs = (f(&mut it)? as usize).max(1),
+            "--mix" => mix_on = true,
+            "--mix-follow" => mix_follow = true,
+            "--pos" => pos_list = Some(it.next().ok_or("--pos 后面缺少位置")?.clone()),
+            "--mix-gain" => gain_list = Some(it.next().ok_or("--mix-gain 后面缺少数值")?.clone()),
             "--style" => {
                 it.next();
             }
@@ -305,6 +357,92 @@ fn run_convert(args: &[String]) -> Result<(), String> {
         }
     }
     p.level_follow = level_follow.unwrap_or(Params::default_level_follow(p.mode));
+    if (pos_list.is_some() || gain_list.is_some() || mix_follow) && !mix_on {
+        return Err("--pos / --mix-gain / --mix-follow 只用于多音频合成，请同时加 --mix".into());
+    }
+    if mix_follow && pos_list.is_some() {
+        return Err("一起移动时位置由 --mode 的走位决定，不能再用 --pos".into());
+    }
+    if mix_on {
+        if out_dir.is_some() {
+            return Err("多音频合成只输出一个文件，请用 -o 指定，不能用 --out-dir".into());
+        }
+        if save_traj.is_some() {
+            return Err("多音频合成不支持 --save-trajectory".into());
+        }
+        let inputs = crate::batch::expand_inputs(&inputs);
+        if inputs.len() < 2 || inputs.len() > MAX_VOICES {
+            return Err(format!("多音频合成需要 2–{MAX_VOICES} 个音频，现在是 {} 个", inputs.len()));
+        }
+        let mut voices: Vec<Voice> = Vec::new();
+        if let Some(s) = &pos_list {
+            for part in s.split(',').filter(|x| !x.trim().is_empty()) {
+                voices.push(parse_pos(part)?);
+            }
+            if voices.len() > inputs.len() {
+                return Err(format!("--pos 给了 {} 个位置，但只有 {} 个音频", voices.len(), inputs.len()));
+            }
+        }
+        while voices.len() < inputs.len() {
+            let v = mix::default_voice(&voices);
+            voices.push(v);
+        }
+        if let Some(s) = &gain_list {
+            let g = s.split(',').map(|x| x.trim().parse::<f32>().map_err(|_| format!("--mix-gain 里的 {:?} 不是数字", x.trim()))).collect::<Result<Vec<f32>, String>>()?;
+            if g.len() > inputs.len() {
+                return Err(format!("--mix-gain 给了 {} 个数值，但只有 {} 个音频", g.len(), inputs.len()));
+            }
+            for (v, g) in voices.iter_mut().zip(g) {
+                v.gain_db = g;
+            }
+        }
+        let mut opts = ConvertOptions::new(inputs[0].clone());
+        opts.output = output.unwrap_or_else(|| default_mix_output(&inputs[0]));
+        opts.start = start;
+        opts.duration = duration;
+        opts.channel = channel;
+        opts.bits = bits;
+        opts.lufs = lufs;
+        opts.peak_db = peak;
+        opts.max_gr_db = max_gr;
+        let items: Vec<MixInput> = inputs.iter().cloned().zip(voices.iter().copied()).map(|(path, voice)| MixInput { path, voice }).collect();
+        if mix_follow {
+            eprintln!("多音频合成 {} 个音频，一起移动（彼此相隔 {:.0}°）：", items.len(), 360.0 / items.len() as f32);
+        } else {
+            eprintln!("多音频合成 {} 个音频，各自固定：", items.len());
+        }
+        for (k, it) in items.iter().enumerate() {
+            let pos = if mix_follow { format!("+{:.0}°{}", 360.0 * k as f32 / items.len() as f32, if it.voice.gain_db != 0.0 { format!("，{:+.1} dB", it.voice.gain_db) } else { String::new() }) } else { voice_text(&it.voice) };
+            eprintln!("  {}. {}（{pos}）", k + 1, it.path.display());
+        }
+        let mut last = -1i32;
+        let rep = convert_mix(&opts, &items, &p, mix_follow, Arc::new(AtomicBool::new(false)), |f, stage| {
+            let pc = (f * 100.0) as i32;
+            if pc / 10 != last / 10 {
+                eprintln!("  {stage} {pc}%");
+                last = pc;
+            }
+        })?;
+        if !rep.channel_note.is_empty() {
+            println!("{}", rep.channel_note);
+        }
+        println!(
+            "完成：{}  ({:.1} s，{:.1} LUFS，真峰值 {:.1} dBTP，限制器最多压 {:.1} dB；说话平均占 {:.0}%，{}；用时 {:.1} s)",
+            opts.output.display(),
+            rep.seconds,
+            rep.lufs,
+            rep.true_peak_db,
+            rep.max_gr_db,
+            rep.speech_pct,
+            if mix_follow {
+                format!("一起换边 {} 次（其中从头顶绕 {} 次），往后让 {} 次，上下换位 {} 次", rep.n_moves, rep.n_tops, rep.n_sways, rep.n_updowns)
+            } else {
+                format!("往后让共 {} 次，上下换位共 {} 次", rep.n_sways, rep.n_updowns)
+            },
+            rep.elapsed_s
+        );
+        return Ok(());
+    }
     let is_batch = inputs.len() > 1 || inputs.iter().any(|p| p.is_dir()) || out_dir.is_some();
     let inputs = crate::batch::expand_inputs(&inputs);
     if inputs.is_empty() {
@@ -674,5 +812,30 @@ fn bench() {
             1e6 * worst,
             1000.0 * eng.latency_samples() as f64 / FS_USIZE as f64
         );
+    }
+    // 多音频合成的试听：每个音源一个引擎，相加后统一做自动响度和限幅
+    for (n, follow) in [(2usize, false), (MAX_VOICES, false), (2, true)] {
+        let base = Arc::new(EngineConfig::new(Params::default(), None));
+        let mut voices: Vec<Voice> = Vec::new();
+        for _ in 0..n {
+            let v = mix::default_voice(&voices);
+            voices.push(v);
+        }
+        let setup = mix::MixSetup::new(&base, &voices, &vec![None; n], follow, None);
+        let mut mx = mix::Mixer::new(&setup, PostMode::Realtime, 0.0);
+        // 各音源错开 0.1 s，免得几路完全相同
+        let ins: Vec<Vec<f32>> = (0..n).map(|k| x.iter().copied().skip(k * 4800).chain(std::iter::repeat(0.0).take(k * 4800)).collect()).collect();
+        let (mut l, mut r) = ([0f32; 128], [0f32; 128]);
+        let (mut worst, mut total) = (0f64, 0f64);
+        for o in (0..x.len() - 128).step_by(128) {
+            let refs: Vec<&[f32]> = ins.iter().map(|v| &v[o..o + 128]).collect();
+            let t0 = std::time::Instant::now();
+            mx.process(&refs, &mut l, &mut r);
+            let dt = t0.elapsed().as_secs_f64();
+            worst = worst.max(dt);
+            total += dt;
+        }
+        let secs = x.len() as f64 / FS_USIZE as f64;
+        println!("  多音频合成 {n} 个音源{}（试听）：单核占用约 {:.1}%；每块平均 {:.0} µs，最慢 {:.0} µs", if follow { "、一起移动" } else { "" }, 100.0 * total / secs, 1e6 * total / (x.len() / 128) as f64, 1e6 * worst);
     }
 }

@@ -6,6 +6,7 @@ pub mod direct;
 pub mod dynamics;
 pub mod engine;
 pub mod filters;
+pub mod mix;
 pub mod motion;
 pub mod params;
 pub mod pinna;

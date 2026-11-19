@@ -98,7 +98,8 @@ pub fn plan_outputs(inputs: &[PathBuf], out_dir: Option<&Path>) -> Vec<PathBuf> 
         .collect()
 }
 
-fn normalize(p: &Path) -> PathBuf {
+/// 规范化路径，用来判断两个路径是不是同一个文件（文件还不存在时规范化所在文件夹）。
+pub fn normalize(p: &Path) -> PathBuf {
     std::fs::canonicalize(p).unwrap_or_else(|_| {
         // 文件还不存在：把所在文件夹规范化后再接上文件名
         match (p.parent().and_then(|d| std::fs::canonicalize(if d.as_os_str().is_empty() { Path::new(".") } else { d }).ok()), p.file_name()) {
