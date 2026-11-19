@@ -5,12 +5,14 @@ use crate::dsp::params::{MotionMode, Params, Playback, Via, DENOISE_MAX_DB};
 use crate::dsp::tables::tables;
 use crate::dsp::motion::lift_tilt;
 use crate::dsp::{FS, HEAD_A, R_MIN, R_MAX};
-use crate::offline::{convert, default_output, load_mono, Channel, ConvertOptions, ConvertReport};
+use crate::batch;
+use crate::offline::{default_output, load_mono, Channel, ConvertOptions, ConvertReport};
 use crate::realtime::{self, DeviceInfo, DeviceList, Realtime, RtOptions};
 use eframe::egui;
 use egui::{Color32, RichText};
 use serde::{Deserialize, Serialize};
-use std::path::PathBuf;
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver};
 use std::sync::{Arc, Mutex};
@@ -102,19 +104,37 @@ struct Saved {
     bits: u16,
     file_lufs: f32,
     file_channel: u8,
+    /// 批量转换同时处理几个文件；0 = 自动（CPU 逻辑核数）。
+    jobs: usize,
+    /// 批量转换的输出文件夹；None = 放在各自源文件旁边。
+    out_dir: Option<PathBuf>,
 }
 
 impl Default for Saved {
     fn default() -> Self {
-        Saved { params: Params::default(), english: false, tab: Tab::Realtime, host: String::new(), input: None, output: None, buffer: 256, in_channel: 0, dry: false, bits: 24, file_lufs: -16.0, file_channel: 0 }
+        Saved { params: Params::default(), english: false, tab: Tab::Realtime, host: String::new(), input: None, output: None, buffer: 256, in_channel: 0, dry: false, bits: 24, file_lufs: -16.0, file_channel: 0, jobs: 0, out_dir: None }
     }
 }
 
+/// 列表里一个文件的转换状态。
+#[derive(Clone)]
+enum ItemStatus {
+    Waiting,
+    Running(f32, String),
+    Done(Box<ConvertReport>, PathBuf),
+    Failed(String),
+}
+
+/// 一次转换（单个文件或一批文件）。工作线程更新 `status`，界面每帧读一次。
 struct Job {
-    progress: Arc<Mutex<(f32, String)>>,
+    paths: Vec<PathBuf>,
+    status: Arc<Vec<Mutex<ItemStatus>>>,
+    /// 每个文件的估计时长（秒），用来给总进度加权；后台线程估计好之前为空（按等权算）。
+    est: Arc<Mutex<Vec<f64>>>,
     cancel: Arc<AtomicBool>,
-    result: Arc<Mutex<Option<Result<ConvertReport, String>>>>,
-    output: PathBuf,
+    finished: Arc<AtomicBool>,
+    workers: usize,
+    t0: std::time::Instant,
 }
 
 type Decoded = Result<(PathBuf, u8, Arc<Vec<f32>>), String>;
@@ -128,6 +148,9 @@ pub struct App {
     rt: Option<Realtime>,
     rt_preview: bool,
     status: String,
+    /// 文件页的待转换列表；`file_in` 是其中选中用来试听的那个。
+    files: Vec<PathBuf>,
+    statuses: HashMap<PathBuf, ItemStatus>,
     file_in: Option<PathBuf>,
     file_out: Option<PathBuf>,
     start_s: f32,
@@ -211,7 +234,8 @@ impl App {
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         cc.egui_ctx.set_global_style(style);
         let s_mode = s.params.mode;
-        App {
+        let is_shot = shot.is_some();
+        let mut app = App {
             sent: s.params.clone(),
             s,
             cfg,
@@ -220,6 +244,8 @@ impl App {
             rt: None,
             rt_preview: false,
             status: String::new(),
+            files: Vec::new(),
+            statuses: HashMap::new(),
             file_in: None,
             file_out: None,
             start_s: 0.0,
@@ -242,7 +268,20 @@ impl App {
             }),
             shot_drag_frame: 0,
             demo,
+        };
+        if is_shot {
+            // 截图自检批量转换：AUTO_ASMR_SHOT_FILES="a;b;c" 预先放进文件列表；
+            // AUTO_ASMR_SHOT_CONVERT=<输出文件夹> 再以每个文件 600 秒开始全部转换，截下转换中的画面（退出时取消）
+            if let Ok(v) = std::env::var("AUTO_ASMR_SHOT_FILES") {
+                app.add_files(v.split(';').filter(|x| !x.is_empty()).map(PathBuf::from).collect(), false);
+            }
+            if let Ok(d) = std::env::var("AUTO_ASMR_SHOT_CONVERT") {
+                app.s.out_dir = Some(PathBuf::from(d));
+                app.dur_s = 600.0;
+                app.start_convert();
+            }
         }
+        app
     }
 
     fn host_id(&self) -> Option<cpal::HostId> {
@@ -291,33 +330,88 @@ impl App {
         }
     }
 
-    fn convert_options(&self) -> Option<ConvertOptions> {
-        let input = self.file_in.clone()?;
-        let mut o = ConvertOptions::new(input.clone());
-        o.output = self.file_out.clone().unwrap_or_else(|| default_output(&input));
+    fn convert_options(&self, input: PathBuf, output: PathBuf) -> ConvertOptions {
+        let mut o = ConvertOptions::new(input);
+        o.output = output;
         o.start = self.start_s.max(0.0) as f64;
         o.duration = if self.dur_s > 0.0 { Some(self.dur_s as f64) } else { None };
         o.channel = self.file_channel();
         o.bits = self.s.bits;
         o.lufs = self.s.file_lufs;
         o.peak_db = self.s.params.ceiling_db;
-        Some(o)
+        o
     }
 
+    /// 同时转换几个文件。
+    fn threads(&self) -> usize {
+        if self.s.jobs == 0 {
+            batch::default_threads()
+        } else {
+            self.s.jobs
+        }
+    }
+
+    /// 转换列表里的全部文件：一个文件时按"输出到…"选的位置保存；多个文件时放进输出文件夹（或各自源文件旁边），
+    /// 后台按 CPU 核数并行，长的文件先做。
     fn start_convert(&mut self) {
-        let Some(opts) = self.convert_options() else { return };
-        let job = Job { progress: Arc::new(Mutex::new((0.0, String::new()))), cancel: Arc::new(AtomicBool::new(false)), result: Arc::new(Mutex::new(None)), output: opts.output.clone() };
-        let (pr, ca, re, params) = (job.progress.clone(), job.cancel.clone(), job.result.clone(), self.s.params.clone());
-        std::thread::spawn(move || {
-            let r = convert(&opts, &params, ca, |f, stage| {
-                if let Ok(mut g) = pr.lock() {
-                    *g = (f, stage.to_string());
+        let paths = self.files.clone();
+        if paths.is_empty() || self.job.is_some() {
+            return;
+        }
+        let outs = if paths.len() == 1 {
+            vec![self.file_out.clone().unwrap_or_else(|| default_output(&paths[0]))]
+        } else {
+            if let Some(d) = &self.s.out_dir {
+                if let Err(e) = std::fs::create_dir_all(d) {
+                    self.status = format!("{} {}：{e}", t("无法创建输出文件夹", "Cannot create output folder"), d.display());
+                    return;
                 }
-            });
-            if let Ok(mut g) = re.lock() {
-                *g = Some(r);
             }
+            batch::plan_outputs(&paths, self.s.out_dir.as_deref())
+        };
+        let items: Vec<ConvertOptions> = paths.iter().cloned().zip(outs).map(|(i, o)| self.convert_options(i, o)).collect();
+        let n = items.len();
+        let workers = self.threads().clamp(1, n);
+        let job = Job {
+            paths: paths.clone(),
+            status: Arc::new((0..n).map(|_| Mutex::new(ItemStatus::Waiting)).collect()),
+            est: Arc::new(Mutex::new(Vec::new())),
+            cancel: Arc::new(AtomicBool::new(false)),
+            finished: Arc::new(AtomicBool::new(false)),
+            workers,
+            t0: std::time::Instant::now(),
+        };
+        let (st, est, ca, fin, params) = (job.status.clone(), job.est.clone(), job.cancel.clone(), job.finished.clone(), self.s.params.clone());
+        std::thread::spawn(move || {
+            let e = batch::estimates(&items);
+            if let Ok(mut g) = est.lock() {
+                *g = e.clone();
+            }
+            batch::run(
+                &items,
+                &e,
+                &params,
+                workers,
+                &ca,
+                |i, f, stage| {
+                    if let Ok(mut g) = st[i].lock() {
+                        *g = ItemStatus::Running(f, stage.to_string());
+                    }
+                },
+                |i, r| {
+                    if let Ok(mut g) = st[i].lock() {
+                        *g = match r {
+                            Ok(rep) => ItemStatus::Done(Box::new(rep), items[i].output.clone()),
+                            Err(e) => ItemStatus::Failed(e),
+                        };
+                    }
+                },
+            );
+            fin.store(true, Ordering::Release);
         });
+        for p in &paths {
+            self.statuses.insert(p.clone(), ItemStatus::Waiting);
+        }
         self.report.clear();
         self.job = Some(job);
     }
@@ -364,14 +458,71 @@ impl App {
         self.status = t("正在解码…", "Decoding…").to_string();
     }
 
+    /// 把文件 / 文件夹加进列表（文件夹展开为其中的音频文件），已在列表里的不重复加。
+    /// 列表原来是空的、或 `select` 为真时，选中新加的第一个用来试听。
+    fn add_files(&mut self, paths: Vec<PathBuf>, select: bool) {
+        if self.job.is_some() {
+            self.status = t("正在转换，完成后才能修改列表", "Converting; the list can be changed when it finishes").to_string();
+            return;
+        }
+        let mut first = None;
+        for p in batch::expand_inputs(&paths) {
+            if !self.files.contains(&p) {
+                first.get_or_insert(p.clone());
+                self.files.push(p);
+            }
+        }
+        if let Some(p) = first {
+            if select || self.file_in.is_none() {
+                self.set_file(p);
+            }
+        } else if !paths.is_empty() && paths.iter().any(|p| p.is_dir()) {
+            self.status = t("文件夹里没有找到新的音频文件", "No new audio files in the folder").to_string();
+        }
+    }
+
+    fn remove_file(&mut self, i: usize) {
+        let p = self.files.remove(i);
+        self.statuses.remove(&p);
+        if self.file_in.as_ref() == Some(&p) {
+            self.stop();
+            self.file_in = None;
+            self.file_out = None;
+            self.decoded = None;
+            self.decoding = None;
+            self.preview_pending = false;
+            if let Some(q) = self.files.get(i.min(self.files.len().saturating_sub(1))).cloned() {
+                self.set_file(q);
+            }
+        }
+    }
+
+    fn clear_files(&mut self) {
+        self.stop();
+        self.files.clear();
+        self.statuses.clear();
+        self.file_in = None;
+        self.file_out = None;
+        self.decoded = None;
+        self.decoding = None;
+        self.preview_pending = false;
+        self.report.clear();
+    }
+
+    /// 选中一个文件用来试听（不在列表里就加进去）。
     fn set_file(&mut self, p: PathBuf) {
+        if !self.files.contains(&p) {
+            self.files.push(p.clone());
+        }
+        if self.file_in.as_ref() == Some(&p) {
+            return;
+        }
         self.stop();
         self.file_out = Some(default_output(&p));
         self.file_in = Some(p);
         self.decoded = None;
         self.preview_s = self.start_s.max(0.0) as f64;
         self.preview_dragging = false;
-        self.report.clear();
         self.decode_file();
     }
 
@@ -642,25 +793,68 @@ impl App {
         );
     }
 
-    fn ui_file(&mut self, ui: &mut egui::Ui) {
-        let channel_before = self.s.file_channel;
-        ui.group(|ui| {
-            ui.set_width(ui.available_width());
-            ui.label(RichText::new(t("音频文件", "Audio file")).strong());
-            ui.horizontal(|ui| {
-                if ui.button(t("选择文件…", "Choose file…")).clicked() {
-                    if let Some(p) = rfd::FileDialog::new().add_filter(t("音频", "Audio"), &["wav", "m4a", "mp3", "flac", "ogg", "aac", "mp4", "mkv", "aiff", "caf"]).pick_file() {
-                        self.set_file(p);
+    /// 文件页上方：待转换的文件列表（可多选添加、拖进窗口、点选试听），以及输出位置。
+    fn ui_file_list(&mut self, ui: &mut egui::Ui) {
+        let busy = self.job.is_some();
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(t("音频文件", "Audio files")).strong());
+            if !self.files.is_empty() {
+                ui.label(RichText::new(format!("{} {}", self.files.len(), t("个", "files"))).weak());
+            }
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add_enabled(!busy && !self.files.is_empty(), egui::Button::new(t("清空", "Clear"))).clicked() {
+                    self.clear_files();
+                }
+                if ui.add_enabled(!busy, egui::Button::new(t("添加文件夹…", "Add folder…"))).on_hover_text(t("加入文件夹里的全部音频文件（不含子文件夹，跳过已转换的 _asmr 文件）", "Adds every audio file in the folder (not subfolders; skips _asmr outputs)")).clicked() {
+                    if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                        self.add_files(vec![d], false);
                     }
                 }
-                match &self.file_in {
-                    Some(p) => ui.label(p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()).on_hover_text(p.display().to_string()),
-                    None => ui.label(RichText::new(t("也可以把文件拖进窗口", "…or drop a file onto the window")).weak()),
-                };
+                if ui.add_enabled(!busy, egui::Button::new(t("添加文件…", "Add files…"))).on_hover_text(t("可以多选（按住 ⌘ / Ctrl 或 Shift）", "Multiple selection allowed (hold ⌘ / Ctrl or Shift)")).clicked() {
+                    if let Some(v) = rfd::FileDialog::new().add_filter(t("音频", "Audio"), batch::AUDIO_EXTS).pick_files() {
+                        self.add_files(v, false);
+                    }
+                }
             });
+        });
+        if self.files.is_empty() {
+            ui.label(RichText::new(t("点「添加文件…」可以一次多选，也可以把文件或文件夹拖进窗口", "Use “Add files…” to pick several at once, or drop files / folders onto the window")).weak());
+        } else {
+            let (mut select, mut remove) = (None, None);
+            let row_h = 22.0;
+            egui::Frame::new().fill(ui.visuals().extreme_bg_color).corner_radius(4.0).inner_margin(4.0).show(ui, |ui| {
+                egui::ScrollArea::vertical().id_salt("filelist").max_height(row_h * 5.0).auto_shrink([false, true]).show(ui, |ui| {
+                    for (i, p) in self.files.iter().enumerate() {
+                        ui.horizontal(|ui| {
+                            ui.set_min_height(row_h - 4.0);
+                            if ui.add_enabled(!busy, egui::Button::new("×").small().frame(false)).on_hover_text(t("从列表移除", "Remove from list")).clicked() {
+                                remove = Some(i);
+                            }
+                            let status_w = 150.0;
+                            let name_w = (ui.available_width() - status_w - 8.0).max(60.0);
+                            let name = p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
+                            let sel = self.file_in.as_ref() == Some(p);
+                            let r = ui.add_sized([name_w, row_h - 4.0], egui::Button::selectable(sel, name).truncate().right_text(""));
+                            if r.on_hover_text(format!("{}\n{}", p.display(), t("点击选中，用来试听", "Click to select for preview"))).clicked() {
+                                select = Some(i);
+                            }
+                            Self::status_cell(ui, status_w, self.statuses.get(p));
+                        });
+                    }
+                });
+            });
+            if let Some(i) = remove {
+                self.remove_file(i);
+            } else if let Some(i) = select {
+                let p = self.files[i].clone();
+                self.set_file(p);
+            }
+        }
+        // 输出位置：一个文件时可以指定文件名；多个文件时指定文件夹
+        if self.files.len() == 1 {
             if let Some(out) = self.file_out.clone() {
                 ui.horizontal(|ui| {
-                    if ui.button(t("输出到…", "Save as…")).clicked() {
+                    if ui.add_enabled(!busy, egui::Button::new(t("输出到…", "Save as…"))).clicked() {
                         if let Some(p) = rfd::FileDialog::new().add_filter("WAV", &["wav"]).set_file_name(out.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()).save_file() {
                             self.file_out = Some(p);
                         }
@@ -668,6 +862,78 @@ impl App {
                     ui.label(out.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()).on_hover_text(out.display().to_string());
                 });
             }
+        } else if self.files.len() > 1 {
+            ui.horizontal(|ui| {
+                if ui.add_enabled(!busy, egui::Button::new(t("输出文件夹…", "Output folder…"))).clicked() {
+                    if let Some(d) = rfd::FileDialog::new().pick_folder() {
+                        self.s.out_dir = Some(d);
+                    }
+                }
+                match self.s.out_dir.clone() {
+                    Some(d) => {
+                        ui.add(egui::Label::new(d.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_else(|| d.display().to_string())).truncate()).on_hover_text(d.display().to_string());
+                        if ui.add_enabled(!busy, egui::Button::new(t("放回源文件旁", "Beside sources")).small()).clicked() {
+                            self.s.out_dir = None;
+                        }
+                    }
+                    None => {
+                        ui.label(RichText::new(t("各自源文件旁边，名字加 _asmr", "beside each source, named …_asmr")).weak());
+                    }
+                }
+            });
+        }
+        // 总进度和完成后的说明放在列表下面，不用滚动就能看到
+        if let Some(j) = &self.job {
+            let (f, n_done, n_run) = job_progress(j);
+            let n = j.paths.len();
+            let el = j.t0.elapsed().as_secs_f64();
+            let eta = if f > 0.02 { format!("，{} {}", t("预计还需", "about"), playback_time(el / f as f64 * (1.0 - f as f64))) } else { String::new() };
+            let text = if n == 1 {
+                match j.status[0].lock().map(|g| g.clone()) {
+                    Ok(ItemStatus::Running(_, st)) => format!("{st} {:.0}%{eta}", f * 100.0),
+                    _ => format!("{:.0}%", f * 100.0),
+                }
+            } else {
+                format!("{n_done} / {n} {}，{n_run} {}，{:.0}%{eta}", t("完成", "done"), t("个在转换", "running"), f * 100.0)
+            };
+            ui.add(egui::ProgressBar::new(f).text(text));
+            if n > 1 {
+                ui.label(RichText::new(format!("{} {} {}", t("后台", "Using"), j.workers, t("个线程并行，长的文件先处理", "threads in parallel, longest files first"))).small().weak());
+            }
+        }
+        if !self.report.is_empty() {
+            ui.label(&self.report);
+        }
+    }
+
+    /// 文件列表右侧的状态：等待 / 进度条 / 完成 / 失败。
+    fn status_cell(ui: &mut egui::Ui, w: f32, st: Option<&ItemStatus>) {
+        let size = [w, 16.0];
+        match st {
+            None => {
+                ui.allocate_exact_size(egui::vec2(w, 16.0), egui::Sense::hover());
+            }
+            Some(ItemStatus::Waiting) => {
+                ui.add_sized(size, egui::Label::new(RichText::new(t("等待中", "Waiting")).small().weak()));
+            }
+            Some(ItemStatus::Running(f, stage)) => {
+                ui.add_sized(size, egui::ProgressBar::new(*f).text(RichText::new(format!("{stage} {:.0}%", f * 100.0)).small()));
+            }
+            Some(ItemStatus::Done(rep, out)) => {
+                ui.add_sized(size, egui::Label::new(RichText::new(format!("✓ {} · {:.0} s", t("完成", "Done"), rep.elapsed_s)).small().color(Color32::from_rgb(90, 190, 120))))
+                    .on_hover_text(format!("{}\n{:.1} s，{:.1} LUFS，{} {:.1} dBTP{}", out.display(), rep.seconds, rep.lufs, t("真峰值", "true peak"), rep.true_peak_db, if rep.channel_note.is_empty() { String::new() } else { format!("\n{}", rep.channel_note) }));
+            }
+            Some(ItemStatus::Failed(e)) => {
+                ui.add_sized(size, egui::Label::new(RichText::new(format!("× {}", t("失败", "Failed"))).small().color(Color32::from_rgb(230, 90, 60)))).on_hover_text(e.as_str());
+            }
+        }
+    }
+
+    fn ui_file(&mut self, ui: &mut egui::Ui) {
+        let channel_before = self.s.file_channel;
+        ui.group(|ui| {
+            ui.set_width(ui.available_width());
+            self.ui_file_list(ui);
             egui::Grid::new("fileopts").num_columns(4).spacing([10.0, 6.0]).show(ui, |ui| {
                 ui.label(t("取哪个声道", "Channel"));
                 let names = [t("自动（更响的）", "Auto (louder)"), t("左", "Left"), t("右", "Right"), t("混合", "Mix")];
@@ -692,6 +958,21 @@ impl App {
                 ui.label(t("目标响度", "Loudness"));
                 ui.add(egui::Slider::new(&mut self.s.file_lufs, -24.0..=-10.0).clamping(egui::SliderClamping::Never).suffix(" LUFS").fixed_decimals(0));
                 ui.end_row();
+                ui.label(t("同时转换", "Parallel"));
+                let cores = batch::default_threads();
+                let mut n = self.threads();
+                let resp = ui.add_enabled(self.job.is_none(), egui::DragValue::new(&mut n).range(1..=cores.max(64)).suffix(t(" 个文件", " files"))).on_hover_text(format!(
+                    "{}{cores}{}",
+                    t("批量转换时同时处理几个文件，每个文件占一个核。默认 = 本机逻辑核数 ", "How many files are converted at once, one core each. Default = logical cores on this machine: "),
+                    t("。整段读进内存，长音频每小时约占 0.7 GB，内存紧张时调小", ". Each file is held in memory (≈0.7 GB per hour of audio); lower this if memory is tight")
+                ));
+                if resp.changed() {
+                    self.s.jobs = if n == cores { 0 } else { n };
+                }
+                if self.s.jobs != 0 && ui.small_button(t("自动", "Auto")).on_hover_text(format!("{} {cores}", t("恢复为本机逻辑核数", "Back to the number of logical cores:"))).clicked() {
+                    self.s.jobs = 0;
+                }
+                ui.end_row();
             });
         });
         if channel_before != self.s.file_channel && self.file_in.is_some() {
@@ -704,6 +985,7 @@ impl App {
         self.ui_devices(ui, false);
         self.ui_status(ui);
         let has = self.file_in.is_some();
+        let n_files = self.files.len();
         ui.horizontal(|ui| {
             let previewing = self.rt.is_some() && self.rt_preview;
             if ui.add_enabled(has && !previewing && self.decoding.is_none(), egui::Button::new(t("试听", "Preview")).min_size(egui::vec2(96.0, 30.0))).on_hover_text(t("用实时引擎直接播放，可以边听边调右边的参数", "Plays through the real-time engine; tweak the parameters while listening")).clicked() {
@@ -714,7 +996,8 @@ impl App {
                 self.status = t("已停止", "Stopped").to_string();
             }
             let busy = self.job.is_some();
-            if ui.add_enabled(has && !busy, egui::Button::new(RichText::new(t("转换并保存", "Convert & save")).strong()).min_size(egui::vec2(120.0, 30.0))).clicked() {
+            let label = if n_files > 1 { format!("{}（{n_files}）", t("全部转换并保存", "Convert all")) } else { t("转换并保存", "Convert & save").to_string() };
+            if ui.add_enabled(n_files > 0 && !busy, egui::Button::new(RichText::new(label).strong()).min_size(egui::vec2(120.0, 30.0))).clicked() {
                 self.start_convert();
             }
             if busy && ui.button(t("取消", "Cancel")).clicked() {
@@ -739,13 +1022,6 @@ impl App {
                     self.start_preview();
                 }
             }
-        }
-        if let Some(j) = &self.job {
-            let (f, stage) = j.progress.lock().map(|g| g.clone()).unwrap_or((0.0, String::new()));
-            ui.add(egui::ProgressBar::new(f).text(format!("{stage} {:.0}%", f * 100.0)));
-        }
-        if !self.report.is_empty() {
-            ui.label(&self.report);
         }
     }
 
@@ -1024,42 +1300,37 @@ impl App {
                 }
             }
         }
-        let mut finished = None;
+        // 转换任务：把各文件的状态抄到列表上；全部结束后写总结
         if let Some(j) = &self.job {
-            if let Ok(mut g) = j.result.lock() {
-                if let Some(r) = g.take() {
-                    finished = Some((r, j.output.clone()));
+            for (p, m) in j.paths.iter().zip(j.status.iter()) {
+                if let Ok(g) = m.lock() {
+                    self.statuses.insert(p.clone(), g.clone());
                 }
             }
         }
-        if let Some((r, out)) = finished {
-            self.job = None;
-            self.report = match r {
-                Ok(rep) => format!(
-                    "{}：{}\n{:.1} s，{:.1} LUFS，{} {:.1} dBTP，{} {:.1} dB；{} {:.0}%，{} {}（{} {}），{} {}，{} {}；{} {:.1} s{}",
-                    t("已保存", "Saved"),
-                    out.display(),
-                    rep.seconds,
-                    rep.lufs,
-                    t("真峰值", "true peak"),
-                    rep.true_peak_db,
-                    t("限制器最多压", "limiter max"),
-                    rep.max_gr_db,
-                    t("说话占", "speech"),
-                    rep.speech_pct,
-                    t("换耳", "switches"),
-                    rep.n_moves,
-                    t("从头顶绕", "over the head"),
-                    rep.n_tops,
-                    t("往后让", "lean-backs"),
-                    rep.n_sways,
-                    t("上下换位", "up / down moves"),
-                    rep.n_updowns,
-                    t("用时", "took"),
-                    rep.elapsed_s,
-                    if rep.channel_note.is_empty() { String::new() } else { format!("\n{}", rep.channel_note) }
-                ),
-                Err(e) => format!("{}：{e}", t("失败", "Failed")),
+        if self.job.as_ref().map_or(false, |j| j.finished.load(Ordering::Acquire)) {
+            let j = self.job.take().unwrap();
+            let all: Vec<ItemStatus> = j.status.iter().map(|m| m.lock().map(|g| g.clone()).unwrap_or(ItemStatus::Failed(String::new()))).collect();
+            let ok = all.iter().filter(|s| matches!(s, ItemStatus::Done(..))).count();
+            let n = all.len();
+            self.report = match (n, all.first()) {
+                (1, Some(ItemStatus::Done(rep, out))) => report_text(rep, out),
+                (1, Some(ItemStatus::Failed(e))) => format!("{}：{e}", t("失败", "Failed")),
+                _ => {
+                    let cancelled = all.iter().filter(|s| matches!(s, ItemStatus::Failed(e) if e == "已取消")).count();
+                    let mut r = format!("{} {ok} / {n} {}，{} {}", t("已转换", "Converted"), t("个文件", "files"), t("用时", "took"), playback_time(j.t0.elapsed().as_secs_f64()));
+                    if n - ok - cancelled > 0 {
+                        r.push_str(&format!("；{} {}（{}）", n - ok - cancelled, t("个失败", "failed"), t("鼠标移到列表里的「失败」上看原因", "hover “Failed” in the list for the reason")));
+                    }
+                    if cancelled > 0 {
+                        r.push_str(&format!("；{} {}", cancelled, t("个已取消", "cancelled")));
+                    }
+                    r.push_str(&format!("\n{}：{}", t("输出位置", "Output"), match &self.s.out_dir {
+                        Some(d) => d.display().to_string(),
+                        None => t("各自源文件旁边", "beside each source").to_string(),
+                    }));
+                    r
+                }
             };
         }
         let mut stop = false;
@@ -1087,8 +1358,9 @@ impl App {
         }
         // 拖进窗口的文件
         let dropped: Vec<PathBuf> = ctx.input(|i| i.raw.dropped_files.iter().map(|f| f.path().to_path_buf()).filter(|p| !p.as_os_str().is_empty()).collect());
-        if let Some(p) = dropped.into_iter().next() {
-            self.set_file(p);
+        if !dropped.is_empty() {
+            // 拖进来的文件（可多个、可以是文件夹）加进列表，选中第一个用来试听
+            self.add_files(dropped, true);
             self.s.tab = Tab::File;
         }
         if self.rt.is_some() || self.job.is_some() || self.decoding.is_some() {
@@ -1213,11 +1485,73 @@ impl eframe::App for App {
         }
     }
 
+    /// 关闭窗口时还在转换：取消，等工作线程收尾（删掉临时文件和写了一半的输出），最多等 3 秒。
+    fn on_exit(&mut self, _gl: Option<&eframe::glow::Context>) {
+        if let Some(j) = &self.job {
+            j.cancel.store(true, Ordering::Relaxed);
+            let t0 = std::time::Instant::now();
+            while !j.finished.load(Ordering::Acquire) && t0.elapsed().as_secs_f32() < 3.0 {
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+        }
+    }
+
     fn save(&mut self, storage: &mut dyn eframe::Storage) {
         if self.shot.is_none() {
             eframe::set_value(storage, eframe::APP_KEY, &self.s);
         }
     }
+}
+
+/// 总进度（按估计时长加权，0–1）、已结束的文件数、正在转换的文件数。
+fn job_progress(j: &Job) -> (f32, usize, usize) {
+    let est = j.est.lock().map(|g| g.clone()).unwrap_or_default();
+    let (mut sum, mut tot, mut done, mut run) = (0f64, 0f64, 0, 0);
+    for (i, m) in j.status.iter().enumerate() {
+        let w = est.get(i).copied().unwrap_or(1.0);
+        let f = match m.lock().map(|g| g.clone()) {
+            Ok(ItemStatus::Running(f, _)) => {
+                run += 1;
+                f as f64
+            }
+            Ok(ItemStatus::Done(..)) | Ok(ItemStatus::Failed(_)) => {
+                done += 1;
+                1.0
+            }
+            _ => 0.0,
+        };
+        sum += w * f;
+        tot += w;
+    }
+    ((sum / tot.max(1e-9)) as f32, done, run)
+}
+
+/// 单个文件转换完成后的说明。
+fn report_text(rep: &ConvertReport, out: &Path) -> String {
+    format!(
+        "{}：{}\n{:.1} s，{:.1} LUFS，{} {:.1} dBTP，{} {:.1} dB；{} {:.0}%，{} {}（{} {}），{} {}，{} {}；{} {:.1} s{}",
+        t("已保存", "Saved"),
+        out.display(),
+        rep.seconds,
+        rep.lufs,
+        t("真峰值", "true peak"),
+        rep.true_peak_db,
+        t("限制器最多压", "limiter max"),
+        rep.max_gr_db,
+        t("说话占", "speech"),
+        rep.speech_pct,
+        t("换耳", "switches"),
+        rep.n_moves,
+        t("从头顶绕", "over the head"),
+        rep.n_tops,
+        t("往后让", "lean-backs"),
+        rep.n_sways,
+        t("上下换位", "up / down moves"),
+        rep.n_updowns,
+        t("用时", "took"),
+        rep.elapsed_s,
+        if rep.channel_note.is_empty() { String::new() } else { format!("\n{}", rep.channel_note) }
+    )
 }
 
 fn playback_time(seconds: f64) -> String {

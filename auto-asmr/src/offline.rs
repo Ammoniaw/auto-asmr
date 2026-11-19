@@ -237,7 +237,9 @@ pub fn convert(opts: &ConvertOptions, params: &Params, cancel: Arc<AtomicBool>, 
     let tail = if params.room { (0.65 * FS) as usize } else { 512 };
     let total = n_sig + skip + tail;
 
-    let tmp_path = std::env::temp_dir().join(format!("auto_asmr_{}_{}.f32", std::process::id(), t_start.elapsed().as_nanos()));
+    // 批量转换时多个线程同时转换：用进程内递增的序号保证临时文件名不重复
+    static TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let tmp_path = std::env::temp_dir().join(format!("auto_asmr_{}_{}.f32", std::process::id(), TMP_SEQ.fetch_add(1, Ordering::Relaxed)));
     let tmp = TempFile(tmp_path.clone());
     let mut w = BufWriter::with_capacity(1 << 20, File::create(&tmp_path).map_err(|e| format!("无法创建临时文件：{e}"))?);
     let mut meter = LoudnessMeter::new();
@@ -318,35 +320,42 @@ pub fn convert(opts: &ConvertOptions, params: &Params, cancel: Arc<AtomicBool>, 
     let mut emitted = 0usize;
     let ceiling = lim * 0.97;
     let total2 = n_out + ldelay; // 末尾多送一段 0，把限制器里延时的样本推出来
-    while fed < total2 {
-        if cancelled() {
-            return Err("已取消".into());
-        }
-        let m = CH.min(total2 - fed);
-        let avail = m.min(n_out.saturating_sub(fed));
-        if avail > 0 {
-            rd.read_exact(&mut buf[..avail * 8]).map_err(|e| e.to_string())?;
-        }
-        for i in 0..m {
-            let (l, r) = if i < avail {
-                let o = i * 8;
-                (f32::from_le_bytes(buf[o..o + 4].try_into().unwrap()) * gain, f32::from_le_bytes(buf[o + 4..o + 8].try_into().unwrap()) * gain)
-            } else {
-                (0.0, 0.0)
-            };
-            let (a, b) = limiter.process(l, r, ceiling);
-            if fed + i >= ldelay {
-                tp.push(a, b);
-                out_meter.push(a, b);
-                wav.write_sample((a.clamp(-1.0, 1.0) * full).round() as i32).map_err(|e| e.to_string())?;
-                wav.write_sample((b.clamp(-1.0, 1.0) * full).round() as i32).map_err(|e| e.to_string())?;
-                emitted += 1;
+    let pass2 = (|| -> Result<(), String> {
+        while fed < total2 {
+            if cancelled() {
+                return Err("已取消".into());
             }
+            let m = CH.min(total2 - fed);
+            let avail = m.min(n_out.saturating_sub(fed));
+            if avail > 0 {
+                rd.read_exact(&mut buf[..avail * 8]).map_err(|e| e.to_string())?;
+            }
+            for i in 0..m {
+                let (l, r) = if i < avail {
+                    let o = i * 8;
+                    (f32::from_le_bytes(buf[o..o + 4].try_into().unwrap()) * gain, f32::from_le_bytes(buf[o + 4..o + 8].try_into().unwrap()) * gain)
+                } else {
+                    (0.0, 0.0)
+                };
+                let (a, b) = limiter.process(l, r, ceiling);
+                if fed + i >= ldelay {
+                    tp.push(a, b);
+                    out_meter.push(a, b);
+                    wav.write_sample((a.clamp(-1.0, 1.0) * full).round() as i32).map_err(|e| e.to_string())?;
+                    wav.write_sample((b.clamp(-1.0, 1.0) * full).round() as i32).map_err(|e| e.to_string())?;
+                    emitted += 1;
+                }
+            }
+            fed += m;
+            progress(0.8 + 0.2 * emitted as f32 / n_out.max(1) as f32, "响度归一化");
         }
-        fed += m;
-        progress(0.8 + 0.2 * emitted as f32 / n_out.max(1) as f32, "响度归一化");
+        wav.finalize().map_err(|e| e.to_string())
+    })();
+    if let Err(e) = pass2 {
+        // 取消或出错：不留下写了一半的输出文件
+        let _ = std::fs::remove_file(&opts.output);
+        return Err(e);
     }
-    wav.finalize().map_err(|e| e.to_string())?;
     drop(tmp);
     progress(1.0, "完成");
     Ok(ConvertReport {

@@ -14,11 +14,15 @@ pub const HELP: &str = "auto-asmr —— KU100 双耳 ASMR 空间化（纯 CPU�
 用法：
   auto-asmr                          启动图形界面（实时 + 文件转换）
   auto-asmr convert <输入> [选项]    转换一个音频文件（wav / m4a / mp3 / flac / ogg …），输出 WAV
+  auto-asmr convert <输入1> <输入2> … [选项]   批量转换：多个文件或文件夹，多线程并行
   auto-asmr devices                  列出本机的音频输入 / 输出设备
   auto-asmr bench                    测试处理速度
 
 convert 的选项（括号里是默认值）：
-  -o <文件>               输出文件（输入名_asmr.wav）
+  -o <文件>               输出文件（输入名_asmr.wav）；只用于单个文件
+ 批量（多个输入，或输入是文件夹）
+  --out-dir <文件夹>      输出都放进这个文件夹（默认放在各自源文件旁边，重名自动加 _2、_3）
+  -j, --jobs <n>          同时转换几个文件（默认 = CPU 逻辑核数）
   --style ear|ku100       ear=贴耳加强；ku100=像真实 KU100 实录（远耳听得到、离耳约 6 cm、真实房间）
   --start <秒> --duration <秒>      只处理一段
   --channel auto|left|right|mix     立体声取哪个声道（auto=更响的那个）
@@ -138,7 +142,9 @@ pub fn run(args: Vec<String>) -> i32 {
 
 fn run_convert(args: &[String]) -> Result<(), String> {
     let mut p = Params::default();
-    let mut input: Option<PathBuf> = None;
+    let mut inputs: Vec<PathBuf> = Vec::new();
+    let mut out_dir: Option<PathBuf> = None;
+    let mut jobs = crate::batch::default_threads();
     let mut output: Option<PathBuf> = None;
     let (mut start, mut duration) = (0.0f64, None);
     let mut channel = Channel::Auto;
@@ -159,6 +165,8 @@ fn run_convert(args: &[String]) -> Result<(), String> {
         let f = |it: &mut std::iter::Peekable<std::slice::Iter<String>>| parse_f(it.next(), name);
         match name {
             "-o" | "--output" => output = Some(PathBuf::from(it.next().ok_or("-o 后面缺少文件名")?)),
+            "--out-dir" => out_dir = Some(PathBuf::from(it.next().ok_or("--out-dir 后面缺少文件夹")?)),
+            "-j" | "--jobs" => jobs = (f(&mut it)? as usize).max(1),
             "--style" => {
                 it.next();
             }
@@ -293,11 +301,69 @@ fn run_convert(args: &[String]) -> Result<(), String> {
             "--seed" => p.seed = f(&mut it)? as u64,
             "--save-trajectory" => save_traj = Some(PathBuf::from(it.next().ok_or("--save-trajectory 后面缺少文件名")?)),
             _ if name.starts_with('-') => return Err(format!("不认识的选项 {name}")),
-            _ => input = Some(PathBuf::from(name)),
+            _ => inputs.push(PathBuf::from(name)),
         }
     }
     p.level_follow = level_follow.unwrap_or(Params::default_level_follow(p.mode));
-    let input = input.ok_or("缺少输入文件")?;
+    let is_batch = inputs.len() > 1 || inputs.iter().any(|p| p.is_dir()) || out_dir.is_some();
+    let inputs = crate::batch::expand_inputs(&inputs);
+    if inputs.is_empty() {
+        return Err("缺少输入文件".into());
+    }
+    if is_batch {
+        if output.is_some() {
+            return Err("批量转换不能用 -o，请用 --out-dir 指定输出文件夹".into());
+        }
+        if save_traj.is_some() {
+            return Err("批量转换不支持 --save-trajectory".into());
+        }
+        if let Some(d) = &out_dir {
+            std::fs::create_dir_all(d).map_err(|e| format!("无法创建 {}：{e}", d.display()))?;
+        }
+        let outs = crate::batch::plan_outputs(&inputs, out_dir.as_deref());
+        let items: Vec<ConvertOptions> = inputs
+            .iter()
+            .zip(outs)
+            .map(|(inp, out)| {
+                let mut o = ConvertOptions::new(inp.clone());
+                o.output = out;
+                o.start = start;
+                o.duration = duration;
+                o.channel = channel;
+                o.bits = bits;
+                o.lufs = lufs;
+                o.peak_db = peak;
+                o.max_gr_db = max_gr;
+                o
+            })
+            .collect();
+        let n = items.len();
+        let workers = jobs.min(n);
+        eprintln!("批量转换 {n} 个文件，{workers} 个线程并行");
+        let t0 = std::time::Instant::now();
+        let n_done = std::sync::atomic::AtomicUsize::new(0);
+        let n_fail = std::sync::atomic::AtomicUsize::new(0);
+        let cpu = std::sync::Mutex::new(0f64);
+        let est = crate::batch::estimates(&items);
+        crate::batch::run(&items, &est, &p, jobs, &Arc::new(AtomicBool::new(false)), |_, _, _| {}, |i, r| {
+            let k = n_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            match r {
+                Ok(rep) => {
+                    *cpu.lock().unwrap() += rep.elapsed_s;
+                    println!("[{k}/{n}] 完成：{}  ({:.1} s，{:.1} LUFS，真峰值 {:.1} dBTP；用时 {:.1} s)", items[i].output.display(), rep.seconds, rep.lufs, rep.true_peak_db, rep.elapsed_s);
+                }
+                Err(e) => {
+                    n_fail.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    println!("[{k}/{n}] 失败：{}：{e}", items[i].input.display());
+                }
+            }
+        });
+        let wall = t0.elapsed().as_secs_f64();
+        let cpu = *cpu.lock().unwrap();
+        println!("全部完成：成功 {}，失败 {}；总用时 {wall:.1} s，各文件用时合计 {cpu:.1} s（平均同时在转换 {:.1} 个文件）", n - n_fail.load(std::sync::atomic::Ordering::Relaxed), n_fail.load(std::sync::atomic::Ordering::Relaxed), cpu / wall.max(1e-9));
+        return if n_fail.load(std::sync::atomic::Ordering::Relaxed) > 0 { Err("有文件转换失败".into()) } else { Ok(()) };
+    }
+    let input = inputs.into_iter().next().unwrap();
     let mut opts = ConvertOptions::new(input.clone());
     opts.output = output.unwrap_or_else(|| default_output(&input));
     opts.start = start;

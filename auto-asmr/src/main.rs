@@ -1,6 +1,7 @@
 //! auto-asmr：KU100 双耳 ASMR 空间化。一个程序两个功能——实时（主播用）和音频文件转换。
 #![cfg_attr(all(windows, not(debug_assertions)), windows_subsystem = "windows")]
 
+mod batch;
 mod cli;
 mod dsp;
 mod gui;
