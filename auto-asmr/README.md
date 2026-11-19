@@ -21,6 +21,19 @@ cargo build --release
 
 生成的程序在 `target/release/auto-asmr`（Windows 是 `auto-asmr.exe`）。HRIR、房间、耳机补偿数据都内嵌在程序里，单个文件即可运行，约 25 MB。
 
+### GitHub 自动构建与发布
+
+推送任意名称的 tag 都会触发 `.github/workflows/release.yml`：使用 Rust 1.95.0 并行测试和构建 Windows x64、Linux x64 发布版，验证程序启动，两个平台全部成功后自动创建或更新该 tag 对应的 GitHub Release。附件包含 `auto-asmr.exe`、`auto-asmr-windows-x64.zip`、`auto-asmr-linux-x64.tar.gz` 和统一的 `SHA256SUMS.txt`；压缩包内含说明文档，Actions 页面也可下载构建产物。
+
+Linux 版在 Ubuntu 22.04 上构建（GNU/glibc），解压后运行 `./auto-asmr`，需要桌面图形环境以及 ALSA 等运行库；打包保留程序的可执行权限。
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+工作流文件需要先提交并推送，且包含在该 tag 指向的提交中。本地创建 tag 后，需要推送到 GitHub 才会触发构建。
+
 | 系统 | 说明 |
 |---|---|
 | Windows | 直接双击 `auto-asmr.exe`。直播时把输出设备选成虚拟声卡（如 VB-Cable）。 |
