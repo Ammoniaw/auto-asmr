@@ -1,0 +1,147 @@
+name: Windows and Linux Release
+
+on:
+  push:
+    tags:
+      - '**'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build-windows:
+    name: Test and build Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: pwsh
+        working-directory: auto-asmr
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Install Rust 1.95
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          rustup target add x86_64-pc-windows-msvc --toolchain 1.95.0
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: auto-asmr -> target
+          key: windows-x64-rust-1.95.0
+
+      - name: Run tests
+        run: cargo +1.95.0 test --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Build Windows EXE
+        run: cargo +1.95.0 build --release --locked --target x86_64-pc-windows-msvc
+
+      - name: Verify EXE starts
+        run: |
+          $exe = (Resolve-Path 'target/x86_64-pc-windows-msvc/release/auto-asmr.exe').Path
+          $process = Start-Process -FilePath $exe -ArgumentList '--help' -WindowStyle Hidden -Wait -PassThru
+          if ($process.ExitCode -ne 0) { throw "EXE smoke test failed: $($process.ExitCode)" }
+
+      - name: Package release
+        run: |
+          New-Item -ItemType Directory -Path '../dist' -Force | Out-Null
+          Copy-Item 'target/x86_64-pc-windows-msvc/release/auto-asmr.exe' '../dist/auto-asmr.exe'
+          Compress-Archive -Path '../dist/auto-asmr.exe', 'README.md' -DestinationPath '../dist/auto-asmr-windows-x64.zip' -Force
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: auto-asmr-windows-x64
+          path: dist/*
+          if-no-files-found: error
+
+  build-linux:
+    name: Test and build Linux x64
+    runs-on: ubuntu-22.04
+    timeout-minutes: 45
+    defaults:
+      run:
+        shell: bash
+        working-directory: auto-asmr
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            pkg-config libasound2-dev libudev-dev libxkbcommon-dev \
+            libwayland-dev libx11-dev libxi-dev libxrandr-dev \
+            libxcursor-dev libxinerama-dev libegl1-mesa-dev
+
+      - name: Install Rust 1.95
+        run: |
+          rustup toolchain install 1.95.0 --profile minimal --no-self-update
+          rustup target add x86_64-unknown-linux-gnu --toolchain 1.95.0
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: auto-asmr -> target
+          key: linux-x64-rust-1.95.0
+
+      - name: Run tests
+        run: cargo +1.95.0 test --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Build Linux binary
+        run: cargo +1.95.0 build --release --locked --target x86_64-unknown-linux-gnu
+
+      - name: Verify binary starts
+        run: ./target/x86_64-unknown-linux-gnu/release/auto-asmr --help
+
+      - name: Package release
+        run: |
+          mkdir -p ../dist
+          tar -czf ../dist/auto-asmr-linux-x64.tar.gz \
+            -C target/x86_64-unknown-linux-gnu/release auto-asmr \
+            -C "$GITHUB_WORKSPACE/auto-asmr" README.md
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: auto-asmr-linux-x64
+          path: dist/auto-asmr-linux-x64.tar.gz
+          if-no-files-found: error
+
+  release:
+    name: Publish GitHub Release
+    needs: [build-windows, build-linux]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: auto-asmr-*-x64
+          merge-multiple: true
+          path: dist
+
+      - name: Generate checksums for all platforms
+        working-directory: dist
+        run: sha256sum auto-asmr.exe auto-asmr-windows-x64.zip auto-asmr-linux-x64.tar.gz > SHA256SUMS.txt
+
+      - name: Publish Windows and Linux packages
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            dist/auto-asmr.exe
+            dist/auto-asmr-windows-x64.zip
+            dist/auto-asmr-linux-x64.tar.gz
+            dist/SHA256SUMS.txt
