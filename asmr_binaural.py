@@ -15,6 +15,9 @@
     移动时按双耳总响度补偿，声音是"跑过去"而不是"这边变小那边变大"。始终叠加人体的微小晃动。
   * 忽远忽近（默认开启）：贴耳停留、慢慢往后让、再慢慢凑回来，时长和深浅都随机；声音大的地方
     提前往后让、轻声时更贴近。退开时耳边音量只保留物理衰减的 45%（KU100 实录 40–56%）。
+  * 上下（默认开启自动上下）：嘴在耳朵上方 / 下方之间慢慢换位置（--updown）；也可以固定一个高度
+    （--height），或者换耳时从头顶绕过去（--over-top）。水平面的查找表不变，离开水平面时再乘上
+    取自 KU100 全球面实测的高度修正（耳廓对来声方向的染色）；都关掉时结果与原来逐样本相同。
   * 人头麦贴耳感（默认 ear 风格）：嘴离耳朵约 1.7 cm，远耳额外压低 32 dB，近耳低频更厚、
     临场感更强；离开耳边时平滑恢复。--style ku100 改为按两段 KU100 实录标定（远耳听得到、
     离耳约 6 cm、真实房间）。不改变原来的嗓音，也不添加任何底噪或呼吸声。
@@ -66,7 +69,10 @@ R_MEAS = (0.25, 0.5, 0.75, 1.0, 1.5)
 R_GAIN = (1.0, 0.33, 0.25, 0.16, 0.095)   # TH Köln 给的各距离数据集的还原增益
 D0 = 4.0                   # 固定附加时延（样本），保证时延恒为正
 NSEC = 12                  # 房间早期反射按 30° 扇区预计算
-TABLE_VERSION = 3
+TABLE_VERSION = 4
+ELEV_TAPS = 48             # 高度修正滤波器长度
+ELEV_DA = 5.0              # 高度修正表的网格：从耳朵看声源的侧向角每 5° 一格（−90…90）
+ELEV_DB = 10.0             # 绕两耳连线的极角每 10° 一格（0 = 前，90 = 上，180 = 后，270 = 下）
 REAL_ROOM_DB = -28.0       # 真实房间：贴耳时远耳听到的房间声比近耳直达声低多少（KU100 实测 −24…−35 dB）
 
 HERE = Path(__file__).resolve().parent
@@ -311,6 +317,55 @@ class Tables:
     sph_tau: np.ndarray    # (P, 2)
     cdfc: np.ndarray       # (256,) KU100 公共扩散场均衡
     e_ref_1m: float        # 1 m 直达声单耳能量（经 CDFC），房间混响标定用
+    elev: np.ndarray       # (2, 37, 36, ELEV_TAPS) 高度修正滤波器：[耳, 侧向角, 极角]
+
+
+def _smooth_pow(m2: np.ndarray, nfft: int, frac: float = 6.0, bmin: float = 1000.0) -> np.ndarray:
+    """功率谱平滑：带宽取 1/frac 倍频程和 bmin Hz 里较宽的那个（48 点的 FIR 只能表示这么细的结构）。"""
+    c = np.concatenate([np.zeros(m2.shape[:-1] + (1,)), np.cumsum(m2, -1)], -1)
+    n = m2.shape[-1]
+    k = np.arange(n)
+    hw = np.maximum(k * (2 ** (0.5 / frac) - 1), 0.5 * bmin / (FS / nfft))
+    lo = np.clip(np.round(k - hw).astype(int), 0, n - 1)
+    hi = np.clip(np.round(k + hw).astype(int), 0, n - 1)
+    return (c[..., hi + 1] - c[..., lo]) / (hi + 1 - lo)
+
+
+def build_elevation(dirs: np.ndarray, h_sph: np.ndarray, r0: float = 1.5) -> np.ndarray:
+    """高度修正表。水平面的查找表只有"方位角 × 距离"；声源离开水平面时，两耳时间差、声级差和近场效应
+    主要由"偏向哪只耳朵多少"（侧向角）决定，所以先取同一侧向角上水平面前 / 后两点的混合，再乘上这里的
+    修正——它只描述耳廓对来声方向的染色怎么随"绕两耳连线转多少"（极角）变化。
+
+    修正取自 KU100 1.5 m 的全球面实测（2702 个方向）：某方向的频谱 ÷ 同侧向角水平面前 / 后混合的频谱，
+    方向按"从这只耳朵看过去"算（近处的声源，耳朵看到的方向和从头中心看到的不一样，即声学视差）。
+    用它预测 0.5 m 的全球面实测，近耳 6–9 kHz 的误差从 7.0 dB（不修正）降到 1.8 dB。
+    水平面上（极角 0 / 180）修正恒为 1，所以不带高度时结果与原来完全相同。
+    返回 (2, NA, NB, ELEV_TAPS) 的最小相位 FIR。"""
+    from scipy.spatial import cKDTree
+    nfft = 512
+    al = np.radians(np.arange(-90.0, 90.0 + 1e-6, ELEV_DA))
+    be = np.radians(np.arange(0.0, 360.0, ELEV_DB))
+    A, B = np.meshgrid(al, be, indexing="ij")
+    q = np.stack([np.cos(A) * np.cos(B), np.sin(A), np.cos(A) * np.sin(B)], -1)   # 耳心坐标：y 朝这只耳朵自己的一侧
+    wf = 0.5 * (1 + np.cos(be))
+    j180 = int(round(180.0 / ELEV_DB))
+    out = np.zeros((2, len(al), len(be), ELEV_TAPS), np.float32)
+    for e, ey in enumerate((HEAD_A, -HEAD_A)):
+        v = r0 * dirs - np.array([0.0, ey, 0.0])
+        v /= np.linalg.norm(v, axis=1, keepdims=True)
+        if e == 1:
+            v = v * np.array([1.0, -1.0, 1.0])
+        dist, idx = cKDTree(v).query(q.reshape(-1, 3), k=4)
+        ang = 2 * np.arcsin(np.clip(dist / 2, 0, 1))
+        w = 1.0 / (ang ** 2 + np.radians(0.7) ** 2)
+        w /= w.sum(1, keepdims=True)
+        g = (w[..., None] * h_sph[idx, e]).sum(1).reshape(len(al), len(be), -1)   # 各网格方向的 HRIR
+        ref = wf[None, :, None] * g[:, 0:1] + (1 - wf)[None, :, None] * g[:, j180:j180 + 1]
+        num = _smooth_pow(np.abs(np.fft.rfft(g, nfft, axis=-1)) ** 2, nfft)
+        den = _smooth_pow(np.abs(np.fft.rfft(ref, nfft, axis=-1)) ** 2, nfft)
+        db = np.clip(10 * np.log10(np.maximum(num, 1e-12) / np.maximum(den, 1e-12)), -15.0, 12.0)
+        out[e] = minphase_from_mag(10 ** (db / 20), nfft, ELEV_TAPS)
+    return out
 
 
 def build_tables(d: Path) -> Tables:
@@ -351,8 +406,9 @@ def build_tables(d: Path) -> Tables:
     cdfc = np.asarray(sio.loadmat(d / CDFC_FILE, squeeze_me=True, struct_as_record=False)["hpcf"].minPhase, float)
     h1 = H[np.argmin(np.abs(inv - 1.0))]
     e1 = np.fft.irfft(np.fft.rfft(h1, 512, axis=-1) * np.fft.rfft(cdfc, 512), 512, axis=-1)
-    tab = Tables(inv, H, TAU, dirs, minimum_phase(ir).astype(np.float32), tau - tau.mean(), cdfc,
-                 float(np.mean(np.sum(e1 ** 2, axis=-1))))
+    sph_h = minimum_phase(ir).astype(np.float32)
+    tab = Tables(inv, H, TAU, dirs, sph_h, tau - tau.mean(), cdfc,
+                 float(np.mean(np.sum(e1 ** 2, axis=-1))), build_elevation(dirs, sph_h.astype(np.float64)))
     np.savez_compressed(d / f"ku100_tables_v{TABLE_VERSION}.npz", **tab.__dict__)
     return tab
 
@@ -385,6 +441,58 @@ def lookup(tab: Tables, az_sofa: np.ndarray, r: np.ndarray):
     return h.astype(np.float32), tau
 
 
+def cone_coords(az_sofa: np.ndarray, el: np.ndarray):
+    """（SOFA 方位角, 仰角）-> 方向余弦 (dx 前, dy 左, dz 上)、侧向角 alpha（度，朝左为正）、
+    极角 beta（度，绕两耳连线：0 前、90 上、180 后、270 下）、水平面"前"那一点的权重 wf。"""
+    a, e = np.radians(az_sofa), np.radians(el)
+    dx, dy, dz = np.cos(e) * np.cos(a), np.cos(e) * np.sin(a), np.sin(e)
+    alpha = np.degrees(np.arcsin(np.clip(dy, -1.0, 1.0)))
+    beta = np.mod(np.degrees(np.arctan2(dz, dx)), 360.0)
+    return (dx, dy, dz), alpha, beta, 0.5 * (1.0 + np.cos(np.radians(beta)))
+
+
+def elev_taps(tab: Tables, ear: int, lat: np.ndarray, beta: np.ndarray) -> np.ndarray:
+    """高度修正滤波器 (n, ELEV_TAPS)：在（从耳朵看的侧向角, 极角）网格上双线性插值。"""
+    g = tab.elev[ear]
+    na, nb = g.shape[0], g.shape[1]
+    x = (np.clip(lat, -90.0, 90.0) + 90.0) / ELEV_DA
+    i0 = np.minimum(np.floor(x).astype(int), na - 2)
+    fa = (x - i0)[:, None]
+    y = np.mod(beta, 360.0) / ELEV_DB
+    j0 = np.floor(y).astype(int) % nb
+    j1 = (j0 + 1) % nb
+    fb = (y - np.floor(y))[:, None]
+    return (1 - fa) * ((1 - fb) * g[i0, j0] + fb * g[i0, j1]) + fa * ((1 - fb) * g[i0 + 1, j0] + fb * g[i0 + 1, j1])
+
+
+def lookup3(tab: Tables, az_sofa: np.ndarray, el: np.ndarray | None, r: np.ndarray):
+    """带高度的查表。仰角为 0 的位置直接用水平面的表（结果与 lookup 完全相同）；离开水平面时，
+    取同一侧向角上水平面前 / 后两点的混合，再给每只耳朵卷上高度修正（见 build_elevation）。"""
+    if el is None or not np.any(np.abs(el) > 1e-4):
+        return lookup(tab, az_sofa, r)
+    (dx, dy, dz), alpha, beta, wf = cone_coords(az_sofa, el)
+    hf, tf = lookup(tab, np.mod(alpha, 360.0), r)
+    hb, tb = lookup(tab, np.mod(180.0 - alpha, 360.0), r)
+    h = wf[:, None, None] * hf + (1 - wf)[:, None, None] * hb
+    tau = wf[:, None] * tf + (1 - wf)[:, None] * tb
+    rr = np.maximum(r, R_MIN)
+    fade = np.ones(NTAP)
+    fade[-16:] = 0.5 * (1 + np.cos(np.linspace(0, np.pi, 16)))
+    for e, ey in enumerate((HEAD_A, -HEAD_A)):
+        vy = rr * dy - ey
+        lat = np.degrees(np.arcsin(np.clip((vy if e == 0 else -vy) / np.sqrt((rr * dx) ** 2 + vy ** 2 + (rr * dz) ** 2), -1, 1)))
+        for i in range(0, len(h), 8192):          # 分块，免得占太多内存
+            d = elev_taps(tab, e, lat[i:i + 8192], beta[i:i + 8192])
+            he = np.fft.irfft(np.fft.rfft(h[i:i + 8192, e], NFFT_BLK, axis=-1) * np.fft.rfft(d, NFFT_BLK, axis=-1),
+                              NFFT_BLK, axis=-1)[:, :NTAP] * fade
+            h[i:i + 8192, e] = he
+    flat = np.abs(el) <= 1e-4                       # 仍在水平面上的位置：与不带高度时逐位相同
+    if flat.any():
+        h0, t0 = lookup(tab, az_sofa[flat], r[flat])
+        h[flat], tau[flat] = h0, t0
+    return h.astype(np.float32), tau
+
+
 # ----------------------------------------------------------------------------- 渲染
 
 def frac_delay(x: np.ndarray, idx: np.ndarray, d: np.ndarray, up: int = 4, pad: int = 48) -> np.ndarray:
@@ -405,10 +513,10 @@ def frac_delay(x: np.ndarray, idx: np.ndarray, d: np.ndarray, up: int = 4, pad: 
 
 
 def ear_intimacy(h_b: np.ndarray, az_b: np.ndarray, r_b: np.ndarray, iso_db: float, presence_db: float,
-                 ear_eq: bool = True, dark_db: float = 0.0) -> None:
+                 ear_eq: bool = True, dark_db: float = 0.0, el_b: np.ndarray | None = None) -> None:
     """人头麦贴耳感（原地修改 h_b）：嘴贴近一侧耳朵时，近耳加临场 / 空气感，远耳额外压低（单耳独占）；
     离开耳边、转到脸前时按距离和侧向程度平滑恢复。"""
-    p = closeness(az_b, r_b)
+    p = closeness(az_b, r_b, el_b)
     if p.max() <= 0:
         return
     ipsi = (np.mod(az_b, 360.0) < 180.0).astype(int)   # 声源在右边 -> 近耳是右耳（通道 1）
@@ -430,20 +538,22 @@ def ear_intimacy(h_b: np.ndarray, az_b: np.ndarray, r_b: np.ndarray, iso_db: flo
             h_b[kk, e] = hi + p[i:i + 8192, None] * (he - hi)
 
 
-def closeness(az_b: np.ndarray, r_b: np.ndarray) -> np.ndarray:
-    """嘴贴近某一侧耳朵的程度（0–1）：距离越近、越偏向正侧方越大；转到脸前 / 脑后时为 0。"""
+def closeness(az_b: np.ndarray, r_b: np.ndarray, el_b: np.ndarray | None = None) -> np.ndarray:
+    """嘴贴近某一侧耳朵的程度（0–1）：距离越近、越偏向正侧方越大；转到脸前 / 脑后 / 头顶时为 0。"""
     lat = np.abs(np.sin(np.radians(az_b)))
+    if el_b is not None:
+        lat = lat * np.cos(np.radians(el_b))
     return (np.clip((0.2 - r_b) / (0.2 - EAR_R), 0, 1) * lat ** 2).astype(np.float32)
 
 
 def apply_ear_lf(y: np.ndarray, az_b: np.ndarray, r_b: np.ndarray, near_db: float, far_db: float,
-                 fc: float = 320.0) -> None:
+                 fc: float = 320.0, el_b: np.ndarray | None = None) -> None:
     """贴耳时近耳低频提升、远耳低频再压低，让低频两耳差更大（Brungart：近场距离感的主导线索；
     Honda：128 Hz 两耳差的起伏与战栗感 r=0.93）。用 4 阶 Linkwitz–Riley 分频，两耳做完全相同的分频，
     所以 ITD 不受影响。原地修改 y (2, N)。"""
     if near_db <= 0 and far_db <= 0:
         return
-    p = closeness(az_b, r_b)
+    p = closeness(az_b, r_b, el_b)
     right = np.mod(az_b, 360.0) < 180.0
     lp = signal.butter(2, fc, "low", fs=FS, output="sos")
     hp = signal.butter(2, fc, "high", fs=FS, output="sos")
@@ -570,17 +680,23 @@ def binaural_power(h: np.ndarray) -> np.ndarray:
 def render_direct(x: np.ndarray, az_b: np.ndarray, r_b: np.ndarray, tab: Tables,
                   level_follow: float = 1.0, iso_db: float = 0.0, presence_db: float = 0.0, ear_eq: bool = True,
                   dark_db: float = 0.0, r_level: np.ndarray | None = None, gain_b: np.ndarray | None = None,
-                  chunk_blocks: int = 2048) -> np.ndarray:
+                  chunk_blocks: int = 2048, el_b: np.ndarray | None = None, level_pos=None) -> np.ndarray:
     """时变 HRIR 卷积（重叠保留 + 块内交叉淡化）+ 逐样本分数时延。az_b/r_b 为各块边界处的位置。
-    r_level：响度补偿按这条轨迹算（不含忽远忽近，退开时的音量变化另由 gain_b 决定）。"""
+    r_level：响度补偿按这条轨迹算（不含忽远忽近，退开时的音量变化另由 gain_b 决定）。
+    el_b：各块边界处的仰角（度）；level_pos：带高度时响度补偿所用轨迹的 (方位角, 仰角, 距离)。"""
     N = len(x)
     nb = -(-N // BLOCK)
     assert len(az_b) == nb + 1
-    h_b, tau_b = lookup(tab, np.mod(-az_b, 360.0), r_b)   # 用户方位角顺时针 -> SOFA 逆时针
+    if el_b is not None and not np.any(np.abs(el_b) > 1e-4):
+        el_b = None
+    h_b, tau_b = lookup3(tab, np.mod(-az_b, 360.0), el_b, r_b)   # 用户方位角顺时针 -> SOFA 逆时针
     rc = np.clip(r_b, R_MIN, R_MAX)
     if level_follow != 1.0:
         # 响度补偿：按语音频段加权的双耳总功率，相对"贴耳 0.14 m"拉平；方向线索（ITD/ILD/耳廓）不变
-        if r_level is None:
+        if el_b is not None:
+            az0, el0, r0 = level_pos if level_pos is not None else (az_b, el_b, r_b)
+            p = path_power(tab, az0, r0, el0)
+        elif r_level is None:
             p = np.concatenate([binaural_power(h_b[i:i + 8192]) for i in range(0, len(h_b), 8192)])
         else:
             p = path_power(tab, az_b, r_level)
@@ -589,7 +705,7 @@ def render_direct(x: np.ndarray, az_b: np.ndarray, r_b: np.ndarray, tab: Tables,
     if gain_b is not None:
         h_b *= gain_b[:, None, None].astype(np.float32)
     if ear_eq or iso_db > 0 or presence_db != 0 or dark_db != 0:
-        ear_intimacy(h_b, az_b, rc, iso_db, presence_db, ear_eq, dark_db)
+        ear_intimacy(h_b, az_b, rc, iso_db, presence_db, ear_eq, dark_db, el_b)
     d_b = (rc / C * FS)[:, None] + tau_b + D0
     tb = np.arange(nb + 1, dtype=float) * BLOCK
     L = NTAP
@@ -609,22 +725,38 @@ def render_direct(x: np.ndarray, az_b: np.ndarray, r_b: np.ndarray, tab: Tables,
     return out[:, :N]
 
 
-def path_power(tab: Tables, az_b: np.ndarray, r_b: np.ndarray) -> np.ndarray:
-    """沿轨迹各块的双耳总功率（语音加权），分块查表以免占用太多内存。"""
+def path_power(tab: Tables, az_b: np.ndarray, r_b: np.ndarray, el_b: np.ndarray | None = None) -> np.ndarray:
+    """沿轨迹各块的双耳总功率（语音加权），分块查表以免占用太多内存。带高度时取同一侧向角上
+    水平面前 / 后两点功率的混合（高度修正只动 5 kHz 以上，对语音频段的总功率影响很小）。"""
     out = np.empty(len(az_b))
     for i in range(0, len(az_b), 8192):
-        h, _ = lookup(tab, np.mod(-az_b[i:i + 8192], 360.0), r_b[i:i + 8192])
-        out[i:i + 8192] = binaural_power(h)
+        az, r = np.mod(-az_b[i:i + 8192], 360.0), r_b[i:i + 8192]
+        if el_b is None:
+            out[i:i + 8192] = binaural_power(lookup(tab, az, r)[0])
+            continue
+        el = el_b[i:i + 8192]
+        _, alpha, _, wf = cone_coords(az, el)
+        pw = (wf * binaural_power(lookup(tab, np.mod(alpha, 360.0), r)[0])
+              + (1 - wf) * binaural_power(lookup(tab, np.mod(180.0 - alpha, 360.0), r)[0]))
+        flat = np.abs(el) <= 1e-4
+        if flat.any():
+            pw[flat] = binaural_power(lookup(tab, az[flat], r[flat])[0])
+        out[i:i + 8192] = pw
     return out
 
 
-def sway_gain(tab: Tables, az_b: np.ndarray, r_b: np.ndarray, r_base: np.ndarray, keep: float) -> np.ndarray:
+def sway_gain(tab: Tables, az_b: np.ndarray, r_b: np.ndarray, r_base: np.ndarray, keep: float,
+              el_b: np.ndarray | None = None, base_pos=None) -> np.ndarray:
     """忽远忽近时说话人自己的音量变化：退开时会不自觉地说大声一点、凑近时放轻（Pelegrín-García 等 2011；
     KU100 实录里近耳音量只保留了物理衰减的约 44%）。返回每块的增益，耳边音量 = 物理衰减 ** keep。
-    这是说话人发出的声音本身变了，所以房间声也要乘同样的增益。"""
+    这是说话人发出的声音本身变了，所以房间声也要乘同样的增益。
+    带高度时 base_pos 给出不含忽远忽近的位置 (方位角, 仰角, 距离)。"""
     if keep >= 1.0 or np.allclose(r_b, r_base):
         return np.ones(len(r_b))
-    return (path_power(tab, az_b, r_b) / path_power(tab, az_b, r_base)) ** (-(1.0 - keep) / 2)
+    if el_b is None:
+        return (path_power(tab, az_b, r_b) / path_power(tab, az_b, r_base)) ** (-(1.0 - keep) / 2)
+    az0, el0, r0 = base_pos
+    return (path_power(tab, az_b, r_b, el_b) / path_power(tab, az0, r0, el0)) ** (-(1.0 - keep) / 2)
 
 
 def conv_add(out: np.ndarray, x: np.ndarray, h: np.ndarray, chunk: int = 1 << 20) -> None:
@@ -741,9 +873,12 @@ def build_room(tab: Tables, name: str, wet_db: float, seed: int = 7, pb="cdfc") 
     return Room(er, tail.astype(np.float32))
 
 
-def render_room(out: np.ndarray, x: np.ndarray, az_b: np.ndarray, room: Room, gain_b: np.ndarray | None = None) -> None:
+def render_room(out: np.ndarray, x: np.ndarray, az_b: np.ndarray, room: Room, gain_b: np.ndarray | None = None,
+                el_b: np.ndarray | None = None) -> None:
     """早期反射按声源方向在 12 个扇区间插值（权重加在输入端），尾巴共用；结果累加进 out。
-    gain_b：说话人音量的变化（忽远忽近），房间声跟着说话人的音量走，而不跟距离走。"""
+    gain_b：说话人音量的变化（忽远忽近），房间声跟着说话人的音量走，而不跟距离走。
+    el_b：仰角。房间只在水平面上测过 12 个方向；声源升到 45° 以上时逐渐换成各方向的平均，到 80° 完全平均
+    （从头顶绕过去、方位角翻到另一侧时不会突变）。"""
     if gain_b is not None:
         x = (x * np.concatenate([block_interp(gain_b, n0, min(len(x), n0 + (1 << 22)))
                                  for n0 in range(0, len(x), 1 << 22)])).astype(np.float32)
@@ -754,6 +889,9 @@ def render_room(out: np.ndarray, x: np.ndarray, az_b: np.ndarray, room: Room, ga
     ar = np.arange(len(az_b))
     np.add.at(Wb, (k0, ar), 1 - fr)
     np.add.at(Wb, ((k0 + 1) % NSEC, ar), fr)
+    if el_b is not None:
+        up = smoothstep((np.abs(el_b) - 45.0) / 35.0)
+        Wb = Wb * (1 - up) + up / NSEC
     N = len(x)
     xs = np.empty_like(x)
     for sec in range(NSEC):
@@ -790,9 +928,15 @@ class PolarTrack:
         self.t = t
         self.az = np.full(len(t), az0, float)
         self.r = np.full(len(t), r0, float)
+        self.lift = np.zeros(len(t))          # 绕两耳连线向上转多少度（从头顶绕时为 90）
         self.cur_az, self.cur_r = az0, r0
 
-    def move(self, t0: float, t1: float, az1: float, r1: float, via: str = "short", pass_r: float | None = None):
+    def move(self, t0: float, t1: float, az1: float, r1: float, via: str = "short", pass_r: float | None = None,
+             top: bool = False):
+        """top：从头顶绕——方位角照"从前面绕"走，同时把整条路径绕两耳连线向上转 90°，
+        于是声音从这只耳朵升到头顶、再落到另一只耳朵（起止各用四分之一的行程转上去 / 转回来）。"""
+        if top:
+            via = "front"
         d = arc_delta(self.cur_az, az1, via)
         a0, rr0 = self.cur_az, self.cur_r
         bump = 0.0
@@ -802,6 +946,7 @@ class PolarTrack:
         s = smoothstep((self.t[m] - t0) / max(t1 - t0, 1e-6))
         self.az[m] = a0 + d * s
         self.r[m] = (1 - s) * rr0 + s * r1 + bump * np.sin(np.pi * s)
+        self.lift[m] = 90.0 * smoothstep(s / 0.25) * smoothstep((1 - s) / 0.25) if top else 0.0
         self.cur_az, self.cur_r = a0 + d, r1
 
 
@@ -888,6 +1033,7 @@ def traj_sweep(t, rng, a):
     r_ear = a.dist if a.dist_set else EAR_R
     ea = a.ear_angle
     tr = PolarTrack(t, 360.0 - ea, r_ear)
+    rng_top = np.random.default_rng(a.seed + 404)   # 单独的随机数，不打乱原来的走位
     side, k, n_app = "L", 0, 0
     t0 = a.hold_time
     while t0 < T:
@@ -908,9 +1054,12 @@ def traj_sweep(t, rng, a):
         else:
             via = a.via if a.via != "alternate" else ("front" if k % 2 == 0 else "back")
             mv = a.move_time * rng.uniform(0.92, 1.08)
-            tr.move(t0, t0 + mv, az1, r1, via, pass_r=a.pass_dist)
+            top = a.over_top > 0 and rng_top.random() < a.over_top
+            a.n_top = getattr(a, "n_top", 0) + int(top)
+            tr.move(t0, t0 + mv, az1, r1, via, pass_r=a.pass_dist, top=top)
             t0 += mv + a.hold_time * rng.uniform(0.9, 1.1)
         k += 1
+    a.lift_track = tr.lift
     return tr.az, tr.r, (k, n_app)
 
 
@@ -1083,6 +1232,62 @@ def sway_gestures(t: np.ndarray, rng, period: float) -> tuple[np.ndarray, int]:
     i = np.clip(np.searchsorted(kt, t, side="right") - 1, 0, len(kt) - 2)
     u = smoothstep((t - kt[i]) / np.maximum(kt[i + 1] - kt[i], 1e-6))
     return kv[i] + (kv[i + 1] - kv[i]) * u, int(np.sum(kt[2::4] < T))
+
+
+def updown_gestures(t: np.ndarray, rng, period: float, rnd: float) -> tuple[np.ndarray, int]:
+    """自动上下：嘴在耳朵上方 / 下方之间慢慢换位置——停一会儿 → 慢慢移到另一边 → 停一会儿 → 再移回来。
+    rnd=0 时节奏和高低都固定（上、下各到幅度的 75%，一个来回 period 秒）；rnd=1 时停留和移动的时长、
+    每次到多高都随机，偶尔连续两次停在同一侧。返回 −1…1 的曲线和换位次数。t 用说话时钟时停顿里不动。"""
+    T = float(t[-1])
+    sc = max(period, 1.0) / 6.4
+    rho = float(np.clip(rnd, 0.0, 1.0))
+
+    def mix(mid: float, lo: float, hi: float) -> float:
+        return mid + (rng.uniform(lo, hi) - mid) * rho
+
+    v = rng.uniform(-0.5, 0.5) * rho
+    sgn = 1.0 if rng.random() < 0.5 else -1.0
+    keys = [(0.0, v)]
+    tc, n = 0.0, 0
+    while tc < T + 5.0:
+        tc += mix(1.3, 0.5, 2.1) * sc
+        keys.append((tc, v))
+        if rng.random() >= 0.2 * rho:
+            sgn = -sgn
+        v = sgn * mix(0.75, 0.35, 1.0)
+        tc += mix(1.9, 1.3, 2.5) * sc
+        keys.append((tc, v))
+        n += 1
+    kt = np.array([k[0] for k in keys])
+    kv = np.array([k[1] for k in keys])
+    i = np.clip(np.searchsorted(kt, t, side="right") - 1, 0, len(kt) - 2)
+    u = smoothstep((t - kt[i]) / np.maximum(kt[i + 1] - kt[i], 1e-6))
+    return kv[i] + (kv[i + 1] - kv[i]) * u, int(np.sum(kt[2::2] < T))
+
+
+def lift_tilt(az: np.ndarray, r: np.ndarray, lift: np.ndarray, tilt: np.ndarray):
+    """把水平面上的位置（方位角 az、距离 r）抬离水平面，返回 (方位角, 仰角, 距离)。
+      1. lift：整个位置绕两耳连线向上转这么多度（从头顶绕时用；正前方转 90° 就到了头顶）。
+      2. tilt：以"耳朵"为支点向上（正）/ 向下（负）倾这么多度，嘴到耳朵的距离不变——贴耳时就是嘴绕着
+         耳朵上下挪。支点随声源的侧向程度在两耳之间滑动：声源在正侧方时支点就是那只耳朵，在正前 / 正后方
+         时是头中心（这时就是普通的仰角）。从头顶绕到最高处时 tilt 不起作用。
+    lift 和 tilt 都为 0 的位置原样返回，仰角为 0。"""
+    a = np.radians(az)
+    x, y = r * np.sin(a), r * np.cos(a)                    # x 朝右，y 朝前
+    rho = np.radians(lift)
+    y2, z2 = y * np.cos(rho), y * np.sin(rho)
+    cx = HEAD_A * x / np.maximum(r, 1e-9)
+    vx = x - cx
+    vh = np.hypot(vx, y2)
+    d = np.hypot(vh, z2)
+    phi = np.clip(np.arctan2(z2, vh) + np.radians(tilt) * np.cos(rho), -0.5 * np.pi, 0.5 * np.pi)
+    ux, uy = vx / np.maximum(vh, 1e-9), y2 / np.maximum(vh, 1e-9)
+    px, py, pz = cx + ux * d * np.cos(phi), uy * d * np.cos(phi), d * np.sin(phi)
+    rr = np.sqrt(px * px + py * py + pz * pz)
+    el = np.degrees(np.arcsin(np.clip(pz / np.maximum(rr, 1e-9), -1.0, 1.0)))
+    az2 = np.degrees(np.arctan2(px, py)) % 360.0
+    flat = (lift == 0) & (tilt == 0)
+    return np.where(flat, az, az2), np.where(flat, 0.0, el), np.where(flat, r, np.clip(rr, R_MIN, R_MAX))
 
 
 def apply_sway(x: np.ndarray, t: np.ndarray, r: np.ndarray, rng, a,
@@ -1304,6 +1509,15 @@ def main(argv=None) -> int:
     ap.add_argument("--sway-period", type=float, default=4.0,
                     help="说话时一次凑近—退开的大致时长（秒，随机，贴近至少停 2 s，所以实际约 4–7 s；"
                          "停顿时动作会停住，按真实时间算更长）")
+    ap.add_argument("--height", type=float, default=0.0,
+                    help="高度：嘴相对耳朵向上（正）/ 向下（负）偏多少度，离耳朵的距离不变（0=与耳朵齐平）")
+    ap.add_argument("--updown", type=float, default=25.0,
+                    help="自动上下：嘴在耳朵上方 / 下方之间慢慢换位置的幅度（度，0=关闭）")
+    ap.add_argument("--updown-period", type=float, default=9.0, help="自动上下：说话时一个来回的大致秒数")
+    ap.add_argument("--updown-random", type=float, default=0.6,
+                    help="自动上下的随机程度（0=节奏和高低固定，1=时长和高低都随机）")
+    ap.add_argument("--over-top", type=float, default=0.0,
+                    help="sweep：每次换耳改成\"从头顶绕过去\"的概率（0=只从前 / 后绕，1=每次都从头顶绕）")
     ap.add_argument("--pause-motion", type=float, default=0.13,
                     help="停顿时晃动和凑近 / 退开的速度（相对说话时）：0.13=停顿里几乎不动，下一句从原位置接着说"
                          "（Hadar 1983）；1=一直在动（旧版）")
@@ -1325,7 +1539,7 @@ def main(argv=None) -> int:
     ap.add_argument("--duration", type=float, help="只处理这么长（秒）")
     ap.add_argument("--sr", type=int, default=FS, help="输出采样率")
     ap.add_argument("--seed", type=int, default=1, help="随机种子（换一个就换一套走位）")
-    ap.add_argument("--save-trajectory", type=Path, help="把轨迹写成 CSV（时间, 方位角, 距离）")
+    ap.add_argument("--save-trajectory", type=Path, help="把轨迹写成 CSV（时间, 方位角, 距离, 仰角）")
     ap.add_argument("--hrtf-dir", type=Path, default=HRTF_DIR)
     a = ap.parse_args(argv)
     for k, v in STYLES[a.style].items():      # 没有手动指定的参数按风格取默认值
@@ -1402,9 +1616,34 @@ def main(argv=None) -> int:
     log(f"轨迹：{a.mode}，{desc}；距离 {r.min():.2f}–{r.max():.2f} m"
         + (f"；动作跟着说话（说话占 {np.mean(act_b > 0.5) * 100:.0f}%，停顿时速度 {a.pause_motion:g}）" if clock is not None else ""))
     r_base, g_sway = r, None
-    if a.sway > 0 or a.sway_follow > 0:
+    swaying = a.sway > 0 or a.sway_follow > 0
+    if swaying:
         r, _, n_sw = apply_sway(x, t, r_base, np.random.default_rng(a.seed + 202), a, clock)
-        g_sway = sway_gain(tab, az, r, r_base, a.sway_level)
+    # 上下：固定高度 + 自动上下（含一点上下的晃动）+ 从头顶绕。都没有时 el 为 None，后面与不带高度时完全相同
+    el = base_pos = None
+    tilt = np.full(len(t), float(a.height))
+    lift = getattr(a, "lift_track", None)
+    lift = np.zeros(len(t)) if lift is None else lift
+    if a.updown > 0:
+        rng_ud = np.random.default_rng(a.seed + 303)
+        g_ud, n_ud = updown_gestures(tm, rng_ud, a.updown_period, a.updown_random)
+        fq, ph, am = rng_ud.uniform(0.06, 0.45, 4), rng_ud.uniform(0, 2 * np.pi, 4), rng_ud.uniform(0.5, 1.0, 4)
+        wob = (am[:, None] * np.sin(2 * np.pi * fq[:, None] * tm[None, :] + ph[:, None])).sum(0) / np.sqrt((am ** 2).sum() / 2)
+        tilt += a.updown * (g_ud + 0.15 * wob * (amp if amp is not None else 1.0))
+    tilt = np.clip(tilt, -80.0, 85.0)
+    if np.any(tilt != 0) or np.any(lift != 0):
+        az_h = az
+        az, el, r = lift_tilt(az_h, r, lift, tilt)
+        base_pos = lift_tilt(az_h, r_base, lift, tilt)
+        side = (np.abs(np.sin(np.radians(az_h))) > 0.9) & (lift == 0)
+        if not side.any():
+            side = np.ones(len(t), bool)
+        log(f"上下：贴耳时嘴相对耳朵 {np.percentile(tilt[side], 5):+.0f}°…{np.percentile(tilt[side], 95):+.0f}°"
+            f"（上为正；仰角 {el.min():+.0f}°…{el.max():+.0f}°）"
+            + (f"，自动上下 {n_ud} 次" if a.updown > 0 else "")
+            + (f"，从头顶绕 {a.n_top} 次" if getattr(a, "n_top", 0) else ""))
+    if swaying:
+        g_sway = sway_gain(tab, az, r, base_pos[2] if el is not None else r_base, a.sway_level, el, base_pos)
         ear = (np.abs(np.sin(np.radians(az))) > 0.9) & (r_base < 0.3)
         dcm = (r[ear] if ear.any() else r) * 100 - HEAD_A * 100
         log(f"忽远忽近：贴耳时离耳 {np.percentile(dcm, 10):.1f}–{np.percentile(dcm, 90):.1f} cm"
@@ -1412,15 +1651,15 @@ def main(argv=None) -> int:
             f"说话人随距离调整音量 {20 * np.log10(g_sway.min()):+.1f}…{20 * np.log10(g_sway.max()):+.1f} dB")
     if a.save_trajectory:
         step = max(1, int(0.05 * FS / BLOCK))
-        np.savetxt(a.save_trajectory, np.stack([t, az, r], 1)[::step], delimiter=",", fmt="%.3f",
-                   header="t_sec,az_deg,dist_m", comments="")
+        np.savetxt(a.save_trajectory, np.stack([t, az, r, el if el is not None else np.zeros(len(t))], 1)[::step],
+                   delimiter=",", fmt="%.3f", header="t_sec,az_deg,dist_m,el_deg", comments="")
 
     y = np.zeros((2, len(x)), np.float32)
     xd = apply_warmth(x, r, a.warmth)
     direct = render_direct(xd, az, r, tab, a.level_follow, a.isolation, a.presence, a.ku100_eq, a.dark,
-                           r_level=r_base if g_sway is not None else None, gain_b=g_sway)
+                           r_level=r_base if g_sway is not None else None, gain_b=g_sway, el_b=el, level_pos=base_pos)
     del xd
-    apply_ear_lf(direct, az, r, a.ear_warmth, a.far_lf_cut)
+    apply_ear_lf(direct, az, r, a.ear_warmth, a.far_lf_cut, el_b=el)
     if a.puff > 0:
         puffs, npf = make_puffs(x, direct, az, r, a.puff, rng_fx)
         direct += puffs
@@ -1432,7 +1671,7 @@ def main(argv=None) -> int:
         conv_add(y, direct, pb[None, :])
     del direct
     if room is not None:
-        render_room(y, x, az, room, g_sway)
+        render_room(y, x, az, room, g_sway, el)
     sos = signal.butter(2, 25, "high", fs=FS, output="sos")
     zi = np.zeros((sos.shape[0], 2, 2))
     for n0 in range(0, y.shape[1], 1 << 21):

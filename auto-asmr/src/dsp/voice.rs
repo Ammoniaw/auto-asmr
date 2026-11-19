@@ -212,6 +212,80 @@ mod tests {
         assert!(db(8000.0) > 0.8 && db(8000.0) < 2.2, "8 kHz {}", db(8000.0));
     }
 
+    /// 确定性的噪声：white = 白噪声；否则一阶低通过的"风扇 / 空调"式低频噪声。有效值 `rms_db` dBFS。
+    fn noise(n: usize, rms_db: f32, white: bool) -> Vec<f32> {
+        let mut seed = 12345u32;
+        let mut lp = 0.0f32;
+        let mut x: Vec<f32> = (0..n)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                let w = (seed >> 8) as f32 / (1u32 << 23) as f32 - 1.0;
+                lp += 0.05 * (w - lp);
+                if white {
+                    w
+                } else {
+                    lp
+                }
+            })
+            .collect();
+        let rms = (x.iter().map(|v| v * v).sum::<f32>() / n as f32).sqrt();
+        let g = crate::dsp::db_to_lin(rms_db) / rms;
+        x.iter_mut().for_each(|v| *v *= g);
+        x
+    }
+
+    fn rms_db(x: &[f32]) -> f32 {
+        10.0 * (x.iter().map(|v| (v * v) as f64).sum::<f64>() / x.len() as f64 + 1e-30).log10() as f32
+    }
+
+    fn run_denoiser(x: &[f32], mix: f32) -> Vec<f32> {
+        let mut d = Denoiser::new();
+        x.iter().map(|&v| d.process(v, mix)).collect()
+    }
+
+    fn attenuation(x: &[f32], db: f32) -> f32 {
+        let p = crate::dsp::params::Params { denoise_db: db, ..Default::default() };
+        let y = run_denoiser(x, p.denoise_mix());
+        rms_db(&x[3 * 48000..]) - rms_db(&y[3 * 48000..])
+    }
+
+    #[test]
+    fn denoise_strength_is_a_fixed_number_of_db() {
+        use crate::dsp::params::{DENOISE_MAX_DB, DENOISE_STEPS};
+        // 稳定的低频底噪（风扇 / 空调一类），降噪器自己能把它压得很干净：设多少分贝就降多少分贝
+        let fan = noise(6 * 48000, -40.0, false);
+        for db in DENOISE_STEPS {
+            let att = attenuation(&fan, db);
+            assert!((att - db).abs() < 0.6, "set {db} dB, got {att} dB");
+        }
+        // "最大"不设上限，比 30 dB 那一档干净得多
+        assert!(attenuation(&fan, DENOISE_MAX_DB) > 40.0);
+        // 嘶嘶的白噪声，降噪器自己只能压低二十多分贝：实际降的不会超过设定值，小档位仍然基本到位
+        let hiss = noise(6 * 48000, -55.0, true);
+        for db in DENOISE_STEPS {
+            let att = attenuation(&hiss, db);
+            assert!(att < db + 0.3 && att > db.min(24.0) - 3.0, "hiss: set {db} dB, got {att} dB");
+        }
+    }
+
+    #[test]
+    fn denoiser_keeps_the_voice_and_stays_aligned() {
+        // 合成的"人声"（带谐波的浊音 + 一点噪声）：降噪后音量基本不变；
+        // 原声那一路和降噪后那一路严格对齐（差一个样本，按比例混合时就会出梳状滤波）
+        let v = crate::cli::test_voice(6.0);
+        let p = crate::dsp::params::Params { denoise_db: 12.0, ..Default::default() };
+        for mix in [p.denoise_mix(), 1.0] {
+            let y = run_denoiser(&v, mix);
+            let (i0, n) = (2 * 48000usize, 3 * 48000usize);
+            let a = &v[i0..i0 + n];
+            let corr = |lag: i32| -> f64 { a.iter().enumerate().map(|(i, &u)| u as f64 * y[(i0 + DENOISE_DELAY + i) as i32 as usize + lag as usize] as f64).sum() };
+            let best = (-8i32..=8).max_by(|&p, &q| corr(p).total_cmp(&corr(q))).unwrap();
+            assert_eq!(best, 0);
+            let change = rms_db(&y[i0 + DENOISE_DELAY..i0 + DENOISE_DELAY + n]) - rms_db(a);
+            assert!(change.abs() < 1.5, "voice level changed by {change} dB");
+        }
+    }
+
     #[test]
     fn deesser_is_transparent_on_vowels() {
         let mut d = DeEsser::new();

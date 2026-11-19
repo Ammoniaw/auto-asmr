@@ -41,16 +41,20 @@ convert 的选项（括号里是默认值）：
   --sway-level <0–1>      退开时耳边音量保留物理衰减的比例（0.45）
   --pause-motion <0–1>    停顿时动作的速度，1=一直在动（0.13）
   --micro <x>             自然晃动幅度（1）
+ 上下
+  --height <度>           嘴相对耳朵向上（正）/ 向下（负）偏多少度，离耳朵的距离不变（0）
+  --updown <度>           自动上下的幅度，0=关闭（25）    --updown-period <秒>（9）  --updown-random <0–1>（0.6）
+  --over-top <0–1>        换耳时从头顶绕过去的概率（0）
  房间与回放
   --room none|real        KU100 实测真实房间（none）    --wet <dB>（-3）
   --headphone diffuse|native|<型号>   回放补偿（diffuse）；--headphone list 列出型号
  人声处理
-  --denoise [强度]        输入降噪 RNNoise（关；强度 0–1）
+  --denoise [dB]          输入降噪 RNNoise（关）。数值 = 底噪最多压低多少 dB，如 12；不写数值 = 降到最干净
   --gate <dBFS>           响应阈值，低于它当作静音（关）
   --deess <dB>            去齿音最多压低（0）       --soft-voice <x>   轻声化（0）
  输出
   --lufs <L>（-16）  --peak <dBTP>（-1）  --max-gr <dB>（8）  --bits 16|24（24）  --seed <n>（1）
-  --save-trajectory <csv> 导出实际走位（时间, 方位角, 距离, 不含忽远忽近的距离, 说话活动）
+  --save-trajectory <csv> 导出实际走位（时间, 方位角, 距离, 不含忽远忽近的距离, 说话活动, 仰角）
 ";
 
 fn parse_f(v: Option<&String>, name: &str) -> Result<f32, String> {
@@ -103,6 +107,13 @@ pub fn run(args: Vec<String>) -> i32 {
                 }
             }
         }
+        "rt-sim" => match run_rt_sim(&args[1..]) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("错误：{e}");
+                2
+            }
+        },
         "bench" => {
             bench();
             0
@@ -198,6 +209,11 @@ fn run_convert(args: &[String]) -> Result<(), String> {
             "--sway-level" => p.sway_level = f(&mut it)?,
             "--pause-motion" => p.pause_motion = f(&mut it)?,
             "--micro" => p.micro = f(&mut it)?,
+            "--height" => p.height = f(&mut it)?.clamp(-80.0, 85.0),
+            "--updown" => p.updown = f(&mut it)?.clamp(0.0, 80.0),
+            "--updown-period" => p.updown_period = f(&mut it)?,
+            "--updown-random" => p.updown_random = f(&mut it)?,
+            "--over-top" => p.over_top = f(&mut it)?.clamp(0.0, 1.0),
             "--room" => {
                 p.room = match it.next().map(|s| s.as_str()) {
                     Some("none") => false,
@@ -231,7 +247,7 @@ fn run_convert(args: &[String]) -> Result<(), String> {
             "--denoise" => {
                 p.denoise = true;
                 if let Some(v) = it.peek().and_then(|s| s.parse::<f32>().ok()) {
-                    p.denoise_mix = v.clamp(0.0, 1.0);
+                    p.denoise_db = v.clamp(1.0, crate::dsp::params::DENOISE_MAX_DB);
                     it.next();
                 }
             }
@@ -272,7 +288,7 @@ fn run_convert(args: &[String]) -> Result<(), String> {
         println!("{}", rep.channel_note);
     }
     println!(
-        "完成：{}  ({:.1} s，{:.1} LUFS，真峰值 {:.1} dBTP，限制器最多压 {:.1} dB；说话占 {:.0}%，换耳 {} 次，往后让 {} 次；用时 {:.1} s)",
+        "完成：{}  ({:.1} s，{:.1} LUFS，真峰值 {:.1} dBTP，限制器最多压 {:.1} dB；说话占 {:.0}%，换耳 {} 次（其中从头顶绕 {} 次），往后让 {} 次，上下换位 {} 次；用时 {:.1} s)",
         opts.output.display(),
         rep.seconds,
         rep.lufs,
@@ -280,13 +296,166 @@ fn run_convert(args: &[String]) -> Result<(), String> {
         rep.max_gr_db,
         rep.speech_pct,
         rep.n_moves,
+        rep.n_tops,
         rep.n_sways,
+        rep.n_updowns,
         rep.elapsed_s
     );
     Ok(())
 }
 
+/// 调试用：不经过声卡，把一个文件按"主播模式"（实时引擎：没有预读、说话检测现学现用）跑一遍，
+/// 打印走位统计；可以模拟小音量麦克风（--gain）、底噪（--noise）、说得少（--sparse）、开头静音（--lead）。
+///   auto-asmr rt-sim <音频> [--duration 秒] [--gain dB] [--noise dBFS] [--sparse 说秒/停秒] [--lead 秒]
+///                    [--style ku100] [--mode …] [--pause-motion x] [--denoise [dB]] [-o 输出.wav]
+fn run_rt_sim(args: &[String]) -> Result<(), String> {
+    let mut p = Params::default();
+    if let Some(i) = args.iter().position(|a| a == "--style") {
+        if args.get(i + 1).map(|s| s.as_str()) == Some("ku100") {
+            p = p.style_ku100();
+        }
+    }
+    let get = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1));
+    let getf = |name: &str| get(name).and_then(|v| v.parse::<f32>().ok());
+    let input = PathBuf::from(args.first().ok_or("缺少输入文件")?);
+    let mut opts = ConvertOptions::new(input);
+    opts.duration = getf("--duration").map(|v| v as f64);
+    opts.start = getf("--start").unwrap_or(0.0) as f64;
+    if let Some(m) = get("--mode") {
+        p.mode = match m.as_str() {
+            "random" => MotionMode::Random,
+            "orbit" => MotionMode::Orbit,
+            "static" => MotionMode::Static,
+            _ => MotionMode::Sweep,
+        };
+        p.level_follow = Params::default_level_follow(p.mode);
+    }
+    if let Some(v) = getf("--pause-motion") {
+        p.pause_motion = v;
+    }
+    if let Some(v) = getf("--micro") {
+        p.micro = v;
+    }
+    if let Some(i) = args.iter().position(|a| a == "--denoise") {
+        p.denoise = true;
+        if let Some(v) = args.get(i + 1).and_then(|v| v.parse::<f32>().ok()) {
+            p.denoise_db = v.clamp(1.0, crate::dsp::params::DENOISE_MAX_DB);
+        }
+    }
+    if let Some(v) = getf("--height") {
+        p.height = v;
+    }
+    if let Some(v) = getf("--updown") {
+        p.updown = v;
+    }
+    if let Some(v) = getf("--over-top") {
+        p.over_top = v;
+    }
+    let (mut x, _) = crate::offline::load_mono(&opts, &AtomicBool::new(false))?;
+    let g = crate::dsp::db_to_lin(getf("--gain").unwrap_or(0.0));
+    for v in x.iter_mut() {
+        *v *= g;
+    }
+    if let Some(sp) = get("--sparse") {
+        // "1.5/4"：每说 1.5 秒，插入 4 秒静音
+        let mut it = sp.split('/').filter_map(|v| v.parse::<f32>().ok());
+        let (on, off) = (it.next().unwrap_or(1.5), it.next().unwrap_or(4.0));
+        let (n_on, n_off) = ((on * FS) as usize, (off * FS) as usize);
+        let mut y = Vec::with_capacity(x.len() * 3);
+        for c in x.chunks(n_on.max(1)) {
+            y.extend_from_slice(c);
+            y.extend(std::iter::repeat(0.0).take(n_off));
+        }
+        if let Some(d) = opts.duration {
+            y.truncate((d * FS as f64) as usize);
+        }
+        x = y;
+    }
+    if let Some(l) = getf("--lead") {
+        let mut y = vec![0f32; (l * FS) as usize];
+        y.extend_from_slice(&x);
+        x = y;
+    }
+    if let Some(n) = getf("--noise") {
+        let a = crate::dsp::db_to_lin(n) * 3f32.sqrt(); // 均匀分布白噪声，有效值 n dBFS
+        let mut seed = 7u32;
+        for v in x.iter_mut() {
+            seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+            *v += a * ((seed >> 8) as f32 / (1u32 << 23) as f32 - 1.0);
+        }
+    }
+    let cfg = Arc::new(EngineConfig::new(p, None));
+    let mut eng = Engine::new(cfg, PostMode::Realtime, 0.0);
+    eng.set_live(!args.iter().any(|a| a == "--strict")); // --strict：动作严格跟着说话（试听 / 修复前的行为）
+    eng.trace = Some(Vec::new());
+    let (mut l, mut r) = (vec![0f32; x.len()], vec![0f32; x.len()]);
+    for (i, c) in x.chunks(128).enumerate() {
+        let o = i * 128;
+        eng.process(c, &mut l[o..o + c.len()], &mut r[o..o + c.len()]);
+    }
+    let tr = eng.trace.take().unwrap_or_default();
+    // 每 0.5 秒一个字符：L / R 贴在左 / 右耳边，l / r 偏左 / 偏右，^ 正前，v 正后，T 头顶；下一行是说话检测（# 说话，. 停顿）
+    let per = (0.5 / crate::dsp::CTRL_DT) as usize;
+    let (mut line, mut acts) = (String::new(), String::new());
+    for c in tr.chunks(per) {
+        let m = c[c.len() / 2];
+        let ce = m[5].to_radians().cos();
+        let s = m[1].to_radians().sin() * ce;
+        let f = m[1].to_radians().cos() * ce;
+        line.push(if m[5] > 55.0 {
+            'T'
+        } else if s < -0.85 {
+            'L'
+        } else if s > 0.85 {
+            'R'
+        } else if s < -0.3 {
+            'l'
+        } else if s > 0.3 {
+            'r'
+        } else if f > 0.0 {
+            '^'
+        } else {
+            'v'
+        });
+        let a = c.iter().map(|v| v[4]).sum::<f32>() / c.len() as f32;
+        acts.push(if a > 0.6 {
+            '#'
+        } else if a > 0.2 {
+            '+'
+        } else {
+            '.'
+        });
+    }
+    let secs = x.len() as f32 / FS;
+    println!("主播模式模拟 {secs:.1} s（每个字符 0.5 s）");
+    for (a, b) in line.as_bytes().chunks(120).zip(acts.as_bytes().chunks(120)) {
+        println!("  位置 {}", String::from_utf8_lossy(a));
+        println!("  说话 {}", String::from_utf8_lossy(b));
+    }
+    let speech = 100.0 * eng.n_speech as f32 / eng.n_blocks.max(1) as f32;
+    let rms = |v: &[f32]| (v.iter().map(|a| (a * a) as f64).sum::<f64>() / v.len().max(1) as f64).sqrt() as f32;
+    println!(
+        "  说话占 {speech:.0}%，换耳 {} 次，往后让 {} 次；输入有效值 {:.1} dBFS，输出有效值 {:.1} dBFS",
+        eng.tele.n_moves,
+        eng.tele.n_sways,
+        crate::dsp::lin_to_db(rms(&x)),
+        crate::dsp::lin_to_db(rms(&l).max(rms(&r)))
+    );
+    if let Some(out) = get("-o") {
+        let spec = hound::WavSpec { channels: 2, sample_rate: FS_USIZE as u32, bits_per_sample: 24, sample_format: hound::SampleFormat::Int };
+        let mut w = hound::WavWriter::create(out, spec).map_err(|e| e.to_string())?;
+        for (a, b) in l.iter().zip(r.iter()) {
+            w.write_sample((a.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32).map_err(|e| e.to_string())?;
+            w.write_sample((b.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32).map_err(|e| e.to_string())?;
+        }
+        w.finalize().map_err(|e| e.to_string())?;
+        println!("  已写出 {out}");
+    }
+    Ok(())
+}
+
 /// 调试用：只解码并取成 48 kHz 单声道，写成 WAV（用来核对解码器）。
+/// 加 `--denoise [dB]` 时再过一遍输入降噪（不做空间化），可以单独听降噪的效果。
 fn run_decode(args: &[String]) -> Result<(), String> {
     let input = PathBuf::from(args.first().ok_or("缺少输入文件")?);
     let out = args.iter().position(|a| a == "-o").and_then(|i| args.get(i + 1)).map(PathBuf::from).unwrap_or_else(|| input.with_extension("decoded.wav"));
@@ -294,7 +463,19 @@ fn run_decode(args: &[String]) -> Result<(), String> {
     if let Some(i) = args.iter().position(|a| a == "--duration") {
         opts.duration = args.get(i + 1).and_then(|v| v.parse().ok());
     }
-    let (mono, note) = crate::offline::load_mono(&opts, &AtomicBool::new(false))?;
+    let (mut mono, note) = crate::offline::load_mono(&opts, &AtomicBool::new(false))?;
+    if let Some(i) = args.iter().position(|a| a == "--denoise") {
+        let mut p = Params::default();
+        if let Some(v) = args.get(i + 1).and_then(|v| v.parse::<f32>().ok()) {
+            p.denoise_db = v.clamp(1.0, crate::dsp::params::DENOISE_MAX_DB);
+        }
+        let mix = p.denoise_mix();
+        let mut d = crate::dsp::voice::Denoiser::new();
+        // 降噪器有 20 ms 的固定时延：多喂 20 ms 的静音，再把开头的 20 ms 去掉，输出与输入对齐
+        mono.extend(std::iter::repeat(0.0).take(crate::dsp::voice::DENOISE_DELAY));
+        let y: Vec<f32> = mono.iter().map(|&v| d.process(v, mix)).collect();
+        mono = y[crate::dsp::voice::DENOISE_DELAY..].to_vec();
+    }
     let spec = hound::WavSpec { channels: 1, sample_rate: FS_USIZE as u32, bits_per_sample: 24, sample_format: hound::SampleFormat::Int };
     let mut w = hound::WavWriter::create(&out, spec).map_err(|e| e.to_string())?;
     for v in &mono {

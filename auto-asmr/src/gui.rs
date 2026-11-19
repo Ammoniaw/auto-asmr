@@ -1,7 +1,7 @@
 //! 图形界面（egui）：实时页 + 文件转换页，右侧是两种模式共用的效果参数。
 
 use crate::dsp::engine::{EngineConfig, Telemetry};
-use crate::dsp::params::{MotionMode, Params, Playback, Via};
+use crate::dsp::params::{MotionMode, Params, Playback, Via, DENOISE_MAX_DB, DENOISE_STEPS};
 use crate::dsp::tables::tables;
 use crate::dsp::{FS, HEAD_A};
 use crate::offline::{convert, default_output, load_mono, Channel, ConvertOptions, ConvertReport};
@@ -136,8 +136,12 @@ impl App {
         let mut s: Saved = cc.storage.and_then(|st| eframe::get_value(st, eframe::APP_KEY)).unwrap_or_default();
         let mut demo = None;
         let shot = screenshot.map(|(p, file_tab, demo_file)| {
-            // 截图自检：用默认设置，保证每次画面一致
+            // 截图自检：用默认设置，保证每次画面一致；要看别的状态时，用环境变量 AUTO_ASMR_SHOT_PARAMS
+            // 给出参数（RON，只写要改的项，如 "(denoise:true,denoise_db:12.0)"）
             s = Saved::default();
+            if let Some(p) = std::env::var("AUTO_ASMR_SHOT_PARAMS").ok().and_then(|v| ron::from_str::<Params>(&v).ok()) {
+                s.params = p;
+            }
             if file_tab {
                 s.tab = Tab::File;
             }
@@ -359,16 +363,18 @@ impl App {
     }
 
     /// 头顶俯视图：声源相对头的位置（上 = 正前方），半径按对数压缩，贴耳的细节看得清。
+    /// 右侧的竖条是高度：从耳朵（声源在正前 / 正后方时从头中心）看过去，嘴在上方还是下方多少度。
     fn ui_radar(&mut self, ui: &mut egui::Ui, size: f32) {
-        let (resp, p) = ui.allocate_painter(egui::vec2(size, size), egui::Sense::hover());
-        let rect = resp.rect;
+        const GAUGE_W: f32 = 20.0;
+        let (resp, p) = ui.allocate_painter(egui::vec2(size + GAUGE_W, size), egui::Sense::hover());
+        let rect = egui::Rect::from_min_size(resp.rect.min, egui::vec2(size, size));
         let c = rect.center();
         let rmax = size * 0.47;
         let map = |r: f32| -> f32 { ((r / 0.02).max(1.0).ln() / (0.8f32 / 0.02).ln()).clamp(0.0, 1.0) * rmax };
         let dark = ui.visuals().dark_mode;
         let grid = if dark { Color32::from_gray(70) } else { Color32::from_gray(190) };
         let fg = if dark { Color32::from_gray(200) } else { Color32::from_gray(60) };
-        p.rect_filled(rect, 8.0, if dark { Color32::from_gray(24) } else { Color32::from_gray(245) });
+        p.rect_filled(resp.rect, 8.0, if dark { Color32::from_gray(24) } else { Color32::from_gray(245) });
         for (rr, label) in [(0.1875, "10 cm"), (0.3875, "30 cm"), (0.6875, "60 cm")] {
             p.circle_stroke(c, map(rr), egui::Stroke::new(1.0, grid));
             let a = 0.25 * std::f32::consts::PI; // 距离刻度写在右下方，不挡左上角的读数
@@ -391,8 +397,11 @@ impl App {
             c + egui::vec2(a.sin(), -a.cos()) * map(r)
         };
         let active = self.rt.is_some();
+        // 俯视图里画的是水平投影：声源升高时向头中心靠拢，从头顶绕过去时会穿过头的上方
+        let (el, r3) = (self.tele.el.to_radians(), self.tele.r);
+        let r_h = r3 * el.cos();
         if active {
-            self.trail.push((self.tele.az, self.tele.r));
+            self.trail.push((self.tele.az, r_h));
             if self.trail.len() > 90 {
                 self.trail.remove(0);
             }
@@ -410,9 +419,22 @@ impl App {
         } else {
             Color32::from_rgb(170, 120, 90)
         };
-        let sp = pos(self.tele.az, self.tele.r);
+        let sp = pos(self.tele.az, r_h);
         p.circle_filled(sp, if speaking && active { 7.0 } else { 5.5 }, col);
-        p.text(rect.left_top() + egui::vec2(8.0, 6.0), egui::Align2::LEFT_TOP, format!("{} {:.1} cm   {:.0}°", t("离耳", "from ear"), ((self.tele.r - HEAD_A) * 100.0).max(0.0), self.tele.az), egui::FontId::proportional(12.0), fg);
+        // 高度角：以"耳朵"为支点（与运动里倾斜的支点相同：正侧方时是那只耳朵，正前 / 正后方时是头中心）
+        let a = self.tele.az.to_radians();
+        let (x, y, z) = (r_h * a.sin(), r_h * a.cos(), r3 * el.sin());
+        let cx = HEAD_A * x / r3.max(1e-6);
+        let up = z.atan2((x - cx).hypot(y)).to_degrees();
+        let (gx, g0, g1) = (rect.right() + 0.5 * GAUGE_W - 2.0, rect.top() + 30.0, rect.bottom() - 18.0);
+        let gm = 0.5 * (g0 + g1);
+        p.line_segment([egui::pos2(gx, g0), egui::pos2(gx, g1)], egui::Stroke::new(2.0, grid));
+        p.line_segment([egui::pos2(gx - 4.0, gm), egui::pos2(gx + 4.0, gm)], egui::Stroke::new(1.5, grid));
+        p.text(egui::pos2(gx, g0 - 3.0), egui::Align2::CENTER_BOTTOM, t("上", "up"), egui::FontId::proportional(10.0), grid);
+        p.text(egui::pos2(gx, g1 + 2.0), egui::Align2::CENTER_TOP, t("下", "dn"), egui::FontId::proportional(10.0), grid);
+        p.circle_filled(egui::pos2(gx, gm - (up / 90.0).clamp(-1.0, 1.0) * 0.5 * (g1 - g0)), if speaking && active { 5.0 } else { 4.0 }, col);
+        let hgt = if up.abs() < 1.0 { String::new() } else { format!("   {} {:.0}°", if up > 0.0 { t("上", "up") } else { t("下", "down") }, up.abs()) };
+        p.text(rect.left_top() + egui::vec2(8.0, 6.0), egui::Align2::LEFT_TOP, format!("{} {:.1} cm   {:.0}°{}", t("离耳", "from ear"), ((self.tele.r - HEAD_A) * 100.0).max(0.0), self.tele.az, hgt), egui::FontId::proportional(12.0), fg);
     }
 
     /// 电平条：`frac` 0–1 是填充比例，`hot` 时变红。
@@ -431,7 +453,7 @@ impl App {
         ui.group(|ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
-                self.ui_radar(ui, 210.0);
+                self.ui_radar(ui, 192.0);
                 ui.vertical(|ui| {
                     let tl = self.tele;
                     let dbs = |v: f32| if v < -100.0 { "—".to_string() } else { format!("{v:.0} dB") };
@@ -574,6 +596,41 @@ impl App {
         }
     }
 
+    /// 左下角：输入降噪。强度按固定的分贝数选——底噪最多压低这么多。
+    fn ui_denoise(ui: &mut egui::Ui, p: &mut Params) {
+        ui.add_space(5.0);
+        ui.horizontal(|ui| {
+            ui.label(RichText::new(t("降噪", "Denoise")).strong()).on_hover_text(t(
+                "输入降噪（RNNoise，纯 CPU）：在空间化之前去掉麦克风 / 录音里的底噪。选一个数值，底噪就最多压低这么多分贝；人声的音量不变",
+                "Input denoise (RNNoise, CPU only): removes background noise before spatialization. Pick a value: noise is lowered by at most that many dB; the voice keeps its level",
+            ));
+            if ui.selectable_label(!p.denoise, t("关", "Off")).clicked() {
+                p.denoise = false;
+            }
+            for db in DENOISE_STEPS {
+                let on = p.denoise && (p.denoise_db - db).abs() < 0.5;
+                if ui.selectable_label(on, format!("{db:.0} dB")).on_hover_text(format!("{} {db:.0} dB", t("底噪最多压低", "Lower the noise by at most"))).clicked() {
+                    p.denoise = true;
+                    p.denoise_db = db;
+                }
+            }
+            let max = p.denoise && p.denoise_db >= DENOISE_MAX_DB;
+            if ui.selectable_label(max, t("最大", "Max")).on_hover_text(t("不设上限，降到最干净", "No limit: as clean as it gets")).clicked() {
+                p.denoise = true;
+                p.denoise_db = DENOISE_MAX_DB;
+            }
+        });
+        let note = if !p.denoise {
+            t("关闭。麦克风或录音有底噪时打开：数值 = 底噪最多压低多少分贝", "Off. Turn it on for a noisy microphone or recording: the value is how many dB the noise is lowered by at most").to_string()
+        } else if p.denoise_db >= DENOISE_MAX_DB {
+            t("不设上限，降到最干净；气声的高频会被削掉一些，很轻的尾音可能被压掉。延迟增加 20 ms", "No limit, as clean as it gets; breathy highs lose a little and very soft tails may be cut. Adds 20 ms of latency").to_string()
+        } else {
+            format!("{} {:.0} dB{}", t("底噪最多压低", "Noise lowered by at most"), p.denoise_db, t("，人声音量不变。数值越大越干净，气声的高频也会被削掉一点。延迟增加 20 ms", "; the voice keeps its level. Higher = cleaner, but breathy highs lose a little. Adds 20 ms of latency"))
+        };
+        ui.add(egui::Label::new(RichText::new(note).small().weak()).wrap());
+        ui.add_space(3.0);
+    }
+
     /// 右侧第一栏：风格、贴耳感、左右移动。
     fn params_left(ui: &mut egui::Ui, p: &mut Params) {
         ui.horizontal(|ui| {
@@ -662,9 +719,19 @@ impl App {
                 row(ui, t("随机程度", "Randomness"), t("0 = 固定节奏和深浅，1 = 时长和深浅都随机", "0 = fixed rhythm and depth, 1 = random timing and depth"), egui::Slider::new(&mut p.sway_random, 0.0..=1.0).fixed_decimals(2));
                 row(ui, t("跟随音量", "Follow loudness"), t("声音大时往后让、轻声时更贴近，听着更舒服", "Louder → leans back, softer → comes closer; more comfortable"), egui::Slider::new(&mut p.sway_follow, 0.0..=2.0).fixed_decimals(2));
                 row(ui, t("退开时的音量", "Level when back"), t("退开时耳边音量保留物理衰减的比例（真人退开会说大声一点；KU100 实录 0.4–0.56）", "Share of the physical level drop kept when leaning back (talkers raise their voice; KU100 recordings 0.4–0.56)"), egui::Slider::new(&mut p.sway_level, 0.0..=1.0).fixed_decimals(2));
-                row(ui, t("停顿时的动作", "Motion in pauses"), t("停顿时动作的速度：0.13 = 几乎不动，下一句从原位置接着说；1 = 一直在动", "Motion speed during pauses: 0.13 = almost still, 1 = always moving"), egui::Slider::new(&mut p.pause_motion, 0.0..=1.0).fixed_decimals(2));
+                row(ui, t("停顿时的动作", "Motion in pauses"), t("停顿时动作的速度：0.13 = 几乎不动，下一句从原位置接着说；1 = 一直在动。实时（主播）模式下，停顿超过 1 秒会恢复正常速度，话少时声音也一直在动", "Motion speed during pauses: 0.13 = almost still, 1 = always moving. In real-time mode motion resumes at full speed after 1 s of pause, so it keeps moving when you talk little"), egui::Slider::new(&mut p.pause_motion, 0.0..=1.0).fixed_decimals(2));
                 row(ui, t("自然晃动", "Micro motion"), t("人体自然的微小晃动（1 约 1.2 cm）", "Natural small body sway (1 ≈ 1.2 cm)"), egui::Slider::new(&mut p.micro, 0.0..=2.0).fixed_decimals(2));
             });
+        });
+        egui::CollapsingHeader::new(RichText::new(t("上下", "Up / down")).strong()).default_open(true).show(ui, |ui| {
+            egui::Grid::new("g7").num_columns(2).min_col_width(COL).spacing([10.0, 6.0]).show(ui, |ui| {
+                row(ui, t("高度", "Height"), t("嘴相对耳朵向上（正）/ 向下（负）偏多少度，离耳朵的距离不变；0 = 与耳朵齐平", "Mouth above (+) / below (−) the ear, in degrees, at the same distance from the ear; 0 = level with the ear"), egui::Slider::new(&mut p.height, -60.0..=75.0).suffix("°").fixed_decimals(0));
+                row(ui, t("自动上下", "Auto up / down"), t("嘴在耳朵上方 / 下方之间慢慢换位置的幅度（0 = 关闭）", "How far the mouth drifts above / below the ear on its own (0 = off)"), egui::Slider::new(&mut p.updown, 0.0..=60.0).suffix("°").fixed_decimals(0));
+                row(ui, t("节奏", "Period"), t("说话时上下一个来回大约几秒", "Seconds of speech per up / down cycle"), egui::Slider::new(&mut p.updown_period, 3.0..=30.0).suffix(" s").fixed_decimals(1));
+                row(ui, t("随机程度", "Randomness"), t("0 = 节奏和高低固定，1 = 时长和高低都随机", "0 = fixed rhythm and height, 1 = random timing and height"), egui::Slider::new(&mut p.updown_random, 0.0..=1.0).fixed_decimals(2));
+                row(ui, t("从头顶绕", "Over the head"), t("换耳时改成从头顶绕过去的概率（穿梭 / 随机走位）：0 = 只从脸前 / 脑后绕，1 = 每次都从头顶绕", "Chance that an ear switch goes over the top of the head (sweep / random): 0 = front / back only, 1 = always over the top"), egui::Slider::new(&mut p.over_top, 0.0..=1.0).fixed_decimals(2));
+            });
+            ui.add(egui::Label::new(RichText::new(t("上下比左右、远近弱，因人而异；气声、轻语更明显", "Height is a weaker cue than left / right or distance and varies between listeners; clearer on breathy voices")).weak().small()).wrap());
         });
         egui::CollapsingHeader::new(RichText::new(t("KU100 临场感", "KU100 presence")).strong()).default_open(true).show(ui, |ui| {
             ui.checkbox(&mut p.room, t("真实房间（KU100 实测，远耳听到的是房间声而不是寂静）", "Real room (measured with a KU100: the far ear hears the room, not silence)"));
@@ -689,10 +756,6 @@ impl App {
             });
         });
         egui::CollapsingHeader::new(RichText::new(t("人声处理", "Voice")).strong()).default_open(true).show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.checkbox(&mut p.denoise, t("输入降噪", "Input denoise")).on_hover_text(t("RNNoise，纯 CPU；会增加 20 ms 延迟", "RNNoise, CPU only; adds 20 ms of latency"));
-                ui.add_enabled(p.denoise, egui::Slider::new(&mut p.denoise_mix, 0.0..=1.0).text(t("强度", "Strength")).fixed_decimals(2));
-            });
             egui::Grid::new("g5").num_columns(2).min_col_width(COL).spacing([10.0, 6.0]).show(ui, |ui| {
                 row(ui, t("响应阈值", "Gate threshold"), t("输入低于这个电平时当作静音（−90 = 关闭）", "Input below this level is muted (−90 = off)"), egui::Slider::new(&mut p.gate_db, -90.0..=-20.0).suffix(" dB").fixed_decimals(0));
                 row(ui, t("去齿音", "De-ess"), t("只在 s / sh / x 出现时压低 4.5 kHz 以上，最多压这么多", "Ducks >4.5 kHz only on sibilants, by at most this much"), egui::Slider::new(&mut p.deess_db, 0.0..=10.0).suffix(" dB").fixed_decimals(1));
@@ -749,7 +812,7 @@ impl App {
             self.job = None;
             self.report = match r {
                 Ok(rep) => format!(
-                    "{}：{}\n{:.1} s，{:.1} LUFS，{} {:.1} dBTP，{} {:.1} dB；{} {:.0}%，{} {}，{} {}；{} {:.1} s{}",
+                    "{}：{}\n{:.1} s，{:.1} LUFS，{} {:.1} dBTP，{} {:.1} dB；{} {:.0}%，{} {}（{} {}），{} {}，{} {}；{} {:.1} s{}",
                     t("已保存", "Saved"),
                     out.display(),
                     rep.seconds,
@@ -762,8 +825,12 @@ impl App {
                     rep.speech_pct,
                     t("换耳", "switches"),
                     rep.n_moves,
+                    t("从头顶绕", "over the head"),
+                    rep.n_tops,
                     t("往后让", "lean-backs"),
                     rep.n_sways,
+                    t("上下换位", "up / down moves"),
+                    rep.n_updowns,
                     t("用时", "took"),
                     rep.elapsed_s,
                     if rep.channel_note.is_empty() { String::new() } else { format!("\n{}", rep.channel_note) }
@@ -836,6 +903,9 @@ impl eframe::App for App {
             });
         });
         egui::Panel::left("left").resizable(false).exact_size(470.0).show(ui, |ui| {
+            egui::Panel::bottom("left_bottom").resizable(false).show(ui, |ui| {
+                Self::ui_denoise(ui, &mut self.s.params);
+            });
             egui::ScrollArea::vertical().id_salt("leftscroll").show(ui, |ui| {
                 ui.add_space(6.0);
                 match self.s.tab {

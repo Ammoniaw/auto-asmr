@@ -5,7 +5,7 @@ use super::analysis::{Analyzer, Features};
 use super::direct::{DirectRenderer, BASE_DELAY};
 use super::dynamics::{Leveler, Limiter};
 use super::filters::{Biquad, Fir, OnePoleLp, BUTTER_Q};
-use super::motion::{clock_step, Motion, Pose};
+use super::motion::{clock_step, clock_step_live, Motion, Pose};
 use super::params::{Params, Playback};
 use super::room::{conv_energy, Room};
 use super::tables::{tables, Hrir, Tables};
@@ -84,6 +84,8 @@ impl EngineConfig {
 #[derive(Clone, Copy, Debug, Default)]
 pub struct Telemetry {
     pub az: f32,
+    /// 仰角（度，向上为正）。
+    pub el: f32,
     pub r: f32,
     pub closeness: f32,
     pub act: f32,
@@ -93,6 +95,8 @@ pub struct Telemetry {
     pub level_gain_db: f32,
     pub n_moves: u32,
     pub n_sways: u32,
+    pub n_tops: u32,
+    pub n_updowns: u32,
 }
 
 /// 输出端怎么收尾。
@@ -124,10 +128,10 @@ impl EarLf {
     }
 }
 
-/// 嘴贴近某一侧耳朵的程度（0–1）：距离越近、越偏向正侧方越大；转到脸前 / 脑后时为 0。
+/// 嘴贴近某一侧耳朵的程度（0–1）：距离越近、越偏向正侧方越大；转到脸前 / 脑后 / 头顶时为 0。
 #[inline]
-pub fn closeness(az: f32, r: f32) -> f32 {
-    let lat = az.to_radians().sin().abs();
+pub fn closeness(az: f32, el: f32, r: f32) -> f32 {
+    let lat = az.to_radians().sin().abs() * el.to_radians().cos();
     ((0.2 - r) / (0.2 - EAR_R)).clamp(0.0, 1.0) * lat * lat
 }
 
@@ -161,6 +165,7 @@ pub struct Engine {
     feats: Features,
     pose: Pose,
     hr: Hrir,
+    hr_tmp: Hrir,
     xa: [f32; CTRL],
     xr: [f32; CTRL],
     room_dl: [f32; ROOM_DELAY],
@@ -175,9 +180,11 @@ pub struct Engine {
     /// 统计：已处理的控制块数、其中在说话的块数。
     pub n_blocks: u64,
     pub n_speech: u64,
-    /// 打开后记录每个控制块的 [时间 s, 方位角, 距离, 不含忽远忽近的距离, 说话活动]（导出轨迹用）。
-    pub trace: Option<Vec<[f32; 5]>>,
+    /// 打开后记录每个控制块的 [时间 s, 方位角, 距离, 不含忽远忽近的距离, 说话活动, 仰角]（导出轨迹用）。
+    pub trace: Option<Vec<[f32; 6]>>,
     amp_ms: f32,
+    live: bool,
+    pause_s: f32,
 }
 
 impl Engine {
@@ -216,6 +223,7 @@ impl Engine {
             feats: Features::default(),
             pose: Pose::default(),
             hr: Hrir::default(),
+            hr_tmp: Hrir::default(),
             xa: [0.0; CTRL],
             xr: [0.0; CTRL],
             room_dl: [0.0; ROOM_DELAY],
@@ -231,9 +239,17 @@ impl Engine {
             n_speech: 0,
             trace: None,
             amp_ms: 1.0,
+            live: false,
+            pause_s: 0.0,
         };
         e.set_config(cfg);
         e
+    }
+
+    /// 主播模式（麦克风直通）：停顿超过 1 秒后动作恢复正常速度，话少时声音也一直在动。
+    /// 文件转换和试听不开：动作严格跟着说话走，与 Python 版一致。
+    pub fn set_live(&mut self, on: bool) {
+        self.live = on;
     }
 
     /// 换一份配置（在控制块边界生效）。
@@ -287,7 +303,17 @@ impl Engine {
             if f.act > 0.5 {
                 self.amp_ms += super::filters::ema_coef(8.0, CTRL_DT) * (a * a - self.amp_ms);
             }
-            (clock_step(f.act, p.pause_motion), a / self.amp_ms.max(0.25).sqrt())
+            let step = if self.live {
+                if f.act > 0.5 {
+                    self.pause_s = 0.0;
+                } else {
+                    self.pause_s += CTRL_DT;
+                }
+                clock_step_live(f.act, p.pause_motion, self.pause_s)
+            } else {
+                clock_step(f.act, p.pause_motion)
+            };
+            (step, a / self.amp_ms.max(0.25).sqrt())
         } else {
             (CTRL_DT as f64, 1.0)
         };
@@ -299,23 +325,24 @@ impl Engine {
         self.pose = pose;
         if let Some(tr) = &mut self.trace {
             let t = (self.n_blocks.saturating_sub((self.la_buf.len() / CTRL) as u64)) as f32 * CTRL_DT;
-            tr.push([t, pose.az, pose.r, pose.r_base, f.act]);
+            tr.push([t, pose.az, pose.r, pose.r_base, f.act, pose.el]);
         }
         let az_sofa = (360.0 - pose.az).rem_euclid(360.0); // 顺时针 -> SOFA 逆时针
-        self.tab.lookup(az_sofa, pose.r, &mut self.hr);
+        self.tab.lookup3(az_sofa, pose.el, pose.r, &mut self.hr, &mut self.hr_tmp);
 
         // 响度：沿不含忽远忽近的轨迹补偿；退开时说话人自己会说大声一点（只保留一部分物理衰减）
-        let p_base = self.tab.lookup_power(az_sofa, pose.r_base).max(1e-20);
+        let az_base_sofa = (360.0 - pose.az_base).rem_euclid(360.0);
+        let p_base = self.tab.lookup_power3(az_base_sofa, pose.el_base, pose.r_base).max(1e-20);
         let mut g = if p.level_follow != 1.0 { (p_base / cfg.derived.pref).powf(-(1.0 - p.level_follow) / 2.0) } else { 1.0 };
         let mut talker = 1.0;
         if (pose.r - pose.r_base).abs() > 1e-6 && p.sway_level < 1.0 {
-            let p_now = self.tab.lookup_power(az_sofa, pose.r).max(1e-20);
+            let p_now = self.tab.lookup_power3(az_sofa, pose.el, pose.r).max(1e-20);
             talker = (p_now / p_base).powf(-(1.0 - p.sway_level) / 2.0);
             g *= talker;
         }
         // 人头麦贴耳感：远耳额外压低，近耳加临场 / 空气感
         let rc = pose.r.clamp(R_MIN, R_MAX);
-        let cl = closeness(pose.az, rc);
+        let cl = closeness(pose.az, pose.el, rc);
         let ipsi = if pose.az.rem_euclid(360.0) < 180.0 { 1 } else { 0 };
         for e in 0..2 {
             let mut ge = g;
@@ -369,10 +396,11 @@ impl Engine {
             }
             self.primed = true;
         }
-        self.room.set_target(pose.az, talker);
+        self.room.set_target(pose.az, pose.el, talker);
 
         self.tele = Telemetry {
             az: pose.az,
+            el: pose.el,
             r: pose.r,
             closeness: cl,
             act: f.act,
@@ -382,6 +410,8 @@ impl Engine {
             level_gain_db: self.leveler.gain_db,
             n_moves: self.motion.n_moves,
             n_sways: self.motion.n_sways,
+            n_tops: self.motion.n_tops,
+            n_updowns: self.motion.n_updowns,
         };
         self.in_pk *= 0.97;
         self.out_pk *= 0.97;
@@ -412,13 +442,14 @@ impl Engine {
         let m = input.len();
         let ph = self.phase;
         let la = self.la_buf.len();
+        let dn_mix = p.denoise_mix();
         for i in 0..m {
             let x = input[i];
             self.in_pk = self.in_pk.max(x.abs());
             let mut v = self.in_hp.process(x);
             v = self.gate.process(v, p.gate_db);
             if p.denoise {
-                v = self.denoiser.process(v, p.denoise_mix);
+                v = self.denoiser.process(v, dn_mix);
             }
             if p.deess_db > 0.0 {
                 v = self.deess.process(v, p.deess_db);

@@ -93,7 +93,7 @@ pub struct Shared {
     cfg_ver: AtomicU64,
     /// true = 监听原声（不经过效果），false = 输出效果。
     pub monitor_dry: AtomicBool,
-    tele: [AtomicU32; 10],
+    tele: [AtomicU32; 13],
     /// 环形缓冲里平均积压的时间（微秒）。
     pub fill_us: AtomicU32,
     /// 最近每次输出回调的处理时间（微秒，平滑 / 最大）。
@@ -135,7 +135,7 @@ impl Shared {
     }
 
     fn store_tele(&self, t: &Telemetry) {
-        let v = [t.az, t.r, t.closeness, t.act, t.in_db, t.out_db, t.gr_db, t.level_gain_db, t.n_moves as f32, t.n_sways as f32];
+        let v = [t.az, t.r, t.closeness, t.act, t.in_db, t.out_db, t.gr_db, t.level_gain_db, t.n_moves as f32, t.n_sways as f32, t.el, t.n_tops as f32, t.n_updowns as f32];
         for (a, x) in self.tele.iter().zip(v) {
             a.store(x.to_bits(), Ordering::Relaxed);
         }
@@ -143,7 +143,21 @@ impl Shared {
 
     pub fn telemetry(&self) -> Telemetry {
         let g = |i: usize| f32::from_bits(self.tele[i].load(Ordering::Relaxed));
-        Telemetry { az: g(0), r: g(1), closeness: g(2), act: g(3), in_db: g(4), out_db: g(5), gr_db: g(6), level_gain_db: g(7), n_moves: g(8) as u32, n_sways: g(9) as u32 }
+        Telemetry {
+            az: g(0),
+            r: g(1),
+            closeness: g(2),
+            act: g(3),
+            in_db: g(4),
+            out_db: g(5),
+            gr_db: g(6),
+            level_gain_db: g(7),
+            n_moves: g(8) as u32,
+            n_sways: g(9) as u32,
+            el: g(10),
+            n_tops: g(11) as u32,
+            n_updowns: g(12) as u32,
+        }
     }
 
     /// 设备出错（拔掉、被占用等）时的说明；读一次即清空。
@@ -478,7 +492,8 @@ impl Realtime {
         let out_dev = find(&opts.output, false)?;
         let (out_cfg, out_fmt) = pick_config(&out_dev, false, opts.buffer_frames)?;
         let shared = Arc::new(Shared::new(cfg.clone()));
-        let eng = Engine::new(cfg, PostMode::Realtime, 0.0);
+        let mut eng = Engine::new(cfg, PostMode::Realtime, 0.0);
+        eng.set_live(preview.is_none());
         let out_rate = out_cfg.sample_rate as f64;
         let mut info = RtInfo { output_name: name(&out_dev), out_rate: out_cfg.sample_rate, out_channels: out_cfg.channels, ..Default::default() };
 

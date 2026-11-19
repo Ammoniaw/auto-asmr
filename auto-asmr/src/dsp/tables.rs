@@ -1,7 +1,7 @@
-//! 内嵌的 KU100 数据：近场 HRIR 查找表、时延、双耳功率、扩散场均衡、实测真实房间、耳机补偿滤波器。
+//! 内嵌的 KU100 数据：近场 HRIR 查找表、时延、双耳功率、扩散场均衡、实测真实房间、耳机补偿滤波器、高度修正。
 //! 由 `tools/export_assets.py` 从 Python 版的预处理结果导出（TH Köln，CC BY 4.0）。
 
-use super::{NTAP, R_MIN};
+use super::{HEAD_A, NTAP, R_MIN};
 use std::sync::OnceLock;
 
 static DATA: &[u8] = include_bytes!("../../assets/ku100.bin");
@@ -25,6 +25,28 @@ pub struct Tables {
     pub room: Vec<f32>,
     /// 耳机补偿滤波器（型号, 最小相位 FIR）。
     pub headphones: Vec<(String, Vec<f32>)>,
+    /// 高度修正：`[2 耳][el_na 个侧向角][el_nb 个极角][el_tap]` 的最小相位 FIR。
+    /// 侧向角 = 从这只耳朵看声源偏向自己这一侧多少度（−90…90）；极角 = 绕两耳连线转多少度（0 前、90 上、180 后、270 下）。
+    pub elev: Vec<f32>,
+    pub el_na: usize,
+    pub el_nb: usize,
+    pub el_tap: usize,
+    pub el_da: f32,
+    pub el_db: f32,
+}
+
+/// 高度修正滤波器最多这么长。
+pub const ELEV_MAX_TAPS: usize = 64;
+
+/// （SOFA 方位角, 仰角）换成绕两耳连线的坐标：方向余弦 (前, 左, 上)、侧向角（度，朝左为正）、
+/// 极角（度）、水平面"前"那一点的权重。
+#[inline]
+pub fn cone_coords(az_sofa: f32, el: f32) -> ([f32; 3], f32, f32, f32) {
+    let (a, e) = (az_sofa.to_radians(), el.to_radians());
+    let d = [e.cos() * a.cos(), e.cos() * a.sin(), e.sin()];
+    let alpha = d[1].clamp(-1.0, 1.0).asin().to_degrees();
+    let beta = d[2].atan2(d[0]).to_degrees().rem_euclid(360.0);
+    (d, alpha, beta, 0.5 * (1.0 + beta.to_radians().cos()))
 }
 
 /// 插值得到的一对 HRIR 和两耳时延。
@@ -78,7 +100,7 @@ pub fn tables() -> &'static Tables {
 impl Tables {
     fn load() -> Tables {
         let mut c = Cur { d: DATA, p: 0 };
-        assert_eq!(c.bytes(8), b"ASMRKU02", "assets/ku100.bin 格式不对");
+        assert_eq!(c.bytes(8), b"ASMRKU03", "assets/ku100.bin 格式不对（用 tools/export_assets.py 重新导出）");
         let fs = c.u32();
         assert_eq!(fs, 48_000);
         let (n_r, n_az, n_tap) = (c.u32(), c.u32(), c.u32());
@@ -100,7 +122,12 @@ impl Tables {
             let name = String::from_utf8_lossy(c.bytes(nl)).into_owned();
             headphones.push((name, c.f32s(hp_len)));
         }
-        Tables { n_r, n_az, inv_grid, h, tau, power, cdfc, n_sec, room_len, room, headphones }
+        let (el_na, el_nb, el_tap) = (c.u32(), c.u32(), c.u32());
+        assert!(el_tap <= ELEV_MAX_TAPS && el_tap < NTAP);
+        let dd = c.f32s(2);
+        let es = c.f32s(2 * el_na * el_nb);
+        let elev = c.q16(&es, el_tap);
+        Tables { n_r, n_az, inv_grid, h, tau, power, cdfc, n_sec, room_len, room, headphones, elev, el_na, el_nb, el_tap, el_da: dd[0], el_db: dd[1] }
     }
 
     /// 距离 -> (网格下标 i0, 小数部分)，在 1/r 上分段线性（与 Python 版 `lookup` 相同）。
@@ -153,6 +180,82 @@ impl Tables {
         let p = |i: usize, j: usize| self.power[i * self.n_az + j];
         let v = (1.0 - fu) * ((1.0 - fa) * p(i0, a0) + fa * p(i0, a1)) + fu * ((1.0 - fa) * p(i0 + 1, a0) + fa * p(i0 + 1, a1));
         v * far * far
+    }
+
+    /// 一只耳朵的高度修正滤波器：在（从耳朵看的侧向角, 极角）网格上双线性插值，写进 `out[..el_tap]`。
+    fn elev_taps(&self, ear: usize, lat: f32, beta: f32, out: &mut [f32; ELEV_MAX_TAPS]) {
+        let x = (lat.clamp(-90.0, 90.0) + 90.0) / self.el_da;
+        let i0 = (x.floor() as usize).min(self.el_na - 2);
+        let fa = x - i0 as f32;
+        let y = beta.rem_euclid(360.0) / self.el_db;
+        let j0 = (y.floor() as usize) % self.el_nb;
+        let j1 = (j0 + 1) % self.el_nb;
+        let fb = y - y.floor();
+        let n = self.el_tap;
+        let at = |i: usize, j: usize| {
+            let b = ((ear * self.el_na + i) * self.el_nb + j) * n;
+            &self.elev[b..b + n]
+        };
+        let (c00, c01, c10, c11) = (at(i0, j0), at(i0, j1), at(i0 + 1, j0), at(i0 + 1, j1));
+        let (w00, w01, w10, w11) = ((1.0 - fa) * (1.0 - fb), (1.0 - fa) * fb, fa * (1.0 - fb), fa * fb);
+        for k in 0..n {
+            out[k] = w00 * c00[k] + w01 * c01[k] + w10 * c10[k] + w11 * c11[k];
+        }
+    }
+
+    /// 带高度的查表（`el`：仰角，度）。仰角为 0 时就是 [`lookup`]，结果逐位相同。
+    ///
+    /// 离开水平面时：两耳时间差、声级差和近场效应主要由"偏向哪只耳朵多少"（侧向角）决定，所以先取
+    /// 同一侧向角上水平面前 / 后两点的混合；再给每只耳朵卷上高度修正——耳廓对来声方向的染色随极角的变化，
+    /// 取自 KU100 1.5 m 的全球面实测，方向按"从这只耳朵看过去"算（近处的声源有声学视差）。
+    /// `tmp` 是调用方提供的临时空间。
+    pub fn lookup3(&self, az_sofa: f32, el: f32, r: f32, out: &mut Hrir, tmp: &mut Hrir) {
+        if el.abs() <= 1e-4 {
+            self.lookup(az_sofa, r, out);
+            return;
+        }
+        let (d, alpha, beta, wf) = cone_coords(az_sofa, el);
+        self.lookup(alpha.rem_euclid(360.0), r, out);
+        self.lookup((180.0 - alpha).rem_euclid(360.0), r, tmp);
+        let rr = r.max(R_MIN);
+        let mut taps = [0f32; ELEV_MAX_TAPS];
+        let mut he = [0f32; NTAP];
+        let n = self.el_tap;
+        for e in 0..2 {
+            for (a, b) in out.h[e].iter_mut().zip(tmp.h[e].iter()) {
+                *a = wf * *a + (1.0 - wf) * b;
+            }
+            out.tau[e] = wf * out.tau[e] + (1.0 - wf) * tmp.tau[e];
+            // 从这只耳朵看声源的侧向角（朝自己这一侧为正）
+            let ey = if e == 0 { HEAD_A } else { -HEAD_A };
+            let vy = rr * d[1] - ey;
+            let len = ((rr * d[0]).powi(2) + vy * vy + (rr * d[2]).powi(2)).sqrt().max(1e-9);
+            let lat = (if e == 0 { vy } else { -vy } / len).clamp(-1.0, 1.0).asin().to_degrees();
+            self.elev_taps(e, lat, beta, &mut taps);
+            let h = &mut out.h[e];
+            for (i, o) in he.iter_mut().enumerate() {
+                let kmax = i.min(n - 1);
+                let mut s = 0.0;
+                for k in 0..=kmax {
+                    s += taps[k] * h[i - k];
+                }
+                *o = s;
+            }
+            for i in 0..16 {
+                he[NTAP - 16 + i] *= 0.5 * (1.0 + (std::f32::consts::PI * i as f32 / 15.0).cos());
+            }
+            *h = he;
+        }
+    }
+
+    /// 带高度的双耳总功率：同一侧向角上水平面前 / 后两点功率的混合
+    /// （高度修正只动 5 kHz 以上，对语音频段的总功率影响很小）。
+    pub fn lookup_power3(&self, az_sofa: f32, el: f32, r: f32) -> f32 {
+        if el.abs() <= 1e-4 {
+            return self.lookup_power(az_sofa, r);
+        }
+        let (_, alpha, _, wf) = cone_coords(az_sofa, el);
+        wf * self.lookup_power(alpha.rem_euclid(360.0), r) + (1.0 - wf) * self.lookup_power((180.0 - alpha).rem_euclid(360.0), r)
     }
 
     /// 一个扇区、一只耳朵的房间脉冲响应。

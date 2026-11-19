@@ -1,7 +1,12 @@
 //! 所有可调参数。实时模式和文件模式共用；界面上每个滑块对应这里的一个字段。
 
-use super::EAR_R;
+use super::{db_to_lin, EAR_R};
 use serde::{Deserialize, Serialize};
+
+/// 降噪强度取这个值（或更大）表示不设上限，降到最干净。
+pub const DENOISE_MAX_DB: f32 = 60.0;
+/// 界面上可选的固定档位：底噪最多压低多少 dB。
+pub const DENOISE_STEPS: [f32; 5] = [6.0, 12.0, 18.0, 24.0, 30.0];
 
 /// 左右移动的方式。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -96,6 +101,18 @@ pub struct Params {
     /// 自然晃动幅度倍数（1 约 1.2 cm）。
     pub micro: f32,
 
+    // ---- 上下
+    /// 高度：嘴相对耳朵向上（正）/ 向下（负）偏多少度，离耳朵的距离不变；0 = 与耳朵齐平。
+    pub height: f32,
+    /// 自动上下的幅度（度）：嘴在耳朵上方 / 下方之间慢慢换位置；0 = 关闭。
+    pub updown: f32,
+    /// 自动上下：说话时一个来回的大致秒数。
+    pub updown_period: f32,
+    /// 自动上下的随机程度（0 = 节奏和高低固定，1 = 时长和高低都随机）。
+    pub updown_random: f32,
+    /// 换耳时改成"从头顶绕过去"的概率（0 = 只从前 / 后绕，1 = 每次都从头顶绕）。
+    pub over_top: f32,
+
     // ---- 房间与回放
     /// KU100 实测真实房间。
     pub room: bool,
@@ -106,8 +123,8 @@ pub struct Params {
     // ---- 人声处理
     /// 输入降噪（RNNoise）。
     pub denoise: bool,
-    /// 降噪强度（0–1）。
-    pub denoise_mix: f32,
+    /// 降噪强度：底噪最多压低多少 dB（固定档位见 [`DENOISE_STEPS`]）；[`DENOISE_MAX_DB`] 及以上 = 不设上限。
+    pub denoise_db: f32,
     /// 响应阈值：输入低于这个电平（dBFS）时当作静音；-90 = 关闭。
     pub gate_db: f32,
     /// 去齿音最多压低多少 dB（0 = 关闭）。
@@ -158,11 +175,16 @@ impl Default for Params {
             sway_level: 0.45,
             pause_motion: 0.13,
             micro: 1.0,
+            height: 0.0,
+            updown: 25.0,
+            updown_period: 9.0,
+            updown_random: 0.6,
+            over_top: 0.0,
             room: false,
             wet_db: -3.0,
             playback: Playback::Diffuse,
             denoise: false,
-            denoise_mix: 1.0,
+            denoise_db: DENOISE_MAX_DB,
             gate_db: -90.0,
             deess_db: 0.0,
             soft_voice: 0.0,
@@ -194,6 +216,17 @@ impl Params {
         self.room = true;
         self.playback = Playback::Native;
         self
+    }
+
+    /// 降噪强度换成"降噪后的声音占多少"：输出 = 原声 × (1 − m) + 降噪后 × m。
+    /// 降噪器把某个成分压到再低，输出里它也至少还剩原来的 1 − m = 10^(−dB/20)，
+    /// 所以底噪最多被压低 `denoise_db` 分贝；人声（降噪器原样放过的部分）不受影响。
+    pub fn denoise_mix(&self) -> f32 {
+        if self.denoise_db >= DENOISE_MAX_DB {
+            1.0
+        } else {
+            1.0 - db_to_lin(-self.denoise_db.max(0.0))
+        }
     }
 
     /// 各运动模式默认的"响度随位置变化"程度（与 Python 版相同）。

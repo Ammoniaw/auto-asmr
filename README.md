@@ -45,9 +45,41 @@ uv run asmr/asmr_binaural.py 输入.m4a -o 输出.wav --mode wander  # 在你身
 - 最响 1% 的瞬时响度比中位数高 9.9 dB（不晃时 11.3 dB）。
 - 停顿前后的位置差：距离中位变化 1.4 倍（旧版 2.0 倍），方向 90% 在 23° 以内（旧版 90°），不会"跳"到另一侧。
 
-`--sway 0 --sway-follow 0` 关闭忽远忽近；再加 `--pause-motion 1`，结果与旧版默认逐样本相同。
+`--sway 0 --sway-follow 0` 关闭忽远忽近；再加 `--pause-motion 1 --updown 0`，结果与旧版默认逐样本相同。
 
 文献（DOI）：Pelegrín-García 等 2011 JASA [10.1121/1.3552881](https://doi.org/10.1121/1.3552881)；Arend 等 2016 Tonmeistertagung（KU100 近场 HRIR 的感知评测，[Zenodo 4297951](https://zenodo.org/records/4297951)）；Lundbeck 等 2017 Trends Hear [10.1177/2331216517717152](https://doi.org/10.1177/2331216517717152)；Neuhoff 2016 CRPI [10.1186/s41235-016-0017-4](https://doi.org/10.1186/s41235-016-0017-4)；Ghazanfar 等 2002 PNAS [10.1073/pnas.242469699](https://doi.org/10.1073/pnas.242469699)；Serino 等 2015 Sci Rep [10.1038/srep18603](https://doi.org/10.1038/srep18603)；Noel 等 2018 J Neurophysiol [10.1152/jn.00652.2017](https://doi.org/10.1152/jn.00652.2017)；Kolarik 等 2016 APP [10.3758/s13414-015-1015-1](https://doi.org/10.3758/s13414-015-1015-1)；Zahorik 2002 JASA [10.1121/1.1506692](https://doi.org/10.1121/1.1506692)；Brungart & Rabinowitz 1999 JASA [10.1121/1.427180](https://doi.org/10.1121/1.427180)；Kan 等 2009 JASA [10.1121/1.3081395](https://doi.org/10.1121/1.3081395)；Honda 等 2020 Front Psychol [10.3389/fpsyg.2020.00316](https://doi.org/10.3389/fpsyg.2020.00316)；Koumura 等 2021 QJEP [10.1177/1747021820977174](https://doi.org/10.1177/1747021820977174)；Shimokura 2022 Audiol Res [10.3390/audiolres12050056](https://doi.org/10.3390/audiolres12050056)。
+
+### 上下（默认开启自动上下）
+
+原来声源只在耳朵高度的水平面里移动，现在可以离开水平面。
+
+| 做法 | 说明 | 参数 |
+|---|---|---|
+| 高度 | 嘴相对耳朵向上（正）/ 向下（负）偏多少度。以"耳朵"为支点转，嘴到耳朵的距离不变，所以音量不变，变的只是方向——贴耳时就是嘴绕着耳朵上下挪。声源在正前 / 正后方时支点是头中心，就是普通的仰角 | `--height 0` |
+| 自动上下 | 嘴在耳朵上方 / 下方之间慢慢换位置：停一会儿 → 慢慢移过去 → 停一会儿 → 再移回来。停多久、每次到多高带随机，偶尔连续两次停在同一侧；按说话时钟走，停顿里不动 | `--updown 25`（度，0 = 关闭）`--updown-period 9` `--updown-random 0.6` |
+| 从头顶绕 | 换耳时一定概率不从脸前 / 脑后绕，而是从这只耳朵升到头顶、再落到另一只耳朵 | `--over-top 0`（概率 0–1） |
+
+怎么算的：
+
+- 水平面的查找表不变。离开水平面时，两耳时间差、声级差和近场效应由"偏向哪只耳朵多少"（侧向角）决定（Morimoto 2001），所以取同一侧向角上水平面前 / 后两点的混合。
+- 再给每只耳朵乘上"高度修正"：耳廓对来声方向的染色（Hebrank & Wright 1974：上下靠 4–16 kHz 的谱形）。修正取自同一个 KU100 在 1.5 m 的全球面实测（2702 个方向），做成 2 耳 × 37 个侧向角 × 36 个极角的 48 点滤波器。方向按"从这只耳朵看过去"算：近处的声源，耳朵看到的方向和头中心看到的不一样（声学视差，Brungart & Rabinowitz 1999），与水平面 0.25 m 以内的做法一致。
+- 检验：用 1.5 m 得到的修正去预测 0.5 m 的全球面实测（没有参与建表），近耳的谱误差在 6–9 kHz 从 7.0 dB 降到 1.8 dB，9–13 kHz 从 5.2 dB 降到 1.5 dB。比 0.5 m 更近没有带高度的实测，贴耳位置的高度是模型外推。
+- 两耳时间差不另外修正：同一侧向角上，实测时差随高度的偏移中位只有 11–14 µs。
+
+实测效果（贴左耳，近耳各频段相对"与耳朵齐平"的变化）：
+
+| 高度 | 6.3 kHz | 8 kHz | 10 kHz | 12.5 kHz | 4 kHz 以下 | 总音量 |
+|---|---|---|---|---|---|---|
+| 向上 40° | +1 dB | +7 dB | −6 dB | −12 dB | 3 dB 以内 | −0.3 dB |
+| 向下 40° | −8 dB | +4 dB | −3 dB | −9 dB | 1 dB 以内 | +0.2 dB |
+
+也就是耳廓造成的"缺口"随高度上移 / 下移，嗓音的主体不变。
+
+上下是三个方向里最弱的：只靠 5 kHz 以上的高频，而且 KU100 的耳廓不是听的人自己的耳廓——非个人化 HRTF 下，上下和前后的判断误差明显增大（Wenzel 等 1993）。气声、轻语的高频多，上下会比低沉的嗓音清楚。
+
+`--height 0 --updown 0 --over-top 0` 时结果与加入上下功能之前逐样本相同。
+
+文献（DOI）：Hebrank & Wright 1974 JASA [10.1121/1.1903520](https://doi.org/10.1121/1.1903520)；Wenzel 等 1993 JASA [10.1121/1.407089](https://doi.org/10.1121/1.407089)；Morimoto 2001 JASA [10.1121/1.1352084](https://doi.org/10.1121/1.1352084)；Brungart & Rabinowitz 1999 JASA [10.1121/1.427180](https://doi.org/10.1121/1.427180)。
 
 ### KU100 实录风格 `--style ku100`
 
@@ -111,7 +143,7 @@ uv run asmr/asmr_binaural.py 输入.m4a -o 输出.wav --mode wander  # 在你身
 
 | 模式 | 效果 | 相关参数 |
 |---|---|---|
-| `sweep`（默认） | 贴左耳停一会儿 → 经脸前慢慢移到右耳 → 停 → 移回，持续不断（按说话时间走，停顿里不动）；偶尔先退远再凑近 | `--move-time`（2.5 s）`--hold-time`（2.5 s）`--ear-angle`（100°）`--approach`（0.25）`--via front/back/alternate` `--pass-dist`（0.2 m）`--dist` |
+| `sweep`（默认） | 贴左耳停一会儿 → 经脸前慢慢移到右耳 → 停 → 移回，持续不断（按说话时间走，停顿里不动）；偶尔先退远再凑近 | `--move-time`（2.5 s）`--hold-time`（2.5 s）`--ear-angle`（100°）`--approach`（0.25）`--via front/back/alternate` `--over-top`（从头顶绕的概率，0）`--pass-dist`（0.2 m）`--dist` |
 | `phrase` | 只在说话停顿处换位置（移动藏在停顿里，听起来像跳过去）：左耳 ↔ 右耳为主，偶尔到侧前方、侧后方、正前方 | `--min-gap` `--min-hold` `--max-hold` `--seed` |
 | `pingpong` | 参考视频的节奏：3 秒一个来回，每只耳朵停约 1 秒，约 0.5 秒穿过中间 | `--period`（默认 3）`--via` `--dist` |
 | `orbit` | 绕头转圈 | `--radius`（默认 0.35 m）`--period`（默认 12 s）`--ccw` `--az`（起点） |
@@ -144,15 +176,15 @@ uv run asmr/asmr_binaural.py 输入.m4a -o 输出.wav --mode wander  # 在你身
 - `--level-follow`：响度随位置变化的程度。1 = 物理真实（嘴贴耳朵时比在脸前响约 17 dB，移动起来像"这边消失、那边冒出来"），0 = 处处一样响。默认 sweep 用 0.2，pingpong 用 0.1，orbit 用 0.3，phrase 用 0.5，其他模式用 1。
 - `--lufs -16`，`--peak -1`，`--max-gr 8`：响度目标、真峰值上限、限制器最多压多少 dB。
 - `--start` / `--duration`：只处理一段，方便试听。
-- `--save-trajectory 轨迹.csv`：导出实际走位，格式为 时间, 方位角, 距离。
+- `--save-trajectory 轨迹.csv`：导出实际走位，格式为 时间, 方位角, 距离, 仰角。
 
 ## 建议
 
 - 输入越干净越好。程序不会添加底噪，但输入自带的底噪会跟着人声一起移动，可以先用 DeepFilterNet 降噪（`~/ai/qwenasr/DeepFilterNet3/deep-filter`）。
 - 必须用耳机听。外放听不出效果。
 - HRTF 不是按个人测量的，少数人可能出现前后混淆；运动和房间声能明显减轻这个问题。
-- 声源只在耳朵高度的水平面上移动（近场实测数据只有水平面）；房间反射包含上下方向。
+- 上下方向比左右和远近弱，因人而异；不想要可以用 `--updown 0` 关掉。近场实测数据只有水平面，带高度的位置在 0.5 m 以内是模型外推（见"上下"一节）。
 
 ## 数据与许可
 
-`hrtf/` 中的数据来自 TH Köln 的 Spherical Near-Field HRIR Compilation of the Neumann KU100，作者 J. M. Arend、A. Neidhardt、C. Pörschmann，[Zenodo 4297951](https://zenodo.org/records/4297951)，CC BY 4.0。程序第一次运行时会自动下载这些数据。`ku100_tables_v3.npz` 是预处理缓存，删掉后会自动重建。
+`hrtf/` 中的数据来自 TH Köln 的 Spherical Near-Field HRIR Compilation of the Neumann KU100，作者 J. M. Arend、A. Neidhardt、C. Pörschmann，[Zenodo 4297951](https://zenodo.org/records/4297951)，CC BY 4.0。程序第一次运行时会自动下载这些数据。`ku100_tables_v4.npz` 是预处理缓存，删掉后会自动重建。

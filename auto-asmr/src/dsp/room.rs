@@ -232,8 +232,17 @@ impl Room {
     }
 
     /// 控制块开始时调用：块末尾的声源方位角，和说话人音量增益（忽远忽近时房间声跟着说话人的音量走）。
-    pub fn set_target(&mut self, az: f32, talker_gain: f32) {
-        let w = sector_weights(az);
+    /// `el`：仰角。房间只在水平面上测过 12 个方向；声源升到 45° 以上时逐渐换成各方向的平均，
+    /// 到 80° 完全平均（这样从头顶绕过去、方位角翻到另一侧时房间声不会突变）。45° 以下不变，
+    /// 仍然只算 1–2 个方向。
+    pub fn set_target(&mut self, az: f32, el: f32, talker_gain: f32) {
+        let mut w = sector_weights(az);
+        let up = super::smoothstep((el.abs() - 45.0) / 35.0);
+        if up > 0.0 {
+            for v in w.iter_mut() {
+                *v = *v * (1.0 - up) + up / NSEC as f32;
+            }
+        }
         if self.primed {
             self.w_old = self.w_new;
             self.g_old = self.g_new;
@@ -352,7 +361,7 @@ mod tests {
         let mut phase = 0;
         while i < n {
             if phase == 0 {
-                room.set_target(az, 1.0);
+                room.set_target(az, 0.0, 1.0);
             }
             let m = (CTRL - phase).min(n - i).min(37); // 故意用不整齐的小段
             room.process(&x[i..i + m], phase, 1.0, &mut ol[i..i + m], &mut or[i..i + m]);

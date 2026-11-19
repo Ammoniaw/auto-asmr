@@ -138,10 +138,15 @@ impl Analyzer {
         let e_db = 10.0 * (self.e_s + 1e-12).log10();
         let thr = match self.fixed {
             Some((t, _)) => t,
+            None if !self.started && (self.blk as usize) + 1 < self.eb.len() => {
+                // 50 ms 的能量窗还没填满，读数偏低：先不判断。否则底噪会被估得太低，
+                // 麦克风的底噪在开头十来秒里都被当成"在说话"
+                f32::INFINITY
+            }
             None => {
                 if !self.started {
                     // 还没听到人声时，先假定说话峰值在 −30 dBFS 左右：比它低 30 dB 以上的轻微声音不算说话
-                    self.nf_db = e_db.min(-50.0);
+                    self.nf_db = e_db.min(-40.0);
                     self.sp_db = (e_db + 10.0).max(-30.0);
                     self.started = true;
                 }

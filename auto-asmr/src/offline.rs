@@ -65,6 +65,9 @@ pub struct ConvertReport {
     pub channel_note: String,
     pub n_moves: u32,
     pub n_sways: u32,
+    /// 从头顶绕的次数、上下换位的次数。
+    pub n_tops: u32,
+    pub n_updowns: u32,
     pub speech_pct: f32,
     pub elapsed_s: f64,
 }
@@ -273,9 +276,9 @@ pub fn convert(opts: &ConvertOptions, params: &Params, cancel: Arc<AtomicBool>, 
     drop(w);
     if let (Some(path), Some(tr)) = (&opts.save_trajectory, &eng.trace) {
         let mut f = BufWriter::new(File::create(path).map_err(|e| format!("无法写入轨迹文件：{e}"))?);
-        writeln!(f, "t_sec,az_deg,dist_m,base_dist_m,speech").map_err(|e| e.to_string())?;
+        writeln!(f, "t_sec,az_deg,dist_m,base_dist_m,speech,el_deg").map_err(|e| e.to_string())?;
         for row in tr.iter().step_by(8) {
-            writeln!(f, "{:.4},{:.2},{:.5},{:.5},{:.3}", row[0], row[1], row[2], row[3], row[4]).map_err(|e| e.to_string())?;
+            writeln!(f, "{:.4},{:.2},{:.5},{:.5},{:.3},{:.2}", row[0], row[1], row[2], row[3], row[4], row[5]).map_err(|e| e.to_string())?;
         }
     }
 
@@ -354,6 +357,8 @@ pub fn convert(opts: &ConvertOptions, params: &Params, cancel: Arc<AtomicBool>, 
         channel_note: note,
         n_moves: eng.tele.n_moves,
         n_sways: eng.tele.n_sways,
+        n_tops: eng.tele.n_tops,
+        n_updowns: eng.tele.n_updowns,
         speech_pct: 100.0 * eng.n_speech as f32 / eng.n_blocks.max(1) as f32,
         elapsed_s: t_start.elapsed().as_secs_f64(),
     })
