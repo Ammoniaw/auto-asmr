@@ -4,7 +4,7 @@ use crate::dsp::engine::{EngineConfig, Telemetry};
 use crate::dsp::params::{MotionMode, Params, Playback, Via, DENOISE_MAX_DB};
 use crate::dsp::tables::tables;
 use crate::dsp::motion::lift_tilt;
-use crate::dsp::{FS, HEAD_A, R_MIN};
+use crate::dsp::{FS, HEAD_A, R_MIN, R_MAX};
 use crate::offline::{convert, default_output, load_mono, Channel, ConvertOptions, ConvertReport};
 use crate::realtime::{self, DeviceInfo, DeviceList, Realtime, RtOptions};
 use eframe::egui;
@@ -58,14 +58,17 @@ fn up_angle(az: f32, el: f32, r: f32) -> (f32, f32, f32) {
     (up, px.atan2(py).to_degrees().rem_euclid(360.0), px.hypot(py))
 }
 
-/// 参数表的一行：文字（悬停显示说明）+ 滑块。
-fn row(ui: &mut egui::Ui, label: &str, tip: &str, w: egui::Slider<'_>) {
+/// 参数表的一行：滑轨用常用范围，手输或拖动数值可以超出该范围。
+fn row(ui: &mut egui::Ui, label: &str, tip: &str, w: egui::Slider<'_>) -> bool {
     let l = ui.label(label);
     if !tip.is_empty() {
         l.on_hover_text(tip);
     }
-    ui.add(w);
+    let changed = ui.add(w.clamping(egui::SliderClamping::Never))
+        .on_hover_text(t("点击数字可手动输入，按 Enter 确认；允许超出滑块范围", "Click the number to type a value, then press Enter; values may exceed the slider range"))
+        .changed();
     ui.end_row();
+    changed
 }
 
 /// 界面文字：中文 / 英文二选一。
@@ -687,7 +690,7 @@ impl App {
                 ui.add(egui::DragValue::new(&mut self.dur_s).range(0.0..=36000.0).speed(1.0)).on_hover_text(t("0 = 到结尾。先试 60 秒听听效果很方便", "0 = to the end. Try 60 s first to audition"));
                 ui.end_row();
                 ui.label(t("目标响度", "Loudness"));
-                ui.add(egui::Slider::new(&mut self.s.file_lufs, -24.0..=-10.0).suffix(" LUFS").fixed_decimals(0));
+                ui.add(egui::Slider::new(&mut self.s.file_lufs, -24.0..=-10.0).clamping(egui::SliderClamping::Never).suffix(" LUFS").fixed_decimals(0));
                 ui.end_row();
             });
         });
@@ -804,8 +807,9 @@ impl App {
         egui::CollapsingHeader::new(RichText::new(t("贴耳感", "Closeness")).strong()).default_open(true).show(ui, |ui| {
             egui::Grid::new("g1").num_columns(2).min_col_width(COL).spacing([10.0, 6.0]).show(ui, |ui| {
                 let mut cm = (p.ear_dist - HEAD_A) * 100.0;
-                row(ui, t("贴耳距离", "Distance from ear"), t("嘴离耳朵多远。1.7 cm = 贴着耳朵", "How far the mouth is from the ear. 1.7 cm = touching"), egui::Slider::new(&mut cm, 0.8..=25.0).logarithmic(true).suffix(" cm").fixed_decimals(1));
-                p.ear_dist = HEAD_A + cm / 100.0;
+                if row(ui, t("贴耳距离", "Distance from ear"), t("嘴离耳朵多远。1.7 cm = 贴着耳朵", "How far the mouth is from the ear. 1.7 cm = touching"), egui::Slider::new(&mut cm, 0.8..=25.0).logarithmic(true).suffix(" cm").fixed_decimals(1)) {
+                    p.ear_dist = (HEAD_A + cm / 100.0).clamp(R_MIN, R_MAX);
+                }
                 row(ui, t("远耳压低", "Far-ear cut"), t("贴耳时另一只耳朵额外压低多少（0 = 纯物理，像真实 KU100）", "Extra attenuation of the far ear when close (0 = pure physics)"), egui::Slider::new(&mut p.isolation_db, 0.0..=40.0).suffix(" dB").fixed_decimals(0));
                 row(ui, t("临场感", "Presence"), t("贴耳时近耳 3.5 kHz 和空气感", "Near-ear 3.5 kHz presence and air"), egui::Slider::new(&mut p.presence_db, 0.0..=8.0).suffix(" dB").fixed_decimals(1));
                 row(ui, t("暗度", "Darkness"), t("贴耳时近耳 5 kHz 附近压低，音色更暗、更柔", "Dip around 5 kHz at the near ear: darker, softer"), egui::Slider::new(&mut p.dark_db, 0.0..=8.0).suffix(" dB").fixed_decimals(1));
@@ -813,7 +817,7 @@ impl App {
                 row(ui, t("近耳低频", "Near-ear bass"), t("贴耳时只给近耳加的低频", "Bass added only to the near ear"), egui::Slider::new(&mut p.ear_warmth_db, 0.0..=10.0).suffix(" dB").fixed_decimals(1));
                 row(ui, t("远耳低频削减", "Far-ear bass cut"), t("贴耳时远耳 320 Hz 以下再压低", "Extra cut below 320 Hz at the far ear"), egui::Slider::new(&mut p.far_lf_cut_db, 0.0..=18.0).suffix(" dB").fixed_decimals(0));
                 row(ui, t("气声增强", "Breath lift"), t("贴耳时把嗓音里轻的送气声 / 气息提上来（最多这么多），响的齿音不提；只用嗓音自己的气声，不加噪声。0 = 关闭", "Lifts the soft breathy part of the voice when close (by at most this much); loud sibilants are left alone. No noise is added. 0 = off"), egui::Slider::new(&mut p.breath_db, 0.0..=12.0).suffix(" dB").fixed_decimals(1));
-                row(ui, t("气流扑耳", "Breath puff"), t("送气时气流扑到耳朵上的低频脉冲（耳朵痒的感觉），由嗓音自己的送气声导出。0 = 关闭，1 = 标准", "Low-frequency pulses of breath hitting the ear, derived from the voice's own aspiration. 0 = off, 1 = standard"), egui::Slider::new(&mut p.puff, 0.0..=3.0).fixed_decimals(2));
+                row(ui, t("气流扑耳", "Breath puff"), t("送气时气流扑到耳朵上的低频脉冲（耳朵痒的感觉），由嗓音自己的送气声导出。0 = 关闭，1 倍 = 标准；滑块到 8 倍，手输可更高", "Low-frequency pulses of breath hitting the ear, derived from the voice's own aspiration. 0 = off, 1x = standard; slider up to 8x, type for higher values"), egui::Slider::new(&mut p.puff, 0.0..=8.0).suffix(t(" 倍", "x")).fixed_decimals(2));
                 row(ui, t("耳甲共鸣", "Concha resonance"), t("贴耳时近耳 4.3 kHz 的耳甲腔共振（KU100 贴耳实录的共有特征）。0 = 关闭", "4.3 kHz concha resonance at the near ear when close. 0 = off"), egui::Slider::new(&mut p.concha_db, 0.0..=8.0).suffix(" dB").fixed_decimals(1));
             });
             ui.checkbox(&mut p.ku100_eq, t("近耳用 KU100 实测校正曲线（高频更收）", "KU100-calibrated near-ear EQ (softer highs)"));
@@ -833,11 +837,10 @@ impl App {
                     MotionMode::Sweep | MotionMode::Random => {
                         let mut freq = 60.0 / (p.hold_s + p.move_s).max(0.2);
                         let f0 = freq;
-                        row(ui, t("移动频率", "Moves per minute"), t("说话时每分钟换几次耳朵（同时缩放停留和移动时间）", "Ear switches per minute of speech (scales hold and move time)"), egui::Slider::new(&mut freq, 2.0..=40.0).suffix(t(" 次/分", " /min")).fixed_decimals(0));
-                        if (freq - f0).abs() > 1e-3 {
+                        if row(ui, t("移动频率", "Moves per minute"), t("说话时每分钟换几次耳朵（同时缩放停留和移动时间）", "Ear switches per minute of speech (scales hold and move time)"), egui::Slider::new(&mut freq, 2.0..=40.0).suffix(t(" 次/分", " /min")).fixed_decimals(0)) && freq > 0.0 && freq.is_finite() {
                             let k = f0 / freq;
-                            p.hold_s = (p.hold_s * k).clamp(0.2, 30.0);
-                            p.move_s = (p.move_s * k).clamp(0.2, 30.0);
+                            p.hold_s = (p.hold_s * k).max(0.001);
+                            p.move_s = (p.move_s * k).max(0.001);
                         }
                         row(ui, t("停留时间", "Hold time"), t("每只耳朵边停留多久", "How long it stays at each ear"), egui::Slider::new(&mut p.hold_s, 0.3..=12.0).suffix(" s").fixed_decimals(1));
                         row(ui, t("移动时间", "Move time"), t("从一只耳朵移到另一只耳朵用多久", "How long a crossing takes"), egui::Slider::new(&mut p.move_s, 0.3..=12.0).suffix(" s").fixed_decimals(1));
@@ -858,8 +861,9 @@ impl App {
                     MotionMode::Manual => {
                         row(ui, t("方位角", "Azimuth"), t("0 前，90 右，180 后，270 左。也可以直接在左边的位置图上拖", "0 front, 90 right, 180 back, 270 left. Or drag on the map at the left"), egui::Slider::new(&mut p.manual_az, 0.0..=359.9).suffix("°").fixed_decimals(0));
                         let mut cm = (p.manual_dist - HEAD_A) * 100.0;
-                        row(ui, t("离头距离", "Distance from head"), t("声源离头表面多远；在耳朵正侧方时就是离耳朵多远", "Distance from the head surface; at the side this is the distance from the ear"), egui::Slider::new(&mut cm, 0.8..=71.0).logarithmic(true).suffix(" cm").fixed_decimals(1));
-                        p.manual_dist = (HEAD_A + cm / 100.0).clamp(R_MIN, RADAR_MAX_R);
+                        if row(ui, t("离头距离", "Distance from head"), t("声源离头表面多远；在耳朵正侧方时就是离耳朵多远", "Distance from the head surface; at the side this is the distance from the ear"), egui::Slider::new(&mut cm, 0.8..=71.0).logarithmic(true).suffix(" cm").fixed_decimals(1)) {
+                            p.manual_dist = (HEAD_A + cm / 100.0).clamp(R_MIN, R_MAX);
+                        }
                         row(ui, t("高度", "Height"), t("以耳朵为支点向上（正）/ 向下（负）偏多少度。也可以拖位置图右侧的竖条", "Above (+) / below (−) the ear, in degrees. Or drag the bar at the right of the map"), egui::Slider::new(&mut p.manual_tilt, -80.0..=85.0).suffix("°").fixed_decimals(0));
                     }
                 }
@@ -912,7 +916,7 @@ impl App {
             ui.checkbox(&mut p.room, t("真实房间（KU100 实测，远耳听到的是房间声而不是寂静）", "Real room (measured with a KU100: the far ear hears the room, not silence)"));
             egui::Grid::new("g4").num_columns(2).min_col_width(COL).spacing([10.0, 6.0]).show(ui, |ui| {
                 ui.add_enabled_ui(p.room, |ui| ui.label(t("房间声大小", "Room level")));
-                ui.add_enabled(p.room, egui::Slider::new(&mut p.wet_db, -12.0..=9.0).suffix(" dB").fixed_decimals(0));
+                ui.add_enabled(p.room, egui::Slider::new(&mut p.wet_db, -12.0..=9.0).clamping(egui::SliderClamping::Never).suffix(" dB").fixed_decimals(0));
                 ui.end_row();
                 ui.label(t("回放补偿", "Playback EQ")).on_hover_text(t("扩散场：通用；KU100 原机：和真实 KU100 录音一样（高频略暗）；或按你的耳机型号补偿", "Diffuse: generic; Native: like a real KU100 recording (slightly darker); or pick your headphone model"));
                 let cur = match &p.playback {
@@ -941,7 +945,7 @@ impl App {
             ui.checkbox(&mut p.auto_level, t("自动响度（实时 / 试听：慢慢把音量拉到目标）", "Auto level (real-time / preview: slowly rides to the target)"));
             egui::Grid::new("g6").num_columns(2).min_col_width(COL).spacing([10.0, 6.0]).show(ui, |ui| {
                 ui.add_enabled_ui(p.auto_level, |ui| ui.label(t("目标响度", "Target")));
-                ui.add_enabled(p.auto_level, egui::Slider::new(&mut p.target_lufs, -30.0..=-10.0).suffix(" LUFS").fixed_decimals(0));
+                ui.add_enabled(p.auto_level, egui::Slider::new(&mut p.target_lufs, -30.0..=-10.0).clamping(egui::SliderClamping::Never).suffix(" LUFS").fixed_decimals(0));
                 ui.end_row();
                 row(ui, t("输出增益", "Output gain"), "", egui::Slider::new(&mut p.out_gain_db, -60.0..=12.0).suffix(" dB").fixed_decimals(1));
                 row(ui, t("峰值上限", "Ceiling"), t("限制器的真峰值上限", "True-peak ceiling of the limiter"), egui::Slider::new(&mut p.ceiling_db, -6.0..=-0.1).suffix(" dBTP").fixed_decimals(1));
@@ -1220,6 +1224,41 @@ fn save_png(path: &PathBuf, img: &egui::ColorImage) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn extended_parameter_values_survive_redraw_and_serialization() {
+        for mode in [MotionMode::Sweep, MotionMode::Manual] {
+            let mut params = Params {
+                mode,
+                puff: 10.0,
+                warmth_db: 18.0,
+                hold_s: 30.0,
+                move_s: 25.0,
+                ear_dist: 1.2,
+                manual_dist: 1.5,
+                wet_db: 15.0,
+                target_lufs: -8.0,
+                ..Params::default()
+            };
+            let expected = params.clone();
+            let ctx = egui::Context::default();
+            for _ in 0..3 {
+                let _ = ctx.run_ui(egui::RawInput {
+                    screen_rect: Some(egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(2000.0, 3000.0))),
+                    ..Default::default()
+                }, |ui| {
+                    ui.columns(2, |columns| {
+                        App::params_left(&mut columns[0], &mut params);
+                        App::params_right(&mut columns[1], &mut params);
+                    });
+                });
+                assert_eq!(params, expected, "drawing controls changed a manually entered value");
+            }
+            let saved = Saved { params, ..Saved::default() };
+            let restored: Saved = ron::from_str(&ron::to_string(&saved).unwrap()).unwrap();
+            assert_eq!(restored.params, expected);
+        }
+    }
 
     #[test]
     fn radar_pick_is_the_inverse_of_the_drawing_scale() {
