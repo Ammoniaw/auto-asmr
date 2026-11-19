@@ -5,6 +5,8 @@ use crate::dsp::params::{MotionMode, Params, Playback, Via, DENOISE_MAX_DB};
 use crate::dsp::tables::tables;
 use crate::dsp::motion::lift_tilt;
 use crate::dsp::{FS, HEAD_A, R_MIN, R_MAX};
+mod view3d;
+
 use crate::batch;
 use crate::offline::{default_output, load_mono, Channel, ConvertOptions, ConvertReport};
 use crate::realtime::{self, DeviceInfo, DeviceList, Realtime, RtOptions};
@@ -108,11 +110,13 @@ struct Saved {
     jobs: usize,
     /// 批量转换的输出文件夹；None = 放在各自源文件旁边。
     out_dir: Option<PathBuf>,
+    /// 是否显示 3D 观察窗（默认隐藏；隐藏时不绘制）。
+    view3d: bool,
 }
 
 impl Default for Saved {
     fn default() -> Self {
-        Saved { params: Params::default(), english: false, tab: Tab::Realtime, host: String::new(), input: None, output: None, buffer: 256, in_channel: 0, dry: false, bits: 24, file_lufs: -16.0, file_channel: 0, jobs: 0, out_dir: None }
+        Saved { params: Params::default(), english: false, tab: Tab::Realtime, host: String::new(), input: None, output: None, buffer: 256, in_channel: 0, dry: false, bits: 24, file_lufs: -16.0, file_channel: 0, jobs: 0, out_dir: None, view3d: false }
     }
 }
 
@@ -164,12 +168,14 @@ pub struct App {
     decoding: Option<Receiver<Decoded>>,
     tele: Telemetry,
     trail: Vec<(f32, f32)>,
+    view3d: view3d::View3d,
     /// 最近一次用的自动模式（关掉"手动摆位"时回到它）、上一帧的模式。
     auto_mode: MotionMode,
     last_mode: MotionMode,
     shot: Option<(PathBuf, u32)>,
-    /// 截图自检时模拟的一次拖动：按下点和松开点（窗口坐标）。
+    /// 截图自检时模拟的一次拖动：按下点和松开点（窗口坐标），以及是否用右键。
     shot_drag: Option<[f32; 4]>,
+    shot_drag_right: bool,
     shot_drag_frame: u32,
     demo: Option<PathBuf>,
 }
@@ -259,6 +265,7 @@ impl App {
             decoding: None,
             tele: Telemetry { az: 270.0, r: 0.105, in_db: -120.0, out_db: -120.0, ..Default::default() },
             trail: Vec::new(),
+            view3d: view3d::View3d::default(),
             auto_mode: if s_mode == MotionMode::Manual { MotionMode::Sweep } else { s_mode },
             last_mode: s_mode,
             shot,
@@ -266,10 +273,20 @@ impl App {
                 let f: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
                 (f.len() == 4).then(|| [f[0], f[1], f[2], f[3]])
             }),
+            // AUTO_ASMR_SHOT_DRAG 后面加 ",right"：用右键拖
+            shot_drag_right: std::env::var("AUTO_ASMR_SHOT_DRAG").map_or(false, |v| v.trim_end().ends_with("right")),
             shot_drag_frame: 0,
             demo,
         };
         if is_shot {
+            // AUTO_ASMR_SHOT_3D="偏航,俯仰"（可留空用默认视角）：打开 3D 观察窗
+            if let Ok(v) = std::env::var("AUTO_ASMR_SHOT_3D") {
+                app.s.view3d = true;
+                let f: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                if f.len() == 2 {
+                    (app.view3d.yaw, app.view3d.pitch) = (f[0], f[1]);
+                }
+            }
             // 截图自检批量转换：AUTO_ASMR_SHOT_FILES="a;b;c" 预先放进文件列表；
             // AUTO_ASMR_SHOT_CONVERT=<输出文件夹> 再以每个文件 600 秒开始全部转换，截下转换中的画面（退出时取消）
             if let Ok(v) = std::env::var("AUTO_ASMR_SHOT_FILES") {
@@ -759,6 +776,8 @@ impl App {
                 p.mode = if manual { MotionMode::Manual } else { self.auto_mode };
                 p.level_follow = Params::default_level_follow(p.mode);
             }
+            ui.checkbox(&mut self.s.view3d, t("3D 视图：立体观察人头和音源的相对位置", "3D view: see the source around the head in 3D"))
+                .on_hover_text(t("打开一个小窗口：左键拖动音源（自动切到手动摆位），右键拖动旋转视角；关掉时不绘制，不占资源", "Opens a small window: left-drag moves the source (switches to manual), right-drag rotates the view; nothing is drawn while it is off"));
         });
     }
 
@@ -1385,7 +1404,8 @@ impl eframe::App for App {
                 *frame
             };
             let (a, b) = (egui::pos2(x0, y0), egui::pos2(x1, y1));
-            let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+            let which = if self.shot_drag_right { egui::PointerButton::Secondary } else { egui::PointerButton::Primary };
+            let button = |pos, pressed| egui::Event::PointerButton { pos, button: which, pressed, modifiers: Default::default() };
             match frame {
                 4 => raw.events.push(egui::Event::PointerMoved(a)),
                 5 => raw.events.push(button(a, true)),
@@ -1453,6 +1473,26 @@ impl eframe::App for App {
                 });
             });
         });
+
+        // 3D 观察窗：只有打开时才绘制
+        if self.s.view3d {
+            let mut open = true;
+            let (tele, active) = (self.tele, self.rt.is_some());
+            let (v, params) = (&mut self.view3d, &mut self.s.params);
+            egui::Window::new(t("3D 视图", "3D view"))
+                .id(egui::Id::unique("view3d_window"))
+                .open(&mut open)
+                .default_pos([480.0, 300.0])
+                .default_size([360.0, 400.0])
+                .min_size([240.0, 280.0])
+                .resizable(true)
+                .show(&ctx, |ui| v.ui(ui, &tele, active, params));
+            if !open {
+                self.s.view3d = false;
+            }
+        } else {
+            self.view3d.clear_trail();
+        }
 
         self.sync_params();
 
