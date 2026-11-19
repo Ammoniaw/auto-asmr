@@ -110,6 +110,8 @@ pub struct Shared {
     pub play_pos: AtomicU64,
     pub play_len: AtomicU64,
     pub finished: AtomicBool,
+    /// 待执行的文件跳转；音频回调取走最新请求，不重新打开输出设备。
+    seek_sample: AtomicU64,
     error: Mutex<Option<String>>,
 }
 
@@ -130,6 +132,7 @@ impl Shared {
             play_pos: AtomicU64::new(0),
             play_len: AtomicU64::new(0),
             finished: AtomicBool::new(false),
+            seek_sample: AtomicU64::new(u64::MAX),
             error: Mutex::new(None),
         }
     }
@@ -163,6 +166,21 @@ impl Shared {
     /// 设备出错（拔掉、被占用等）时的说明；读一次即清空。
     pub fn take_error(&self) -> Option<String> {
         self.error.lock().ok().and_then(|mut e| e.take())
+    }
+
+    pub fn seek_preview(&self, sample: u64) {
+        self.seek_sample.store(sample.min(self.play_len.load(Ordering::Relaxed)), Ordering::Release);
+    }
+
+    pub fn preview_finished(&self) -> bool {
+        self.seek_sample.load(Ordering::Acquire) == u64::MAX && self.finished.load(Ordering::Relaxed)
+    }
+
+    fn set_config(&self, cfg: Arc<EngineConfig>) {
+        if let Ok(mut g) = self.cfg.lock() {
+            *g = cfg;
+            self.cfg_ver.fetch_add(1, Ordering::Release);
+        }
     }
 }
 
@@ -307,6 +325,8 @@ struct Pump {
     inb: Vec<f32>,
     el: Vec<f32>,
     er: Vec<f32>,
+    last_output: [f32; 2],
+    seek_fade: usize,
 }
 
 const N: usize = 64;
@@ -314,8 +334,9 @@ const N: usize = 64;
 impl Pump {
     fn new(src: Source, eng: Engine, shared: Arc<Shared>, out_rate: f64) -> Self {
         shared.algo_samples.store(eng.latency_samples() as u32, Ordering::Relaxed);
-        if let Source::Memory { data, .. } = &src {
+        if let Source::Memory { data, pos } = &src {
             shared.play_len.store(data.len() as u64, Ordering::Relaxed);
+            shared.play_pos.store((*pos).min(data.len()) as u64, Ordering::Relaxed);
         }
         Pump {
             src,
@@ -333,6 +354,8 @@ impl Pump {
             inb: vec![0.0; N],
             el: vec![0.0; N],
             er: vec![0.0; N],
+            last_output: [0.0; 2],
+            seek_fade: 0,
         }
     }
 
@@ -360,13 +383,31 @@ impl Pump {
         crate::dsp::flush_denormals();
         let t0 = std::time::Instant::now();
         // 界面改了参数：换一份配置（拿不到锁就下次再说，绝不等待）
-        let ver = self.shared.cfg_ver.load(Ordering::Relaxed);
+        let ver = self.shared.cfg_ver.load(Ordering::Acquire);
         if ver != self.cfg_ver {
             if let Ok(g) = self.shared.cfg.try_lock() {
                 self.eng.set_config(g.clone());
                 self.cfg_ver = ver;
                 self.shared.algo_samples.store(self.eng.latency_samples() as u32, Ordering::Relaxed);
             }
+        }
+        let seek = self.shared.seek_sample.load(Ordering::Acquire);
+        if seek != u64::MAX {
+            if let Source::Memory { data, pos } = &mut self.src {
+                *pos = seek.min(data.len() as u64) as usize;
+                self.shared.play_pos.store(*pos as u64, Ordering::Relaxed);
+                self.shared.finished.store(false, Ordering::Relaxed);
+                for q in &mut self.q {
+                    q.clear();
+                }
+                self.qpos = 0;
+                for rs in &mut self.rs {
+                    rs.reset();
+                }
+                self.seek_fade = (self.out_rate * 0.005).round().max(1.0) as usize;
+            }
+            // 先清除播完状态，再确认跳转完成；期间的新拖动请求留到下一回调。
+            let _ = self.shared.seek_sample.compare_exchange(seek, u64::MAX, Ordering::AcqRel, Ordering::Acquire);
         }
         let frames = out_l.len();
         // 麦克风：目标积压量 = 一次输入回调的量 + 2 ms 余量；攒够了才开始
@@ -412,6 +453,20 @@ impl Pump {
         out_r[..have].copy_from_slice(&self.q[1][self.qpos..self.qpos + have]);
         out_l[have..].fill(0.0);
         out_r[have..].fill(0.0);
+        // 用 5 ms 淡入衔接跳转，避免源波形突变产生咔嗒声。
+        let fade_len = (self.out_rate * 0.005).round().max(1.0) as usize;
+        for i in 0..frames.min(self.seek_fade) {
+            let mix = 1.0 - self.seek_fade as f32 / fade_len as f32;
+            out_l[i] = self.last_output[0] * (1.0 - mix) + out_l[i] * mix;
+            out_r[i] = self.last_output[1] * (1.0 - mix) + out_r[i] * mix;
+            self.seek_fade -= 1;
+        }
+        if let (Some(&l), Some(&r)) = (out_l.last(), out_r.last()) {
+            // 淡入跨多个回调时保留同一衔接起点。
+            if self.seek_fade == 0 {
+                self.last_output = [l, r];
+            }
+        }
         self.qpos += have;
         if self.qpos > 8192 {
             self.q[0].drain(..self.qpos);
@@ -528,10 +583,7 @@ impl Realtime {
 
     /// 界面改了参数后调用。
     pub fn set_config(&self, cfg: Arc<EngineConfig>) {
-        if let Ok(mut g) = self.shared.cfg.lock() {
-            *g = cfg;
-        }
-        self.shared.cfg_ver.fetch_add(1, Ordering::Relaxed);
+        self.shared.set_config(cfg);
     }
 
     /// 估计的总延迟（毫秒）：输入缓冲 + 环形缓冲积压 + 算法 + 重采样 + 输出缓冲。不含声卡驱动自身的延迟。
@@ -592,6 +644,71 @@ pub fn selftest(seconds: f32, opts: &RtOptions, cfg: Arc<EngineConfig>, file: Op
 mod tests {
     use super::*;
     use crate::dsp::params::Params;
+
+    fn preview_pump(audio: Vec<f32>, out_rate: f64, dry: bool) -> (Pump, Arc<Shared>) {
+        let params = Params { auto_level: false, ..Params::default() };
+        let cfg = Arc::new(EngineConfig::new(params, None));
+        let shared = Arc::new(Shared::new(cfg.clone()));
+        shared.monitor_dry.store(dry, Ordering::Relaxed);
+        let pump = Pump::new(Source::Memory { data: Arc::new(audio), pos: 0 }, Engine::new(cfg, PostMode::Realtime, 0.0), shared.clone(), out_rate);
+        (pump, shared)
+    }
+
+    #[test]
+    fn preview_seeks_both_directions_and_restarts_after_eof() {
+        for rate in [48_000.0, 44_100.0] {
+            let mut audio = vec![0.2; FS_USIZE];
+            audio.extend(vec![-0.4; FS_USIZE]);
+            let (mut pump, shared) = preview_pump(audio, rate, true);
+            // 非整块长度使队列残留旧音频，跳转时必须清掉。
+            pump.fill(&mut [0.0; 137], &mut [0.0; 137]);
+            shared.seek_preview((FS_USIZE / 2) as u64);
+            shared.seek_preview(FS_USIZE as u64); // 连续拖动只执行最新位置。
+            let (mut l, mut r) = ([0.0; 1024], [0.0; 1024]);
+            pump.fill(&mut l, &mut r);
+            assert!(l[512..].iter().chain(&r[512..]).all(|x| (*x + 0.4).abs() < 1e-4));
+            assert!((FS_USIZE as u64..FS_USIZE as u64 + 2048).contains(&shared.play_pos.load(Ordering::Relaxed)));
+
+            shared.seek_preview(100);
+            pump.fill(&mut l, &mut r);
+            assert!(l[512..].iter().all(|x| (*x - 0.2).abs() < 1e-4));
+            assert!(shared.play_pos.load(Ordering::Relaxed) < 2048);
+
+            shared.seek_preview(u64::MAX); // 超出长度的跳转截到结尾。
+            for _ in 0..60 {
+                pump.fill(&mut l, &mut r);
+            }
+            assert!(shared.preview_finished());
+            shared.seek_preview(0);
+            assert!(!shared.preview_finished());
+            pump.fill(&mut l, &mut r);
+            assert!(!shared.preview_finished());
+            assert!(l[512..].iter().all(|x| (*x - 0.2).abs() < 1e-4));
+        }
+    }
+
+    #[test]
+    fn effect_parameters_change_during_preview_without_restarting() {
+        let audio: Vec<f32> = (0..FS_USIZE * 3).map(|n| 0.01 * (n as f32 * std::f32::consts::TAU * 440.0 / FS).sin()).collect();
+        let (mut pump, shared) = preview_pump(audio, 48_000.0, false);
+        let (mut l, mut r) = ([0.0; 1024], [0.0; 1024]);
+        for _ in 0..30 {
+            pump.fill(&mut l, &mut r);
+        }
+        let before = l.iter().chain(&r).map(|x| x * x).sum::<f32>();
+        let position = shared.play_pos.load(Ordering::Relaxed);
+        let cfg = shared.cfg.lock().unwrap().clone();
+        let mut params = cfg.params.clone();
+        params.out_gain_db -= 24.0;
+        shared.set_config(Arc::new(EngineConfig::new(params, Some(&cfg))));
+        for _ in 0..4 {
+            pump.fill(&mut l, &mut r);
+        }
+        let after = l.iter().chain(&r).map(|x| x * x).sum::<f32>();
+        assert!(after < before * 0.02, "gain did not change: {before} -> {after}");
+        assert!(shared.play_pos.load(Ordering::Relaxed) > position);
+        assert!(!shared.preview_finished());
+    }
 
     /// 用虚拟时钟模拟"输入回调每次 `n_in` 帧、输出回调每次 `n_out` 帧、输出设备时钟快 `drift`"，
     /// 返回 (断流次数, 稳定后的平均积压毫秒, 监听原声时测到的端到端延迟样本数)。

@@ -511,10 +511,14 @@ impl Motion {
         }
         // 贴耳距离被拖动时，停在耳边的声源跟着挪过去
         if (p.ear_dist - self.last_ear_dist).abs() > 1e-4 {
-            if self.segs.is_empty() && self.at_ear && matches!(p.mode, MotionMode::Sweep | MotionMode::Random | MotionMode::Static) {
+            if self.at_ear && matches!(p.mode, MotionMode::Sweep | MotionMode::Random | MotionMode::Static) {
                 let (az, r1) = (self.plan_az, self.plan_r * p.ear_dist / self.last_ear_dist.max(1e-3));
-                self.push_move(tm, 0.5, az, r1.clamp(R_MIN, R_MAX), None, None);
-                self.next_t = self.next_t.max(tm + 0.6);
+                // 拖动中的每次更新都重新瞄准；旧的平滑移动不能吞掉后续距离。
+                self.segs.clear();
+                self.plan_az = self.az;
+                self.plan_r = self.r;
+                self.push_move(tm, 0.18, az, r1.clamp(R_MIN, R_MAX), None, None);
+                self.next_t = self.next_t.max(tm + 0.2);
             }
             self.last_ear_dist = p.ear_dist;
         }
@@ -532,8 +536,11 @@ impl Motion {
                 }
             }
             MotionMode::Static => {
-                if self.segs.is_empty() && arc_delta(self.plan_az, p.static_az, None).abs() > 0.5 {
-                    self.push_move(tm, 1.2, p.static_az, p.ear_dist, Some(true), None);
+                if arc_delta(self.plan_az, p.static_az, None).abs() > 0.5 {
+                    self.segs.clear();
+                    self.plan_az = self.az;
+                    self.plan_r = self.r;
+                    self.push_move(tm, 0.18, p.static_az, p.ear_dist, Some(true), None);
                 }
             }
             MotionMode::Orbit | MotionMode::Manual => {}
@@ -810,6 +817,25 @@ mod tests {
 
     fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
         ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+    }
+
+    #[test]
+    fn continuous_slider_changes_reach_the_latest_distance_and_angle() {
+        let mut p = Params { mode: MotionMode::Static, static_az: 270.0, sway: 0.0, sway_follow: 0.0, micro: 0.0, height: 0.0, updown: 0.0, ..Params::default() };
+        let mut motion = Motion::new(1);
+        let mut pose = motion.step(&p, 0.0, 1.0, 0.0);
+        let mut previous = xyz(&pose);
+        for i in 1..=900 {
+            if i <= 600 && i % 12 == 0 {
+                p.ear_dist = 0.105 + 0.195 * i as f32 / 600.0;
+                p.static_az = 270.0 - 60.0 * i as f32 / 600.0;
+            }
+            pose = motion.step(&p, i as f64 * CTRL_DT as f64, 1.0, 0.0);
+            assert!(dist(previous, xyz(&pose)) < 0.01, "slider caused a position jump");
+            previous = xyz(&pose);
+        }
+        assert!((pose.r - p.ear_dist).abs() < 1e-4, "distance {} != {}", pose.r, p.ear_dist);
+        assert!(arc_delta(pose.az, p.static_az, None).abs() < 0.1);
     }
 
     #[test]

@@ -129,6 +129,9 @@ pub struct App {
     file_out: Option<PathBuf>,
     start_s: f32,
     dur_s: f32,
+    preview_s: f64,
+    preview_dragging: bool,
+    preview_pending: bool,
     job: Option<Job>,
     report: String,
     decoded: Option<(PathBuf, u8, Arc<Vec<f32>>)>,
@@ -141,6 +144,7 @@ pub struct App {
     shot: Option<(PathBuf, u32)>,
     /// 截图自检时模拟的一次拖动：按下点和松开点（窗口坐标）。
     shot_drag: Option<[f32; 4]>,
+    shot_drag_frame: u32,
     demo: Option<PathBuf>,
 }
 
@@ -217,6 +221,9 @@ impl App {
             file_out: None,
             start_s: 0.0,
             dur_s: 0.0,
+            preview_s: 0.0,
+            preview_dragging: false,
+            preview_pending: false,
             job: None,
             report: String::new(),
             decoded: None,
@@ -230,6 +237,7 @@ impl App {
                 let f: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
                 (f.len() == 4).then(|| [f[0], f[1], f[2], f[3]])
             }),
+            shot_drag_frame: 0,
             demo,
         }
     }
@@ -248,12 +256,19 @@ impl App {
     }
 
     fn stop(&mut self) {
+        if self.rt_preview && !self.preview_dragging {
+            if let Some(rt) = &self.rt {
+                self.preview_s = rt.shared.play_pos.load(Ordering::Relaxed) as f64 / FS as f64;
+            }
+        }
         self.rt = None;
         self.rt_preview = false;
+        self.preview_pending = false;
     }
 
     fn start_mic(&mut self) {
         self.stop();
+        self.sync_params();
         match Realtime::start(&self.rt_options(), self.cfg.clone()) {
             Ok(rt) => {
                 rt.shared.monitor_dry.store(self.s.dry, Ordering::Relaxed);
@@ -307,11 +322,14 @@ impl App {
     /// 试听：先在后台解码（已解码过同一个文件就直接用），再用实时引擎播放。
     fn start_preview(&mut self) {
         let Some(input) = self.file_in.clone() else { return };
+        let selected_s = self.preview_s;
         self.stop();
+        self.preview_s = selected_s;
+        self.sync_params();
         let ch = self.s.file_channel;
         if let Some((p, c, audio)) = &self.decoded {
             if *p == input && *c == ch {
-                let start = ((self.start_s.max(0.0) * FS) as usize).min(audio.len());
+                let start = ((self.preview_s.max(0.0) * FS as f64) as usize).min(audio.len());
                 match Realtime::start_preview(&self.rt_options(), self.cfg.clone(), audio.clone(), start) {
                     Ok(rt) => {
                         self.status = format!("{}：{}（{} Hz）", t("试听中", "Previewing"), rt.info.output_name, rt.info.out_rate);
@@ -323,6 +341,15 @@ impl App {
                 return;
             }
         }
+        self.preview_pending = true;
+        if self.decoding.is_none() {
+            self.decode_file();
+        }
+    }
+
+    fn decode_file(&mut self) {
+        let Some(input) = self.file_in.clone() else { return };
+        let ch = self.s.file_channel;
         let (tx, rx) = channel();
         let mut o = ConvertOptions::new(input.clone());
         o.channel = self.file_channel();
@@ -335,9 +362,14 @@ impl App {
     }
 
     fn set_file(&mut self, p: PathBuf) {
+        self.stop();
         self.file_out = Some(default_output(&p));
         self.file_in = Some(p);
+        self.decoded = None;
+        self.preview_s = self.start_s.max(0.0) as f64;
+        self.preview_dragging = false;
         self.report.clear();
+        self.decode_file();
     }
 
     // ------------------------------------------------------------------ 各块界面
@@ -608,6 +640,7 @@ impl App {
     }
 
     fn ui_file(&mut self, ui: &mut egui::Ui) {
+        let channel_before = self.s.file_channel;
         ui.group(|ui| {
             ui.set_width(ui.available_width());
             ui.label(RichText::new(t("音频文件", "Audio file")).strong());
@@ -647,7 +680,9 @@ impl App {
                 });
                 ui.end_row();
                 ui.label(t("从第几秒", "Start (s)"));
-                ui.add(egui::DragValue::new(&mut self.start_s).range(0.0..=36000.0).speed(1.0));
+                if ui.add(egui::DragValue::new(&mut self.start_s).range(0.0..=36000.0).speed(1.0)).changed() {
+                    self.preview_s = self.start_s as f64;
+                }
                 ui.label(t("处理多少秒", "Duration (s)"));
                 ui.add(egui::DragValue::new(&mut self.dur_s).range(0.0..=36000.0).speed(1.0)).on_hover_text(t("0 = 到结尾。先试 60 秒听听效果很方便", "0 = to the end. Try 60 s first to audition"));
                 ui.end_row();
@@ -656,6 +691,13 @@ impl App {
                 ui.end_row();
             });
         });
+        if channel_before != self.s.file_channel && self.file_in.is_some() {
+            let resume = self.rt_preview || self.preview_pending;
+            self.stop();
+            self.decoded = None;
+            self.preview_pending = resume;
+            self.decode_file();
+        }
         self.ui_devices(ui, false);
         self.ui_status(ui);
         let has = self.file_in.is_some();
@@ -678,10 +720,21 @@ impl App {
                 }
             }
         });
-        if let Some(rt) = &self.rt {
-            if self.rt_preview {
-                let (pos, len) = (rt.shared.play_pos.load(Ordering::Relaxed) as f32, rt.shared.play_len.load(Ordering::Relaxed).max(1) as f32);
-                ui.add(egui::ProgressBar::new(pos / len).text(format!("{:.0} / {:.0} s", pos / FS, len / FS)));
+        if let Some((_, _, audio)) = &self.decoded {
+            let duration = audio.len() as f64 / FS as f64;
+            self.preview_s = self.preview_s.clamp(0.0, duration);
+            ui.label(format!("{}  {} / {}", t("试听位置", "Preview position"), playback_time(self.preview_s), playback_time(duration)));
+            let response = ui.scope(|ui| {
+                ui.spacing_mut().slider_width = ui.available_width().max(1.0);
+                ui.add_enabled(duration > 0.0, egui::Slider::new(&mut self.preview_s, 0.0..=duration).show_value(false))
+            }).inner.on_hover_text(t("点击或拖动，立即试听该位置的处理效果；右侧参数边调边生效", "Click or drag to hear the processed audio here; effect parameters update while playing"));
+            self.preview_dragging = response.dragged();
+            if response.changed() || response.clicked() || response.drag_started() {
+                if let Some(rt) = self.rt.as_ref().filter(|_| self.rt_preview) {
+                    rt.shared.seek_preview((self.preview_s * FS as f64) as u64);
+                } else {
+                    self.start_preview();
+                }
             }
         }
         if let Some(j) = &self.job {
@@ -899,14 +952,17 @@ impl App {
         });
     }
 
-    /// 每帧的后台事务：参数同步、试听解码完成、转换完成、设备出错。
-    fn poll(&mut self, ctx: &egui::Context) {
-        ENGLISH.store(self.s.english, Ordering::Relaxed);
+    /// 在控件修改参数的当帧提交，音频线程下一次回调直接使用最新快照。
+    fn sync_params(&mut self) {
         let mode = self.s.params.mode;
         if mode != self.last_mode {
             if mode == MotionMode::Manual {
                 self.auto_mode = self.last_mode;
-                if self.rt.is_some() {
+                if self.rt.is_some()
+                    && self.s.params.manual_az == self.sent.manual_az
+                    && self.s.params.manual_dist == self.sent.manual_dist
+                    && self.s.params.manual_tilt == self.sent.manual_tilt
+                {
                     // 运行中切到手动：声源就停在此刻所在的位置，从这里开始拖
                     let (up, az, dist) = up_angle(self.tele.az, self.tele.el, self.tele.r);
                     let p = &mut self.s.params;
@@ -925,15 +981,27 @@ impl App {
             self.cfg = cfg;
             self.sent = self.s.params.clone();
         }
+    }
+
+    /// 每帧的后台事务：试听解码完成、转换完成、设备出错。
+    fn poll(&mut self, ctx: &egui::Context) {
+        ENGLISH.store(self.s.english, Ordering::Relaxed);
         if let Some(rx) = &self.decoding {
             if let Ok(r) = rx.try_recv() {
                 self.decoding = None;
                 match r {
                     Ok(d) => {
                         self.decoded = Some(d);
-                        self.start_preview();
+                        if self.preview_pending {
+                            self.start_preview();
+                        } else {
+                            self.status = t("音频已就绪，点击或拖动播放条即可试听", "Audio ready; click or drag the timeline to preview").to_string();
+                        }
                     }
-                    Err(e) => self.status = e,
+                    Err(e) => {
+                        self.preview_pending = false;
+                        self.status = e;
+                    }
                 }
             }
         }
@@ -982,7 +1050,10 @@ impl App {
                 self.status = e;
                 stop = true;
             }
-            if self.rt_preview && rt.shared.finished.load(Ordering::Relaxed) {
+            if self.rt_preview && !self.preview_dragging {
+                self.preview_s = rt.shared.play_pos.load(Ordering::Relaxed) as f64 / FS as f64;
+            }
+            if self.rt_preview && rt.shared.preview_finished() {
                 self.status = t("试听结束", "Preview finished").to_string();
                 stop = true;
             }
@@ -1010,14 +1081,24 @@ impl App {
 impl eframe::App for App {
     /// 截图自检时模拟一次鼠标拖动（环境变量 AUTO_ASMR_SHOT_DRAG="x0,y0,x1,y1"，窗口坐标）：
     /// 第 5 帧在 (x0, y0) 按下，之后几帧移到 (x1, y1)，第 13 帧松开；截图在第 20 帧。
+    /// 文件试听自检从解码完成后开始计数，确保播放条已经出现。
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
         if let (Some((_, frame)), Some([x0, y0, x1, y1])) = (&self.shot, self.shot_drag) {
+            let frame = if self.file_in.is_some() {
+                if self.decoded.is_none() {
+                    return;
+                }
+                self.shot_drag_frame += 1;
+                self.shot_drag_frame
+            } else {
+                *frame
+            };
             let (a, b) = (egui::pos2(x0, y0), egui::pos2(x1, y1));
             let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
-            match *frame {
+            match frame {
                 4 => raw.events.push(egui::Event::PointerMoved(a)),
                 5 => raw.events.push(button(a, true)),
-                6..=12 => raw.events.push(egui::Event::PointerMoved(a + (b - a) * ((*frame - 5) as f32 / 7.0))),
+                6..=12 => raw.events.push(egui::Event::PointerMoved(a + (b - a) * ((frame - 5) as f32 / 7.0))),
                 13 => raw.events.push(button(b, false)),
                 _ => {}
             }
@@ -1051,8 +1132,13 @@ impl eframe::App for App {
             ui.add_space(4.0);
         });
         egui::Panel::bottom("bottom").show(ui, |ui| {
-            ui.horizontal(|ui| {
-                ui.label(RichText::new(if self.status.is_empty() { t("纯 CPU 处理 · KU100 人工头实测 HRIR（TH Köln，CC BY 4.0）· 请戴耳机", "CPU only · KU100 dummy-head HRIRs (TH Köln, CC BY 4.0) · use headphones").to_string() } else { self.status.clone() }).small());
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                ui.hyperlink_to(RichText::new("随意Official").strong().small(), "https://space.bilibili.com/79356601")
+                    .on_hover_text(t("打开研发人的 B 站主页", "Open the developer's Bilibili profile"));
+                ui.label(RichText::new("研发人 B站").small());
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.add(egui::Label::new(RichText::new(if self.status.is_empty() { t("纯 CPU 处理 · KU100 人工头实测 HRIR（TH Köln，CC BY 4.0）· 请戴耳机", "CPU only · KU100 dummy-head HRIRs (TH Köln, CC BY 4.0) · use headphones").to_string() } else { self.status.clone() }).small()).truncate());
+                });
             });
         });
         egui::Panel::left("left").resizable(false).exact_size(470.0).show(ui, |ui| {
@@ -1077,10 +1163,16 @@ impl eframe::App for App {
             });
         });
 
+        self.sync_params();
+
+        if self.rt.is_some() || self.job.is_some() || self.decoding.is_some() {
+            ctx.request_repaint_after(std::time::Duration::from_millis(16));
+        }
         // 截图自检：等界面稳定后截一张图存成 PNG，然后退出
         if let Some(f) = self.demo.take() {
             self.set_file(f);
             self.start_s = 4.0;
+            self.preview_s = 4.0;
             self.start_preview();
         }
         let wait = if self.file_in.is_some() { 150 } else { 20 };
@@ -1107,6 +1199,11 @@ impl eframe::App for App {
             eframe::set_value(storage, eframe::APP_KEY, &self.s);
         }
     }
+}
+
+fn playback_time(seconds: f64) -> String {
+    let seconds = seconds.max(0.0) as u64;
+    format!("{}:{:02}", seconds / 60, seconds % 60)
 }
 
 fn save_png(path: &PathBuf, img: &egui::ColorImage) -> Result<(), String> {

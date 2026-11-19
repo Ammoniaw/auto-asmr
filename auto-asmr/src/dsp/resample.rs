@@ -30,6 +30,13 @@ impl Resampler {
         self.step = in_rate / out_rate * trim;
     }
 
+    /// 跳转到另一段音频后清除插值历史，避免带出跳转前的样本。
+    pub fn reset(&mut self) {
+        self.hist.fill(0.0);
+        self.pos = 0;
+        self.behind = -1.0;
+    }
+
     /// 送入一段输入，把产生的输出追加到 `out`。
     pub fn process(&mut self, input: &[f32], out: &mut Vec<f32>) {
         let taps = self.table.taps;

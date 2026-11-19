@@ -1,3 +1,4 @@
 # HRIR 数据首次运行时自动从 Zenodo 下载，预处理缓存可重建，都不进仓库
 hrtf/
 .tools/
+.idea/
