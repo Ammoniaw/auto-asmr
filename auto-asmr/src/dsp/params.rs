@@ -3,10 +3,8 @@
 use super::{db_to_lin, EAR_R};
 use serde::{Deserialize, Serialize};
 
-/// 降噪强度取这个值（或更大）表示不设上限，降到最干净。
-pub const DENOISE_MAX_DB: f32 = 60.0;
-/// 界面上可选的固定档位：底噪最多压低多少 dB。
-pub const DENOISE_STEPS: [f32; 5] = [6.0, 12.0, 18.0, 24.0, 30.0];
+/// 降噪强度的最大值：取这个值（或更大）表示不设上限，降到最干净。
+pub const DENOISE_MAX_DB: f32 = 100.0;
 
 /// 左右移动的方式。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -19,6 +17,8 @@ pub enum MotionMode {
     Orbit,
     /// 固定在一个位置。
     Static,
+    /// 手动：位置由用户在位置图上拖动决定，没有任何自动移动（穿梭、忽远忽近、自动上下、晃动都停掉）。
+    Manual,
 }
 
 /// 换边时从哪里绕。
@@ -84,6 +84,10 @@ pub struct Params {
     pub static_az: f32,
     /// 响度随位置变化的程度：1 = 物理真实，0 = 处处一样响。
     pub level_follow: f32,
+    /// 手动模式的位置：方位角（度）、到头中心的距离（米）、高度（度，以耳朵为支点，含义同 `height`）。
+    pub manual_az: f32,
+    pub manual_dist: f32,
+    pub manual_tilt: f32,
 
     // ---- 忽远忽近
     /// 随机凑近 / 退开的幅度（0 = 关闭）。
@@ -123,7 +127,8 @@ pub struct Params {
     // ---- 人声处理
     /// 输入降噪（RNNoise）。
     pub denoise: bool,
-    /// 降噪强度：底噪最多压低多少 dB（固定档位见 [`DENOISE_STEPS`]）；[`DENOISE_MAX_DB`] 及以上 = 不设上限。
+    /// 降噪强度，0–100：底噪最多压低多少 dB；[`DENOISE_MAX_DB`]（100）= 不设上限。
+    /// 界面上是一个 0–100 的滑条，拖到 0 就是关闭（`denoise` 置为 false）。
     pub denoise_db: f32,
     /// 响应阈值：输入低于这个电平（dBFS）时当作静音；-90 = 关闭。
     pub gate_db: f32,
@@ -168,6 +173,9 @@ impl Default for Params {
             orbit_radius: 0.35,
             static_az: 270.0,
             level_follow: 0.2,
+            manual_az: 270.0,
+            manual_dist: EAR_R,
+            manual_tilt: 0.0,
             sway: 1.0,
             sway_period: 4.0,
             sway_random: 1.0,
@@ -236,6 +244,7 @@ impl Params {
             MotionMode::Random => 0.5,
             MotionMode::Orbit => 0.3,
             MotionMode::Static => 1.0,
+            MotionMode::Manual => 0.5,
         }
     }
 }

@@ -1,9 +1,10 @@
 //! 图形界面（egui）：实时页 + 文件转换页，右侧是两种模式共用的效果参数。
 
 use crate::dsp::engine::{EngineConfig, Telemetry};
-use crate::dsp::params::{MotionMode, Params, Playback, Via, DENOISE_MAX_DB, DENOISE_STEPS};
+use crate::dsp::params::{MotionMode, Params, Playback, Via, DENOISE_MAX_DB};
 use crate::dsp::tables::tables;
-use crate::dsp::{FS, HEAD_A};
+use crate::dsp::motion::lift_tilt;
+use crate::dsp::{FS, HEAD_A, R_MIN};
 use crate::offline::{convert, default_output, load_mono, Channel, ConvertOptions, ConvertReport};
 use crate::realtime::{self, DeviceInfo, DeviceList, Realtime, RtOptions};
 use eframe::egui;
@@ -20,6 +21,42 @@ static ENGLISH: AtomicBool = AtomicBool::new(false);
 const COL: f32 = 104.0;
 
 const CONFIG_FILE: &str = "auto-asmr.ron";
+
+/// 位置图的半径刻度：到头中心的距离（米）→ 离图中心的比例（0–1）。对数压缩：2 cm 在中心，80 cm 在边上。
+fn radar_map(r: f32) -> f32 {
+    ((r / 0.02).max(1.0).ln() / (RADAR_MAX_R / 0.02).ln()).clamp(0.0, 1.0)
+}
+
+/// 位置图上的一点（相对图中心的偏移；`rmax` = 满刻度对应的像素数）→（方位角 度, 到头中心的距离 米）。
+/// 距离限制在头外面（不会拖进头里）到图的边缘之间。
+fn radar_pick(d: egui::Vec2, rmax: f32) -> (f32, f32) {
+    let az = d.x.atan2(-d.y).to_degrees().rem_euclid(360.0);
+    let r = 0.02 * ((RADAR_MAX_R / 0.02).ln() * (d.length() / rmax).clamp(0.0, 1.0)).exp();
+    (az, r.clamp(R_MIN, RADAR_MAX_R))
+}
+
+/// 位置图边缘对应的距离（米）。
+const RADAR_MAX_R: f32 = 0.8;
+
+/// 高度角（度）：以"耳朵"为支点看声源在上方还是下方多少度——与运动里倾斜用的支点相同
+/// （声源在正侧方时支点是那只耳朵，在正前 / 正后方时是头中心）。同时返回水平面上的"未抬高"位置
+/// （方位角, 到头中心的距离），用来把一个三维位置换回手动模式的三个量。
+fn up_angle(az: f32, el: f32, r: f32) -> (f32, f32, f32) {
+    let (a, e) = (az.to_radians(), el.to_radians());
+    let (x, y, z) = (r * e.cos() * a.sin(), r * e.cos() * a.cos(), r * e.sin());
+    // 支点的位置取决于"未抬高"时的方位，先用当前方位估计，迭代几次就收敛
+    let mut cx = HEAD_A * x / r.max(1e-6);
+    let (mut up, mut px, mut py) = (0.0, x, y);
+    for _ in 0..6 {
+        let vh = (x - cx).hypot(y);
+        let d = vh.hypot(z);
+        up = z.atan2(vh).to_degrees();
+        px = cx + (x - cx) / vh.max(1e-6) * d;
+        py = y / vh.max(1e-6) * d;
+        cx = HEAD_A * px / px.hypot(py).max(1e-6);
+    }
+    (up, px.atan2(py).to_degrees().rem_euclid(360.0), px.hypot(py))
+}
 
 /// 参数表的一行：文字（悬停显示说明）+ 滑块。
 fn row(ui: &mut egui::Ui, label: &str, tip: &str, w: egui::Slider<'_>) {
@@ -98,7 +135,12 @@ pub struct App {
     decoding: Option<Receiver<Decoded>>,
     tele: Telemetry,
     trail: Vec<(f32, f32)>,
+    /// 最近一次用的自动模式（关掉"手动摆位"时回到它）、上一帧的模式。
+    auto_mode: MotionMode,
+    last_mode: MotionMode,
     shot: Option<(PathBuf, u32)>,
+    /// 截图自检时模拟的一次拖动：按下点和松开点（窗口坐标）。
+    shot_drag: Option<[f32; 4]>,
     demo: Option<PathBuf>,
 }
 
@@ -161,6 +203,7 @@ impl App {
         style.spacing.slider_width = 150.0;
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         cc.egui_ctx.set_global_style(style);
+        let s_mode = s.params.mode;
         App {
             sent: s.params.clone(),
             s,
@@ -180,7 +223,13 @@ impl App {
             decoding: None,
             tele: Telemetry { az: 270.0, r: 0.105, in_db: -120.0, out_db: -120.0, ..Default::default() },
             trail: Vec::new(),
+            auto_mode: if s_mode == MotionMode::Manual { MotionMode::Sweep } else { s_mode },
+            last_mode: s_mode,
             shot,
+            shot_drag: std::env::var("AUTO_ASMR_SHOT_DRAG").ok().and_then(|v| {
+                let f: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                (f.len() == 4).then(|| [f[0], f[1], f[2], f[3]])
+            }),
             demo,
         }
     }
@@ -366,11 +415,46 @@ impl App {
     /// 右侧的竖条是高度：从耳朵（声源在正前 / 正后方时从头中心）看过去，嘴在上方还是下方多少度。
     fn ui_radar(&mut self, ui: &mut egui::Ui, size: f32) {
         const GAUGE_W: f32 = 20.0;
-        let (resp, p) = ui.allocate_painter(egui::vec2(size + GAUGE_W, size), egui::Sense::hover());
+        let manual = self.s.params.mode == MotionMode::Manual;
+        let sense = if manual { egui::Sense::click_and_drag() } else { egui::Sense::hover() };
+        let (resp, p) = ui.allocate_painter(egui::vec2(size + GAUGE_W, size), sense);
         let rect = egui::Rect::from_min_size(resp.rect.min, egui::vec2(size, size));
         let c = rect.center();
         let rmax = size * 0.47;
-        let map = |r: f32| -> f32 { ((r / 0.02).max(1.0).ln() / (0.8f32 / 0.02).ln()).clamp(0.0, 1.0) * rmax };
+        let map = |r: f32| -> f32 { radar_map(r) * rmax };
+        // 右侧的高度标尺
+        let (gx, g0, g1) = (rect.right() + 0.5 * GAUGE_W - 2.0, rect.top() + 30.0, rect.bottom() - 18.0);
+        let gm = 0.5 * (g0 + g1);
+        if self.shot.as_ref().map_or(false, |s| s.1 == 2) {
+            eprintln!("位置图：中心 ({:.0}, {:.0})，满刻度 {:.0} px；高度标尺 x={:.0}，y={:.0}…{:.0}", c.x, c.y, rmax, gx, g0, g1);
+        }
+        if manual {
+            // 手动摆位：在俯视图里点 / 拖改方位和距离，在右侧竖条上点 / 拖改高度（双击竖条回到与耳朵齐平）
+            let origin = ui.input(|i| i.pointer.press_origin());
+            let on_gauge = |pt: egui::Pos2| pt.x > rect.right();
+            if resp.is_pointer_button_down_on() {
+                if let (Some(pt), Some(o)) = (resp.interact_pointer_pos(), origin) {
+                    let pr = &mut self.s.params;
+                    if on_gauge(o) {
+                        pr.manual_tilt = ((gm - pt.y) / (0.5 * (g1 - g0)) * 90.0).clamp(-80.0, 85.0);
+                    } else {
+                        (pr.manual_az, pr.manual_dist) = radar_pick(pt - c, rmax);
+                    }
+                }
+            }
+            if resp.double_clicked() && resp.interact_pointer_pos().map_or(false, on_gauge) {
+                self.s.params.manual_tilt = 0.0;
+            }
+            if resp.hovered() {
+                ui.ctx().set_cursor_icon(if resp.is_pointer_button_down_on() { egui::CursorIcon::Grabbing } else { egui::CursorIcon::Grab });
+            }
+            if self.rt.is_none() {
+                // 没在运行：圆点直接显示摆好的位置
+                let pr = &self.s.params;
+                let (az, el, r) = lift_tilt(pr.manual_az, pr.manual_dist, 0.0, pr.manual_tilt);
+                (self.tele.az, self.tele.el, self.tele.r) = (az, el, r);
+            }
+        }
         let dark = ui.visuals().dark_mode;
         let grid = if dark { Color32::from_gray(70) } else { Color32::from_gray(190) };
         let fg = if dark { Color32::from_gray(200) } else { Color32::from_gray(60) };
@@ -421,20 +505,23 @@ impl App {
         };
         let sp = pos(self.tele.az, r_h);
         p.circle_filled(sp, if speaking && active { 7.0 } else { 5.5 }, col);
+        let accent = Color32::from_rgb(70, 150, 240);
+        if manual {
+            // 手动的目标位置：一个可以拖的圈（声音稍微滞后一点跟过来）
+            let pr = &self.s.params;
+            p.circle_stroke(pos(pr.manual_az, pr.manual_dist), 10.0, egui::Stroke::new(1.5, accent));
+            p.circle_stroke(egui::pos2(gx, gm - (pr.manual_tilt / 90.0).clamp(-1.0, 1.0) * 0.5 * (g1 - g0)), 7.0, egui::Stroke::new(1.5, accent));
+            p.text(rect.left_bottom() + egui::vec2(8.0, -5.0), egui::Align2::LEFT_BOTTOM, t("拖动圆点 · 右侧拖高度", "drag the dot · height at right"), egui::FontId::proportional(10.5), accent);
+        }
         // 高度角：以"耳朵"为支点（与运动里倾斜的支点相同：正侧方时是那只耳朵，正前 / 正后方时是头中心）
-        let a = self.tele.az.to_radians();
-        let (x, y, z) = (r_h * a.sin(), r_h * a.cos(), r3 * el.sin());
-        let cx = HEAD_A * x / r3.max(1e-6);
-        let up = z.atan2((x - cx).hypot(y)).to_degrees();
-        let (gx, g0, g1) = (rect.right() + 0.5 * GAUGE_W - 2.0, rect.top() + 30.0, rect.bottom() - 18.0);
-        let gm = 0.5 * (g0 + g1);
+        let (up, _, plan_r) = up_angle(self.tele.az, self.tele.el, r3);
         p.line_segment([egui::pos2(gx, g0), egui::pos2(gx, g1)], egui::Stroke::new(2.0, grid));
         p.line_segment([egui::pos2(gx - 4.0, gm), egui::pos2(gx + 4.0, gm)], egui::Stroke::new(1.5, grid));
         p.text(egui::pos2(gx, g0 - 3.0), egui::Align2::CENTER_BOTTOM, t("上", "up"), egui::FontId::proportional(10.0), grid);
         p.text(egui::pos2(gx, g1 + 2.0), egui::Align2::CENTER_TOP, t("下", "dn"), egui::FontId::proportional(10.0), grid);
         p.circle_filled(egui::pos2(gx, gm - (up / 90.0).clamp(-1.0, 1.0) * 0.5 * (g1 - g0)), if speaking && active { 5.0 } else { 4.0 }, col);
         let hgt = if up.abs() < 1.0 { String::new() } else { format!("   {} {:.0}°", if up > 0.0 { t("上", "up") } else { t("下", "down") }, up.abs()) };
-        p.text(rect.left_top() + egui::vec2(8.0, 6.0), egui::Align2::LEFT_TOP, format!("{} {:.1} cm   {:.0}°{}", t("离耳", "from ear"), ((self.tele.r - HEAD_A) * 100.0).max(0.0), self.tele.az, hgt), egui::FontId::proportional(12.0), fg);
+        p.text(rect.left_top() + egui::vec2(8.0, 6.0), egui::Align2::LEFT_TOP, format!("{} {:.1} cm   {:.0}°{}", t("离耳", "from ear"), ((plan_r - HEAD_A) * 100.0).max(0.0), self.tele.az, hgt), egui::FontId::proportional(12.0), fg);
     }
 
     /// 电平条：`frac` 0–1 是填充比例，`hot` 时变红。
@@ -476,6 +563,16 @@ impl App {
                     }
                 });
             });
+            let mut manual = self.s.params.mode == MotionMode::Manual;
+            let tip = t(
+                "打开后，穿梭、忽远忽近、自动上下、自然晃动全部停掉，声源停在你摆的位置：在位置图里点或拖改方位和距离，在右侧竖条上拖改高度（双击竖条回到与耳朵齐平）。运行中打开时，声源就停在此刻所在的位置。文件转换时相当于固定在这个位置",
+                "When on, all automatic motion stops (sweeps, near / far sway, auto up / down, micro motion) and the source stays where you put it: click or drag on the map for direction and distance, drag the bar at the right for height (double-click it for ear level). Turned on while running, the source stays where it is at that moment. For file conversion this is a fixed position",
+            );
+            if ui.checkbox(&mut manual, t("手动摆位：关闭自动移动，拖动位置图里的声源", "Manual: stop automatic motion and drag the source on the map")).on_hover_text(tip).changed() {
+                let p = &mut self.s.params;
+                p.mode = if manual { MotionMode::Manual } else { self.auto_mode };
+                p.level_follow = Params::default_level_follow(p.mode);
+            }
         });
     }
 
@@ -596,32 +693,38 @@ impl App {
         }
     }
 
-    /// 左下角：输入降噪。强度按固定的分贝数选——底噪最多压低这么多。
+    /// 左下角：输入降噪。一个 0–100 的滑条：数值 = 底噪最多压低多少分贝，0 = 关闭，100 = 不设上限。
     fn ui_denoise(ui: &mut egui::Ui, p: &mut Params) {
         ui.add_space(5.0);
+        let mut v = if p.denoise { p.denoise_db.clamp(0.0, DENOISE_MAX_DB) } else { 0.0 };
         ui.horizontal(|ui| {
             ui.label(RichText::new(t("降噪", "Denoise")).strong()).on_hover_text(t(
-                "输入降噪（RNNoise，纯 CPU）：在空间化之前去掉麦克风 / 录音里的底噪。选一个数值，底噪就最多压低这么多分贝；人声的音量不变",
-                "Input denoise (RNNoise, CPU only): removes background noise before spatialization. Pick a value: noise is lowered by at most that many dB; the voice keeps its level",
+                "输入降噪（RNNoise，纯 CPU）：在空间化之前去掉麦克风 / 录音里的底噪。数值 = 底噪最多压低多少分贝，0 = 关闭，100 = 不设上限；60 以上基本没有区别。人声的音量不变",
+                "Input denoise (RNNoise, CPU only): removes background noise before spatialization. The value is how many dB the noise is lowered by at most; 0 = off, 100 = no limit, little changes above 60. The voice keeps its level",
             ));
-            if ui.selectable_label(!p.denoise, t("关", "Off")).clicked() {
-                p.denoise = false;
-            }
-            for db in DENOISE_STEPS {
-                let on = p.denoise && (p.denoise_db - db).abs() < 0.5;
-                if ui.selectable_label(on, format!("{db:.0} dB")).on_hover_text(format!("{} {db:.0} dB", t("底噪最多压低", "Lower the noise by at most"))).clicked() {
-                    p.denoise = true;
-                    p.denoise_db = db;
+            ui.spacing_mut().slider_width = 300.0;
+            let slider = egui::Slider::new(&mut v, 0.0..=DENOISE_MAX_DB)
+                .step_by(1.0)
+                .fixed_decimals(0)
+                .custom_formatter(|x, _| {
+                    if x < 0.5 {
+                        t("0 关", "0 off").to_string()
+                    } else if x >= DENOISE_MAX_DB as f64 - 0.5 {
+                        t("100 最大", "100 max").to_string()
+                    } else {
+                        format!("{x:.0} dB")
+                    }
+                })
+                .custom_parser(|s| s.trim().split(|c: char| !(c.is_ascii_digit() || c == '.')).find(|w| !w.is_empty()).and_then(|w| w.parse::<f64>().ok()));
+            if ui.add(slider).changed() {
+                p.denoise = v >= 0.5;
+                if p.denoise {
+                    p.denoise_db = v.round();
                 }
-            }
-            let max = p.denoise && p.denoise_db >= DENOISE_MAX_DB;
-            if ui.selectable_label(max, t("最大", "Max")).on_hover_text(t("不设上限，降到最干净", "No limit: as clean as it gets")).clicked() {
-                p.denoise = true;
-                p.denoise_db = DENOISE_MAX_DB;
             }
         });
         let note = if !p.denoise {
-            t("关闭。麦克风或录音有底噪时打开：数值 = 底噪最多压低多少分贝", "Off. Turn it on for a noisy microphone or recording: the value is how many dB the noise is lowered by at most").to_string()
+            t("0 = 关闭。麦克风或录音有底噪时往右拖：数值 = 底噪最多压低多少分贝", "0 = off. Drag right for a noisy microphone or recording: the value is how many dB the noise is lowered by at most").to_string()
         } else if p.denoise_db >= DENOISE_MAX_DB {
             t("不设上限，降到最干净；气声的高频会被削掉一些，很轻的尾音可能被压掉。延迟增加 20 ms", "No limit, as clean as it gets; breathy highs lose a little and very soft tails may be cut. Adds 20 ms of latency").to_string()
         } else {
@@ -662,7 +765,7 @@ impl App {
         egui::CollapsingHeader::new(RichText::new(t("左右移动", "Left / right motion")).strong()).default_open(true).show(ui, |ui| {
             ui.horizontal(|ui| {
                 let before = p.mode;
-                for (m, zh, en) in [(MotionMode::Sweep, "穿梭", "Sweep"), (MotionMode::Random, "随机走位", "Random"), (MotionMode::Orbit, "环绕", "Orbit"), (MotionMode::Static, "固定", "Static")] {
+                for (m, zh, en) in [(MotionMode::Sweep, "穿梭", "Sweep"), (MotionMode::Random, "随机走位", "Random"), (MotionMode::Orbit, "环绕", "Orbit"), (MotionMode::Static, "固定", "Static"), (MotionMode::Manual, "手动", "Manual")] {
                     ui.selectable_value(&mut p.mode, m, t(zh, en));
                 }
                 if p.mode != before {
@@ -696,9 +799,19 @@ impl App {
                     MotionMode::Static => {
                         row(ui, t("方位角", "Azimuth"), t("0 前，90 右，180 后，270 左", "0 front, 90 right, 180 back, 270 left"), egui::Slider::new(&mut p.static_az, 0.0..=359.0).suffix("°").fixed_decimals(0));
                     }
+                    MotionMode::Manual => {
+                        row(ui, t("方位角", "Azimuth"), t("0 前，90 右，180 后，270 左。也可以直接在左边的位置图上拖", "0 front, 90 right, 180 back, 270 left. Or drag on the map at the left"), egui::Slider::new(&mut p.manual_az, 0.0..=359.9).suffix("°").fixed_decimals(0));
+                        let mut cm = (p.manual_dist - HEAD_A) * 100.0;
+                        row(ui, t("离头距离", "Distance from head"), t("声源离头表面多远；在耳朵正侧方时就是离耳朵多远", "Distance from the head surface; at the side this is the distance from the ear"), egui::Slider::new(&mut cm, 0.8..=71.0).logarithmic(true).suffix(" cm").fixed_decimals(1));
+                        p.manual_dist = (HEAD_A + cm / 100.0).clamp(R_MIN, RADAR_MAX_R);
+                        row(ui, t("高度", "Height"), t("以耳朵为支点向上（正）/ 向下（负）偏多少度。也可以拖位置图右侧的竖条", "Above (+) / below (−) the ear, in degrees. Or drag the bar at the right of the map"), egui::Slider::new(&mut p.manual_tilt, -80.0..=85.0).suffix("°").fixed_decimals(0));
+                    }
                 }
                 row(ui, t("响度随位置变化", "Level follows position"), t("1 = 物理真实（贴耳很响、到脸前会弱很多），0 = 处处一样响", "1 = physical (loud at the ear, much quieter in front), 0 = constant"), egui::Slider::new(&mut p.level_follow, 0.0..=1.0).fixed_decimals(2));
             });
+            if p.mode == MotionMode::Manual {
+                ui.add(egui::Label::new(RichText::new(t("手动：声源停在你摆的位置，在左边的位置图上拖动。忽远忽近、上下、自然晃动此时不起作用", "Manual: the source stays where you put it; drag it on the map at the left. Near / far sway, up / down and micro motion are inactive")).weak().small()).wrap());
+            }
             if matches!(p.mode, MotionMode::Sweep) {
                 ui.horizontal(|ui| {
                     ui.label(t("换边时从哪里绕", "Cross via"));
@@ -713,6 +826,9 @@ impl App {
     /// 右侧第二栏：忽远忽近、KU100 临场感、人声处理、输出。
     fn params_right(ui: &mut egui::Ui, p: &mut Params) {
         egui::CollapsingHeader::new(RichText::new(t("忽远忽近", "Near / far sway")).strong()).default_open(true).show(ui, |ui| {
+            if p.mode == MotionMode::Manual {
+                ui.disable(); // 手动摆位时不起作用
+            }
             egui::Grid::new("g3").num_columns(2).min_col_width(COL).spacing([10.0, 6.0]).show(ui, |ui| {
                 row(ui, t("幅度", "Amount"), t("随机地凑近、往后让的幅度（0 = 关闭）", "How far it leans in and out (0 = off)"), egui::Slider::new(&mut p.sway, 0.0..=2.0).fixed_decimals(2));
                 row(ui, t("节奏", "Period"), t("说话时一次凑近—退开大约几秒", "Seconds of speech per lean-out / lean-in cycle"), egui::Slider::new(&mut p.sway_period, 2.0..=14.0).suffix(" s").fixed_decimals(1));
@@ -724,6 +840,9 @@ impl App {
             });
         });
         egui::CollapsingHeader::new(RichText::new(t("上下", "Up / down")).strong()).default_open(true).show(ui, |ui| {
+            if p.mode == MotionMode::Manual {
+                ui.disable(); // 手动摆位时不起作用（高度在"左右移动"里调，或拖位置图右侧的竖条）
+            }
             egui::Grid::new("g7").num_columns(2).min_col_width(COL).spacing([10.0, 6.0]).show(ui, |ui| {
                 row(ui, t("高度", "Height"), t("嘴相对耳朵向上（正）/ 向下（负）偏多少度，离耳朵的距离不变；0 = 与耳朵齐平", "Mouth above (+) / below (−) the ear, in degrees, at the same distance from the ear; 0 = level with the ear"), egui::Slider::new(&mut p.height, -60.0..=75.0).suffix("°").fixed_decimals(0));
                 row(ui, t("自动上下", "Auto up / down"), t("嘴在耳朵上方 / 下方之间慢慢换位置的幅度（0 = 关闭）", "How far the mouth drifts above / below the ear on its own (0 = off)"), egui::Slider::new(&mut p.updown, 0.0..=60.0).suffix("°").fixed_decimals(0));
@@ -780,6 +899,21 @@ impl App {
     /// 每帧的后台事务：参数同步、试听解码完成、转换完成、设备出错。
     fn poll(&mut self, ctx: &egui::Context) {
         ENGLISH.store(self.s.english, Ordering::Relaxed);
+        let mode = self.s.params.mode;
+        if mode != self.last_mode {
+            if mode == MotionMode::Manual {
+                self.auto_mode = self.last_mode;
+                if self.rt.is_some() {
+                    // 运行中切到手动：声源就停在此刻所在的位置，从这里开始拖
+                    let (up, az, dist) = up_angle(self.tele.az, self.tele.el, self.tele.r);
+                    let p = &mut self.s.params;
+                    p.manual_az = az;
+                    p.manual_dist = dist.clamp(R_MIN, RADAR_MAX_R);
+                    p.manual_tilt = up.clamp(-80.0, 85.0);
+                }
+            }
+            self.last_mode = mode;
+        }
         if self.s.params != self.sent {
             let cfg = Arc::new(EngineConfig::new(self.s.params.clone(), Some(&self.cfg)));
             if let Some(rt) = &self.rt {
@@ -871,6 +1005,22 @@ impl App {
 }
 
 impl eframe::App for App {
+    /// 截图自检时模拟一次鼠标拖动（环境变量 AUTO_ASMR_SHOT_DRAG="x0,y0,x1,y1"，窗口坐标）：
+    /// 第 5 帧在 (x0, y0) 按下，之后几帧移到 (x1, y1)，第 13 帧松开；截图在第 20 帧。
+    fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if let (Some((_, frame)), Some([x0, y0, x1, y1])) = (&self.shot, self.shot_drag) {
+            let (a, b) = (egui::pos2(x0, y0), egui::pos2(x1, y1));
+            let button = |pos, pressed| egui::Event::PointerButton { pos, button: egui::PointerButton::Primary, pressed, modifiers: Default::default() };
+            match *frame {
+                4 => raw.events.push(egui::Event::PointerMoved(a)),
+                5 => raw.events.push(button(a, true)),
+                6..=12 => raw.events.push(egui::Event::PointerMoved(a + (b - a) * ((*frame - 5) as f32 / 7.0))),
+                13 => raw.events.push(button(b, false)),
+                _ => {}
+            }
+        }
+    }
+
     fn ui(&mut self, ui: &mut egui::Ui, _frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
         self.poll(&ctx);
@@ -931,9 +1081,13 @@ impl eframe::App for App {
             self.start_preview();
         }
         let wait = if self.file_in.is_some() { 150 } else { 20 };
+        let drag_note = self.shot_drag.map(|_| format!("手动位置：方位角 {:.1}°，到头中心 {:.3} m，高度 {:.1}°", self.s.params.manual_az, self.s.params.manual_dist, self.s.params.manual_tilt));
         if let Some((path, frames)) = &mut self.shot {
             *frames += 1;
             if *frames == wait {
+                if let Some(n) = &drag_note {
+                    eprintln!("{n}");
+                }
                 let path = path.clone();
                 let c2 = ctx.clone();
                 ctx.request_screenshot(move |img| {
@@ -960,4 +1114,38 @@ fn save_png(path: &PathBuf, img: &egui::ColorImage) -> Result<(), String> {
     let mut w = enc.write_header().map_err(|e| e.to_string())?;
     let bytes: Vec<u8> = img.pixels.iter().flat_map(|c| c.to_array()).collect();
     w.write_image_data(&bytes).map_err(|e| e.to_string())
+}
+
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn radar_pick_is_the_inverse_of_the_drawing_scale() {
+        let rmax = 90.0;
+        for &(az, r) in &[(0.0f32, 0.3f32), (90.0, 0.105), (200.0, 0.5), (315.0, 0.8), (270.0, R_MIN)] {
+            // 画的时候：方位角顺时针、上 = 正前方，半径 = radar_map(r) * rmax
+            let a = az.to_radians();
+            let d = egui::vec2(a.sin(), -a.cos()) * (radar_map(r) * rmax);
+            let (az2, r2) = radar_pick(d, rmax);
+            assert!(((az2 - az + 180.0).rem_euclid(360.0) - 180.0).abs() < 0.05, "az {az} -> {az2}");
+            assert!((r2 / r - 1.0).abs() < 1e-3, "r {r} -> {r2}");
+        }
+        // 拖进头里：停在头外面；拖出图外：停在图的边缘
+        assert_eq!(radar_pick(egui::vec2(1.0, 0.0), rmax).1, R_MIN);
+        assert!((radar_pick(egui::vec2(0.0, -500.0), rmax).1 - RADAR_MAX_R).abs() < 1e-5);
+    }
+
+    #[test]
+    fn up_angle_undoes_lift_tilt() {
+        // 手动的三个量（方位角, 距离, 高度）→ 三维位置 → 再换回来
+        for &(az, dist, tilt) in &[(90.0f32, 0.105f32, 45.0f32), (260.0, 0.15, -30.0), (0.0, 0.5, 30.0), (135.0, 0.3, 60.0), (300.0, 0.12, 0.0)] {
+            let (a3, e3, r3) = lift_tilt(az, dist, 0.0, tilt);
+            let (up, az2, dist2) = up_angle(a3, e3, r3);
+            assert!((up - tilt).abs() < 0.2, "tilt {tilt} -> {up}");
+            assert!(((az2 - az + 180.0).rem_euclid(360.0) - 180.0).abs() < 0.2, "az {az} -> {az2}");
+            assert!((dist2 - dist).abs() < 5e-4, "dist {dist} -> {dist2}");
+        }
+    }
 }

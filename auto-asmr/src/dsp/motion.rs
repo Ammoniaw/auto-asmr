@@ -30,6 +30,26 @@ pub struct Pose {
 ///     上下挪。支点随声源的侧向程度在两耳之间滑动：声源在正侧方时支点就是那只耳朵，在正前 / 正后方时是头中心
 ///     （这时就是普通的仰角）。从头顶绕到最高处时 `tilt` 不起作用。
 ///
+/// 手动模式：位置（方位角, 仰角, 距离）朝目标走一个控制块。时间常数约 0.1 秒，拖动时跟手；
+/// 同时限制最快速度（方位角每秒 300°、仰角每秒 240°、距离每秒 1.2 米），所以一下子点到另一侧时
+/// 声音是用大约 0.6 秒很快地绕过去，而不是跳过去——跳变会产生咔嗒声。按真实时间走，与说不说话无关。
+fn approach(cur: (f32, f32, f32), tgt: (f32, f32, f32)) -> (f32, f32, f32) {
+    const TAU_S: f32 = 0.10;
+    let k = 1.0 - (-CTRL_DT / TAU_S).exp();
+    let step = |err: f32, cap_per_s: f32| (k * err).clamp(-cap_per_s * CTRL_DT, cap_per_s * CTRL_DT);
+    let daz = (tgt.0 - cur.0 + 180.0).rem_euclid(360.0) - 180.0;
+    ((cur.0 + step(daz, 300.0)).rem_euclid(360.0), cur.1 + step(tgt.1 - cur.1, 240.0), cur.2 + step(tgt.2 - cur.2, 1.2))
+}
+
+/// 两个位置（方位角, 仰角, 距离）之间按比例 `s` 过渡，方位角走近的那一边。
+fn mix_pos(a: (f32, f32, f32), b: (f32, f32, f32), s: f32) -> (f32, f32, f32) {
+    let d = (b.0 - a.0 + 180.0).rem_euclid(360.0) - 180.0;
+    ((a.0 + d * s).rem_euclid(360.0), a.1 + (b.1 - a.1) * s, a.2 + (b.2 - a.2) * s)
+}
+
+/// 从手动切回自动后，用这么久（秒）平滑过渡到自动的走位。
+const MANUAL_LEAVE_S: f32 = 0.6;
+
 /// 两者都为 0 时原样返回，仰角为 0。
 pub fn lift_tilt(az: f32, r: f32, lift: f32, tilt: f32) -> (f32, f32, f32) {
     if lift == 0.0 && tilt == 0.0 {
@@ -120,6 +140,13 @@ pub struct Motion {
     ud_init: bool,
     micro_z: [(f32, f32, f32); 4],
     micro_z_norm: f32,
+    // 手动摆位
+    /// 上一步输出的位置（方位角, 仰角, 距离）：切到手动时从这里出发。
+    last: (f32, f32, f32),
+    /// 手动模式下平滑后的当前位置。
+    man: Option<(f32, f32, f32)>,
+    /// 刚从手动切回自动：（切换时的位置, 已经过去的秒数）。
+    leave: Option<((f32, f32, f32), f32)>,
     /// 统计：换耳次数、往后让的次数、从头顶绕的次数、上下换位的次数。
     pub n_moves: u32,
     pub n_sways: u32,
@@ -182,6 +209,9 @@ impl Motion {
             ud_init: false,
             micro_z,
             micro_z_norm: pz.sqrt(),
+            last: (270.0, 0.0, 0.105),
+            man: None,
+            leave: None,
             n_moves: 0,
             n_sways: 0,
             n_tops: 0,
@@ -262,6 +292,7 @@ impl Motion {
                     self.r = p.ear_dist;
                 }
             }
+            MotionMode::Manual => {} // 手动模式不排计划，见 step_manual
         }
         if self.mode.is_none() {
             // 开场直接就位，不从默认位置移过去
@@ -443,9 +474,38 @@ impl Motion {
         v0 + (v1 - v0) * smoothstep(((tm - t0) / (t1 - t0).max(1e-6)) as f32)
     }
 
+    /// 手动模式的一步：位置跟着用户拖到的目标走，没有任何自动移动。
+    fn step_manual(&mut self, p: &Params) -> Pose {
+        let tgt = lift_tilt(p.manual_az.rem_euclid(360.0), p.manual_dist.clamp(R_MIN, R_MAX), 0.0, p.manual_tilt.clamp(-80.0, 85.0));
+        let cur = match (self.man, self.mode) {
+            (Some(c), _) => c,
+            (None, None) => tgt,          // 开场：直接就位
+            (None, Some(_)) => self.last, // 从自动切过来：从当前位置出发，不跳
+        };
+        let now = approach(cur, tgt);
+        self.man = Some(now);
+        self.leave = None;
+        self.segs.clear();
+        self.lift = 0.0;
+        self.mode = Some(MotionMode::Manual);
+        self.last = now;
+        Pose { az: now.0, el: now.1, r: now.2, r_base: now.2, az_base: now.0, el_base: now.1 }
+    }
+
     /// 推进到说话时钟 `tm`（秒），返回这个边界上的位置。
     /// `amp`：晃动幅度倍数（随音量）；`follow_db`：说话音量包络（dB，相对中位）。
     pub fn step(&mut self, p: &Params, tm: f64, amp: f32, follow_db: f32) -> Pose {
+        if p.mode == MotionMode::Manual {
+            return self.step_manual(p);
+        }
+        if self.mode == Some(MotionMode::Manual) {
+            // 刚从手动切回自动：自动的走位从手动摆的位置接着走，并在 0.6 秒内平滑过渡过去
+            if let Some(m) = self.man.take() {
+                self.leave = Some((m, 0.0));
+            }
+            self.az = p.manual_az.rem_euclid(360.0);
+            self.r = p.manual_dist.clamp(R_MIN, R_MAX);
+        }
         if self.mode != Some(p.mode) {
             self.reset_plan(p, tm);
         }
@@ -476,7 +536,7 @@ impl Motion {
                     self.push_move(tm, 1.2, p.static_az, p.ear_dist, Some(true), None);
                 }
             }
-            MotionMode::Orbit => {}
+            MotionMode::Orbit | MotionMode::Manual => {}
         }
         // 走完已经结束的移动，求当前位置
         self.lift = 0.0;
@@ -563,7 +623,22 @@ impl Motion {
         let tilt = tilt.clamp(-80.0, 85.0);
         let (az3, el, r3) = lift_tilt(az, r, self.lift, tilt);
         let (az_base, el_base, rb) = lift_tilt(az, r_base, self.lift, tilt);
-        Pose { az: az3, el, r_base: rb, r: r3, az_base, el_base }
+        let mut pose = Pose { az: az3, el, r_base: rb, r: r3, az_base, el_base };
+        if let Some((hold, t)) = self.leave {
+            // 从手动切回来的头 0.6 秒：从切换时的位置平滑过渡到自动的走位
+            let t = t + CTRL_DT;
+            let s = smoothstep(t / MANUAL_LEAVE_S);
+            if s >= 1.0 {
+                self.leave = None;
+            } else {
+                self.leave = Some((hold, t));
+                let now = mix_pos(hold, (pose.az, pose.el, pose.r), s);
+                let base = mix_pos(hold, (pose.az_base, pose.el_base, pose.r_base), s);
+                pose = Pose { az: now.0, el: now.1, r: now.2, r_base: base.2, az_base: base.0, el_base: base.1 };
+            }
+        }
+        self.last = (pose.az, pose.el, pose.r);
+        pose
     }
 }
 
@@ -725,6 +800,92 @@ mod tests {
         }
         assert!(m.n_updowns >= 12, "updowns {}", m.n_updowns);
         assert!(up > 3000 && down > 3000, "up {up} down {down}");
+    }
+
+    /// 位置换成直角坐标（米）。
+    fn xyz(p: &Pose) -> [f32; 3] {
+        let (a, e) = (p.az.to_radians(), p.el.to_radians());
+        [p.r * e.cos() * a.sin(), p.r * e.cos() * a.cos(), p.r * e.sin()]
+    }
+
+    fn dist(a: [f32; 3], b: [f32; 3]) -> f32 {
+        ((a[0] - b[0]).powi(2) + (a[1] - b[1]).powi(2) + (a[2] - b[2]).powi(2)).sqrt()
+    }
+
+    #[test]
+    fn manual_follows_the_target_without_jumps() {
+        let mut p = Params::default();
+        p.mode = MotionMode::Manual;
+        (p.manual_az, p.manual_dist, p.manual_tilt) = (270.0, 0.105, 0.0);
+        let mut m = Motion::new(1);
+        // 开场直接就位；目标不动时位置纹丝不动（没有晃动、忽远忽近、自动上下）
+        let first = m.step(&p, 0.0, 1.0, 0.0);
+        assert!((first.az - 270.0).abs() < 1e-3 && (first.r - 0.105).abs() < 1e-6 && first.el == 0.0);
+        for _ in 0..2000 {
+            let q = m.step(&p, 0.0, 1.6, 9.0);
+            assert!(dist(xyz(&q), xyz(&first)) < 1e-6);
+            assert_eq!(q.r, q.r_base);
+        }
+        // 一下子点到右耳：很快地绕过去，但每个控制块只挪一点点（不是跳过去），全程不进头里。
+        // 说话时钟不走（tm 不变）也照样动：手动摆位按真实时间走
+        (p.manual_az, p.manual_dist, p.manual_tilt) = (90.0, 0.105, 30.0);
+        let (mut prev, mut step_max, mut passed_mid) = (xyz(&first), 0f32, false);
+        let mut settle = None;
+        for i in 0..(1.5 / CTRL_DT) as usize {
+            let q = m.step(&p, 0.0, 1.0, 0.0);
+            assert!(q.r >= R_MIN - 1e-6);
+            let v = xyz(&q);
+            step_max = step_max.max(dist(v, prev));
+            prev = v;
+            passed_mid |= q.az < 20.0 || q.az > 340.0 || (q.az - 180.0).abs() < 20.0;
+            if settle.is_none() && (q.az - 90.0).abs() < 1.0 {
+                settle = Some(i as f32 * CTRL_DT);
+            }
+        }
+        assert!(step_max < 0.002, "largest step {step_max} m");
+        assert!(passed_mid, "should travel around the head");
+        assert!(settle.map_or(false, |t| t > 0.3 && t < 1.0), "settle {settle:?}");
+        // 到位后高度也到了：从右耳看，嘴在上方约 30°
+        let (x, z) = (prev[0], prev[2]);
+        assert!((z.atan2(x - HEAD_A).to_degrees() - 30.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn switching_between_auto_and_manual_is_continuous() {
+        let mut p = Params::default();
+        let mut m = Motion::new(1);
+        let mut tm = 0.0f64;
+        let (mut prev, mut step_max) = (None::<[f32; 3]>, 0f32);
+        let run = |m: &mut Motion, p: &Params, secs: f32, tm: &mut f64, prev: &mut Option<[f32; 3]>, step_max: &mut f32| {
+            for _ in 0..(secs / CTRL_DT) as usize {
+                let q = m.step(p, *tm, 1.0, 0.0);
+                assert!(q.r >= R_MIN - 1e-6 && q.r <= R_MAX);
+                let v = xyz(&q);
+                if let Some(o) = *prev {
+                    *step_max = step_max.max(dist(v, o));
+                }
+                *prev = Some(v);
+                *tm += clock_step(1.0, 0.13);
+            }
+        };
+        // 自动穿梭 4 秒 → 手动摆到右前方 40 cm、向上 40° → 3 秒后回到自动
+        run(&mut m, &p, 4.0, &mut tm, &mut prev, &mut step_max);
+        let moves_before = m.n_moves;
+        p.mode = MotionMode::Manual;
+        (p.manual_az, p.manual_dist, p.manual_tilt) = (40.0, 0.4, 40.0);
+        run(&mut m, &p, 3.0, &mut tm, &mut prev, &mut step_max);
+        let held = prev.unwrap();
+        let want = {
+            let (az, el, r) = lift_tilt(40.0, 0.4, 0.0, 40.0);
+            xyz(&Pose { az, el, r, ..Default::default() })
+        };
+        assert!(dist(held, want) < 0.002, "manual position not reached: {held:?} vs {want:?}");
+        assert_eq!(m.n_moves, moves_before); // 手动时不再自动换耳
+        p.mode = MotionMode::Sweep;
+        run(&mut m, &p, 12.0, &mut tm, &mut prev, &mut step_max);
+        assert!(m.n_moves > moves_before, "sweeps should resume");
+        // 两次切换都没有跳变：最快也就是手动跟随的限速（40 cm 处每块约 4 mm）
+        assert!(step_max < 0.006, "largest step {step_max} m");
     }
 
     #[test]

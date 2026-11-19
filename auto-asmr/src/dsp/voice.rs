@@ -251,15 +251,19 @@ mod tests {
 
     #[test]
     fn denoise_strength_is_a_fixed_number_of_db() {
-        use crate::dsp::params::{DENOISE_MAX_DB, DENOISE_STEPS};
+        use crate::dsp::params::DENOISE_MAX_DB;
+        const DENOISE_STEPS: [f32; 5] = [6.0, 12.0, 18.0, 24.0, 30.0];
         // 稳定的低频底噪（风扇 / 空调一类），降噪器自己能把它压得很干净：设多少分贝就降多少分贝
         let fan = noise(6 * 48000, -40.0, false);
         for db in DENOISE_STEPS {
             let att = attenuation(&fan, db);
             assert!((att - db).abs() < 0.6, "set {db} dB, got {att} dB");
         }
-        // "最大"不设上限，比 30 dB 那一档干净得多
+        // 拖到头（100）不设上限，比 30 dB 干净得多；60 以上降噪器自己已经到底，差别很小
         assert!(attenuation(&fan, DENOISE_MAX_DB) > 40.0);
+        assert!(attenuation(&fan, 60.0) > 40.0);
+        // 0 就是原样通过
+        assert!(attenuation(&fan, 0.0).abs() < 0.01);
         // 嘶嘶的白噪声，降噪器自己只能压低二十多分贝：实际降的不会超过设定值，小档位仍然基本到位
         let hiss = noise(6 * 48000, -55.0, true);
         for db in DENOISE_STEPS {

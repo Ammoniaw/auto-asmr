@@ -49,7 +49,7 @@ convert 的选项（括号里是默认值）：
   --room none|real        KU100 实测真实房间（none）    --wet <dB>（-3）
   --headphone diffuse|native|<型号>   回放补偿（diffuse）；--headphone list 列出型号
  人声处理
-  --denoise [dB]          输入降噪 RNNoise（关）。数值 = 底噪最多压低多少 dB，如 12；不写数值 = 降到最干净
+  --denoise [0–100]       输入降噪 RNNoise（关）。数值 = 底噪最多压低多少 dB，如 12；不写数值或 100 = 降到最干净
   --gate <dBFS>           响应阈值，低于它当作静音（关）
   --deess <dB>            去齿音最多压低（0）       --soft-voice <x>   轻声化（0）
  输出
@@ -247,7 +247,8 @@ fn run_convert(args: &[String]) -> Result<(), String> {
             "--denoise" => {
                 p.denoise = true;
                 if let Some(v) = it.peek().and_then(|s| s.parse::<f32>().ok()) {
-                    p.denoise_db = v.clamp(1.0, crate::dsp::params::DENOISE_MAX_DB);
+                    p.denoise = v > 0.0; // 0 = 关闭
+                    p.denoise_db = v.clamp(0.0, crate::dsp::params::DENOISE_MAX_DB);
                     it.next();
                 }
             }
@@ -307,7 +308,8 @@ fn run_convert(args: &[String]) -> Result<(), String> {
 /// 调试用：不经过声卡，把一个文件按"主播模式"（实时引擎：没有预读、说话检测现学现用）跑一遍，
 /// 打印走位统计；可以模拟小音量麦克风（--gain）、底噪（--noise）、说得少（--sparse）、开头静音（--lead）。
 ///   auto-asmr rt-sim <音频> [--duration 秒] [--gain dB] [--noise dBFS] [--sparse 说秒/停秒] [--lead 秒]
-///                    [--style ku100] [--mode …] [--pause-motion x] [--denoise [dB]] [-o 输出.wav]
+///                    [--style ku100] [--mode …] [--pause-motion x] [--denoise [dB]] [--no-level]
+///                    [--manual "秒:方位角,距离,高度;…;秒:auto"] [-o 输出.wav]
 fn run_rt_sim(args: &[String]) -> Result<(), String> {
     let mut p = Params::default();
     if let Some(i) = args.iter().position(|a| a == "--style") {
@@ -384,13 +386,46 @@ fn run_rt_sim(args: &[String]) -> Result<(), String> {
             *v += a * ((seed >> 8) as f32 / (1u32 << 23) as f32 - 1.0);
         }
     }
-    let cfg = Arc::new(EngineConfig::new(p, None));
-    let mut eng = Engine::new(cfg, PostMode::Realtime, 0.0);
+    if args.iter().any(|a| a == "--no-level") {
+        p.auto_level = false;
+    }
+    // --manual "0:270,0.105,0;3:90,0.105,30;6:auto"：按时间表（秒:方位角,到头中心的距离,高度）切到手动并摆位，
+    // "auto" 切回自动——用来测试手动摆位
+    let mut script: Vec<(f32, Option<[f32; 3]>)> = get("--manual")
+        .map(|s| {
+            s.split(';')
+                .filter_map(|e| {
+                    let (t, v) = e.split_once(':')?;
+                    let t = t.trim().parse::<f32>().ok()?;
+                    if v.trim() == "auto" {
+                        return Some((t, None));
+                    }
+                    let f: Vec<f32> = v.split(',').filter_map(|x| x.trim().parse().ok()).collect();
+                    (f.len() >= 2).then(|| (t, Some([f[0], f[1], f.get(2).copied().unwrap_or(0.0)])))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let auto_mode = p.mode;
+    let mut cur = p.clone();
+    let mut cfg = Arc::new(EngineConfig::new(p, None));
+    let mut eng = Engine::new(cfg.clone(), PostMode::Realtime, 0.0);
     eng.set_live(!args.iter().any(|a| a == "--strict")); // --strict：动作严格跟着说话（试听 / 修复前的行为）
     eng.trace = Some(Vec::new());
     let (mut l, mut r) = (vec![0f32; x.len()], vec![0f32; x.len()]);
     for (i, c) in x.chunks(128).enumerate() {
         let o = i * 128;
+        while script.first().map_or(false, |e| e.0 <= o as f32 / FS) {
+            match script.remove(0).1 {
+                Some([az, d, tilt]) => {
+                    cur.mode = MotionMode::Manual;
+                    (cur.manual_az, cur.manual_dist, cur.manual_tilt) = (az, d, tilt);
+                }
+                None => cur.mode = auto_mode,
+            }
+            cfg = Arc::new(EngineConfig::new(cur.clone(), Some(&cfg)));
+            eng.set_config(cfg.clone());
+        }
         eng.process(c, &mut l[o..o + c.len()], &mut r[o..o + c.len()]);
     }
     let tr = eng.trace.take().unwrap_or_default();
