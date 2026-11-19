@@ -1,0 +1,65 @@
+//! 信号处理核心：与 Python 版 `asmr_binaural.py` 同一套算法，改写成可以逐块流式运行的形式，
+//! 实时模式和文件模式共用同一个 [`engine::Engine`]。
+
+pub mod analysis;
+pub mod direct;
+pub mod dynamics;
+pub mod engine;
+pub mod filters;
+pub mod motion;
+pub mod params;
+pub mod resample;
+pub mod rng;
+pub mod room;
+pub mod tables;
+pub mod voice;
+
+/// 内部处理采样率（HRIR 数据的采样率）。
+pub const FS: f32 = 48_000.0;
+pub const FS_USIZE: usize = 48_000;
+/// 声速 m/s。
+pub const C: f32 = 343.0;
+/// 球头半径（与 KU100 耳间距一致），米。
+pub const HEAD_A: f32 = 0.0875;
+/// 声源到头中心的最小 / 最大距离，米。
+pub const R_MIN: f32 = 0.095;
+pub const R_MAX: f32 = 3.0;
+/// 贴耳轻语时嘴到头中心的距离（离耳朵约 1.7 cm）。
+pub const EAR_R: f32 = 0.105;
+/// 最小相位 HRIR 长度。
+pub const NTAP: usize = 128;
+/// 控制块长度：每 64 个样本（1.33 ms）更新一次位置和滤波器。
+pub const CTRL: usize = 64;
+/// 一个控制块的时长，秒。
+pub const CTRL_DT: f32 = CTRL as f32 / FS;
+
+#[inline]
+pub fn db_to_lin(db: f32) -> f32 {
+    10f32.powf(db / 20.0)
+}
+
+#[inline]
+pub fn lin_to_db(x: f32) -> f32 {
+    20.0 * x.max(1e-10).log10()
+}
+
+#[inline]
+pub fn smoothstep(s: f32) -> f32 {
+    let s = s.clamp(0.0, 1.0);
+    s * s * (3.0 - 2.0 * s)
+}
+
+/// x86 上把"非规格化数"当 0 处理（FTZ / DAZ）：输入静音时，滤波器的状态会衰减成极小的数，
+/// 不处理的话这类数的运算会慢几十倍，实时线程可能因此爆音。ARM 上硬件直接处理，不需要。
+#[cfg(target_arch = "x86_64")]
+pub fn flush_denormals() {
+    let mut csr: u32 = 0;
+    unsafe {
+        std::arch::asm!("stmxcsr [{}]", in(reg) &mut csr, options(nostack));
+        csr |= 0x8040; // FTZ | DAZ
+        std::arch::asm!("ldmxcsr [{}]", in(reg) &csr, options(nostack, readonly));
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+pub fn flush_denormals() {}

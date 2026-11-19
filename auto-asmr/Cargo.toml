@@ -1,0 +1,29 @@
+[package]
+name = "auto-asmr"
+version = "0.1.0"
+edition = "2021"
+description = "KU100 双耳 ASMR 空间化：实时（主播用）+ 音频文件转换，纯 CPU"
+
+[dependencies]
+# DSP
+rustfft = "6.4"
+realfft = "3.5"
+nnnoiseless = { version = "0.5", default-features = false }
+# 音频输入输出
+cpal = "0.18"
+symphonia = { version = "0.5", features = ["all"] }
+hound = "3.5"
+# 界面
+eframe = { version = "0.37", features = ["persistence", "glow"] }
+rfd = "0.18"
+serde = { version = "1", features = ["derive"] }
+png = "0.18"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+
+[profile.dev]
+opt-level = 2

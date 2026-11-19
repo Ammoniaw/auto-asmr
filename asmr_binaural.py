@@ -959,23 +959,69 @@ def traj_path(t, path: Path):
     return tr.az, tr.r, len(keys)
 
 
-def add_micro(az, r, t, rng, sigma):
-    """人体自然晃动：笛卡尔坐标里叠加几条慢速正弦（0.06–0.45 Hz），默认 RMS 1.2 cm。"""
+def speech_activity(x: np.ndarray, t: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    """说话活动（0–1；词与词之间不到 0.3 s 的空隙算作还在说）和此刻音量（dB，相对说话时的中位数，
+    约 0.3 s 平滑，停顿里保持），在块边界 t 上取值。"""
+    hop = int(0.05 * FS)
+    n = len(x) // hop
+    if n < 20:
+        return np.ones(len(t)), np.zeros(len(t))
+    v = signal.sosfilt(signal.butter(2, [150, 5000], "band", fs=FS, output="sos"), x)
+    e = 10 * np.log10(np.mean(np.square(v[:n * hop].reshape(n, hop), dtype=np.float64), axis=1) + 1e-12)
+    act = e > max(np.percentile(e, 97) - 30.0, np.percentile(e, 20) + 6.0)
+    if act.sum() < 10:
+        return np.ones(len(t)), np.zeros(len(t))
+    a = act.astype(float)
+    idx = np.nonzero(act)[0]
+    for i0, g in zip(idx[:-1], np.diff(idx)):
+        if 1 < g <= 6:
+            a[i0 + 1:i0 + g] = 1.0
+    a = np.clip(signal.sosfiltfilt(signal.butter(2, 2.0, fs=1.0 / 0.05, output="sos"), a), 0.0, 1.0)
+    d = e - np.median(e[act])
+    lf = np.empty(n)
+    cur = 0.0
+    for i in range(n):
+        if act[i]:
+            cur = d[i]
+        lf[i] = cur
+    lf = signal.sosfiltfilt(signal.butter(2, 1.5, fs=1.0 / 0.05, output="sos"), lf)
+    tc = (np.arange(n) + 0.5) * hop / FS
+    return np.interp(t, tc, a), np.interp(t, tc, lf)
+
+
+def speech_clock(t: np.ndarray, act: np.ndarray, idle: float) -> np.ndarray:
+    """说话时钟：说话时按真实时间走，停顿时只走 idle 倍。用它驱动晃动和凑近 / 退开，动作就发生在
+    说话的时候，停顿里几乎不动，下一句从上一句停下的位置接着说，不会"跳"一下
+    （Hadar 等 1983：说话时 89.9% 的时间头在动，不说话时只有 12.8%）。"""
+    g = idle + (1.0 - idle) * act
+    return np.concatenate([[0.0], np.cumsum(0.5 * (g[1:] + g[:-1]) * np.diff(t))])
+
+
+def add_micro(az, r, t, rng, sigma, clock=None, amp=None, act=None):
+    """人体自然晃动：笛卡尔坐标里叠加几条慢速正弦（0.06–0.45 Hz），默认 RMS 1.2 cm。
+    clock：说话时钟（停顿时几乎不动）；amp：动作幅度随音量变化（声音大时动得多，Hadar 等 1983），
+    此时按说话时段（act）把 RMS 定为 sigma。两者都不给时与旧版完全相同。"""
     X = r * np.sin(np.radians(az))
     Y = r * np.cos(np.radians(az))
     if sigma > 0:
+        tt = t if clock is None else clock
         for arr in (X, Y):
             fq, ph, am = rng.uniform(0.06, 0.45, 4), rng.uniform(0, 2 * np.pi, 4), rng.uniform(0.5, 1.0, 4)
-            s = (am[:, None] * np.sin(2 * np.pi * fq[:, None] * t[None, :] + ph[:, None])).sum(0)
-            arr += s / (s.std() + 1e-12) * sigma
+            s = (am[:, None] * np.sin(2 * np.pi * fq[:, None] * tt[None, :] + ph[:, None])).sum(0)
+            if amp is None:
+                arr += s / (s.std() + 1e-12) * sigma
+            else:
+                s = s * amp
+                ref = s[act > 0.5] if act is not None and np.count_nonzero(act > 0.5) > 10 else s
+                arr += s / (ref.std() + 1e-12) * sigma
     return np.degrees(np.arctan2(X, Y)) % 360.0, np.clip(np.hypot(X, Y), R_MIN, R_MAX)
 
 
 def speech_loudness(x: np.ndarray, t: np.ndarray) -> np.ndarray:
     """说话人此刻的音量（dB，相对说话时的中位数），在块边界 t 上取值，供"声音大就退远一点"使用。
-    语音频段 50 ms 能量，只在说话时更新，停顿里保持、停久了慢慢回到中位。再做"提前让开、慢慢回来"
-    的包络：响的字到来前约 0.8 s 就开始往后让（每 6 dB），说完后约 2.5 s 才凑回来（每 6 dB），
-    不会贴着耳朵炸出来，也不会一下子弹回耳边。"""
+    语音频段 50 ms 能量，只在说话时更新，停顿里保持不动。再做"提前让开、慢慢回来"的包络：
+    响的字到来前约 0.8 s 就开始往后让（每 6 dB），之后只在说话时慢慢凑回来（约 2.5 s / 6 dB），
+    不会贴着耳朵炸出来，不会一下子弹回耳边，也不会在停顿里偷偷挪位置。"""
     hop = int(0.05 * FS)
     n = len(x) // hop
     if n < 20:
@@ -991,13 +1037,14 @@ def speech_loudness(x: np.ndarray, t: np.ndarray) -> np.ndarray:
     d = 10 * np.log10(np.maximum(num, 1e-30) / np.maximum(den, 1e-9))
     d -= np.median(d[act])
     out = np.empty(n)
-    cur, relax = 0.0, math.exp(-0.05 / 1.5)
+    cur = 0.0
     for i in range(n):
-        cur = d[i] if act[i] else cur * relax
+        if act[i]:
+            cur = d[i]
         out[i] = cur
     att, rel = 6.0 * 0.05 / 0.8, 6.0 * 0.05 / 2.5        # 每帧最多变化多少 dB：提前让开快、回来慢
     for i in range(1, n):
-        out[i] = max(out[i], out[i - 1] - rel)
+        out[i] = max(out[i], out[i - 1] - (rel if act[i] else 0.0))
     for i in range(n - 2, -1, -1):
         out[i] = max(out[i], out[i + 1] - att)
     out -= np.median(out[act])
@@ -1008,8 +1055,9 @@ def speech_loudness(x: np.ndarray, t: np.ndarray) -> np.ndarray:
 def sway_gestures(t: np.ndarray, rng, period: float) -> tuple[np.ndarray, int]:
     """有节奏又不固定的"凑近—退开"：贴着耳朵停一会儿 → 慢慢往后让 → 稍停 → 再慢慢凑回来，循环往复。
     每段时长和退开的深浅都随机（偶尔只让一点，偶尔退得更远），凑回来比退开慢（逼近更引人注意，
-    Neuhoff 1998；进入身体周围空间时触觉增强，Canzoneri 2012）。一个来回的中位数约 period 秒
-    （KU100 实录 4–23 s，中位约 9 s）。返回离耳距离相对基准的倍数（log2，倍频程）和退开次数。"""
+    Neuhoff 2016；进入身体周围空间时触觉增强，Canzoneri 2012）；贴近时至少停 2 s（Koumura 等 2021：
+    战栗感比声音滞后约 2 s）。一个来回约 period 秒；t 用说话时钟时，停顿会让动作停住，实际更长
+    （KU100 实录 2–23 s）。返回离耳距离相对基准的倍数（log2，倍频程）和退开次数。"""
     T = float(t[-1])
     sc = max(period, 1.0) / 8.0
     u0 = rng.uniform(-0.3, 0.1)
@@ -1027,7 +1075,7 @@ def sway_gestures(t: np.ndarray, rng, period: float) -> tuple[np.ndarray, int]:
         tc += rng.uniform(1.6, 3.4) * sc * slow
         u_in = rng.uniform(-0.4, 0.1)
         keys.append((tc, u_in))
-        tc += min(7.0, math.exp(rng.normal(math.log(2.5), 0.45))) * sc
+        tc += max(2.0, min(7.0, math.exp(rng.normal(math.log(2.6), 0.4))) * sc)
         keys.append((tc, float(np.clip(u_in + rng.uniform(-0.15, 0.15), -0.45, 0.2))))
         n += 1
     kt = np.array([k[0] for k in keys])
@@ -1037,14 +1085,15 @@ def sway_gestures(t: np.ndarray, rng, period: float) -> tuple[np.ndarray, int]:
     return kv[i] + (kv[i + 1] - kv[i]) * u, int(np.sum(kt[2::4] < T))
 
 
-def apply_sway(x: np.ndarray, t: np.ndarray, r: np.ndarray, rng, a) -> tuple[np.ndarray, np.ndarray, int]:
+def apply_sway(x: np.ndarray, t: np.ndarray, r: np.ndarray, rng, a,
+               clock: np.ndarray | None = None) -> tuple[np.ndarray, np.ndarray, int]:
     """忽远忽近：改变嘴到头表面的距离（方位不变）= 随机的凑近 / 退开 + 跟着说话音量（每响 6 dB 退远一倍，
     轻声时更贴近）。只在耳边附近生效：基准距离 0.2 m 以内全量，0.45 m 以外不晃（"从远处凑近"保持原样）。
-    返回新的距离、log2 倍数曲线、退开次数。"""
+    clock：说话时钟，随机的凑近 / 退开只在说话时进行。返回新的距离、log2 倍数曲线、退开次数。"""
     w = np.zeros(len(t))
     n = 0
     if a.sway > 0:
-        g, n = sway_gestures(t, rng, a.sway_period)
+        g, n = sway_gestures(t if clock is None else clock, rng, a.sway_period)
         w += a.sway * g
     if a.sway_follow > 0:
         w += a.sway_follow * np.clip(speech_loudness(x, t), -3.0, 12.0) / 6.0
@@ -1252,7 +1301,12 @@ def main(argv=None) -> int:
                     help="跟着说话音量：声音大时往后让、轻声时更贴近，听着更舒服（0=关闭；1=每响 6 dB 退远一倍）")
     ap.add_argument("--sway-level", type=float, default=0.45,
                     help="退开时耳边音量保留物理衰减的比例（0=音量不变，1=完全按距离衰减；KU100 实录约 0.44）")
-    ap.add_argument("--sway-period", type=float, default=7.0, help="一次凑近—退开的平均时长（秒，实际随机，约 4–14 s）")
+    ap.add_argument("--sway-period", type=float, default=4.0,
+                    help="说话时一次凑近—退开的大致时长（秒，随机，贴近至少停 2 s，所以实际约 4–7 s；"
+                         "停顿时动作会停住，按真实时间算更长）")
+    ap.add_argument("--pause-motion", type=float, default=0.13,
+                    help="停顿时晃动和凑近 / 退开的速度（相对说话时）：0.13=停顿里几乎不动，下一句从原位置接着说"
+                         "（Hadar 1983）；1=一直在动（旧版）")
     ap.add_argument("--level-follow", type=float, default=None,
                     help="响度随位置变化的程度：1=物理真实（贴耳很响、到脸前会弱很多），0=处处一样响。"
                          "默认 sweep 0.2、pingpong 0.1、orbit 0.3、phrase 0.5、其他 1")
@@ -1315,9 +1369,17 @@ def main(argv=None) -> int:
     nb = -(-len(x) // BLOCK)
     t = np.arange(nb + 1) * BLOCK / FS
 
+    clock = amp = act_b = None
+    if a.pause_motion < 1.0:      # 动作跟着说话：说话时动、停顿里几乎不动，幅度随音量
+        act_b, lf_b = speech_activity(x, t)
+        clock = speech_clock(t, act_b, max(a.pause_motion, 0.0))
+        amp = np.clip(10 ** (lf_b / 20), 0.5, 1.6)
+    # sweep / orbit / wander 按说话时钟走：换耳、绕行、走动都发生在说话的时候（停顿里不会"跳"过去）；
+    # pingpong 复刻参考视频的固定节奏、phrase 专门在停顿处换位、path 按给定时间，仍按真实时间
+    tm = clock if clock is not None else t
     rng = np.random.default_rng(a.seed)
     if a.mode == "sweep":
-        az, r, (n, n_app) = traj_sweep(t, rng, a)
+        az, r, (n, n_app) = traj_sweep(tm, rng, a)
         desc = f"{n} 次左右穿梭（其中 {n_app} 次从远处凑近；移动 {a.move_time:g} s，停留 {a.hold_time:g} s）"
     elif a.mode == "phrase":
         az, r, n = traj_phrase(x[:n_sig], t, rng, a)
@@ -1326,21 +1388,22 @@ def main(argv=None) -> int:
         az, r, n = traj_pingpong(t, rng, a)
         desc = f"{n} 次左右切换"
     elif a.mode == "orbit":
-        az, r, n = traj_orbit(t, rng, a)
+        az, r, n = traj_orbit(tm, rng, a)
         desc = f"约 {n} 圈"
     elif a.mode == "wander":
-        az, r, n = traj_wander(t, rng, a)
+        az, r, n = traj_wander(tm, rng, a)
         desc = f"{n} 次走动"
     elif a.mode == "static":
         az, r, desc = np.full(len(t), a.az if a.az_set else 270.0), np.full(len(t), a.dist or 0.15), "固定"
     else:
         az, r, n = traj_path(t, a.path)
         desc = f"{n} 个关键帧"
-    az, r = add_micro(az, r, t, rng, 0.012 * a.micro)
-    log(f"轨迹：{a.mode}，{desc}；距离 {r.min():.2f}–{r.max():.2f} m")
+    az, r = add_micro(az, r, t, rng, 0.012 * a.micro, clock, amp, act_b)
+    log(f"轨迹：{a.mode}，{desc}；距离 {r.min():.2f}–{r.max():.2f} m"
+        + (f"；动作跟着说话（说话占 {np.mean(act_b > 0.5) * 100:.0f}%，停顿时速度 {a.pause_motion:g}）" if clock is not None else ""))
     r_base, g_sway = r, None
     if a.sway > 0 or a.sway_follow > 0:
-        r, _, n_sw = apply_sway(x, t, r_base, np.random.default_rng(a.seed + 202), a)
+        r, _, n_sw = apply_sway(x, t, r_base, np.random.default_rng(a.seed + 202), a, clock)
         g_sway = sway_gain(tab, az, r, r_base, a.sway_level)
         ear = (np.abs(np.sin(np.radians(az))) > 0.9) & (r_base < 0.3)
         dcm = (r[ear] if ear.any() else r) * 100 - HEAD_A * 100

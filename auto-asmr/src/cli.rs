@@ -1,0 +1,365 @@
+//! 命令行：不带参数启动图形界面；`convert` 转换文件；`devices` 列出音频设备；`bench` 测处理速度。
+
+use crate::dsp::engine::{Engine, EngineConfig, PostMode};
+use crate::dsp::params::{MotionMode, Params, Playback, Via};
+use crate::dsp::tables::tables;
+use crate::dsp::{FS, FS_USIZE};
+use crate::offline::{convert, default_output, Channel, ConvertOptions};
+use std::path::PathBuf;
+use std::sync::atomic::AtomicBool;
+use std::sync::Arc;
+
+pub const HELP: &str = "auto-asmr —— KU100 双耳 ASMR 空间化（纯 CPU）
+
+用法：
+  auto-asmr                          启动图形界面（实时 + 文件转换）
+  auto-asmr convert <输入> [选项]    转换一个音频文件（wav / m4a / mp3 / flac / ogg …），输出 WAV
+  auto-asmr devices                  列出本机的音频输入 / 输出设备
+  auto-asmr bench                    测试处理速度
+
+convert 的选项（括号里是默认值）：
+  -o <文件>               输出文件（输入名_asmr.wav）
+  --style ear|ku100       ear=贴耳加强；ku100=像真实 KU100 实录（远耳听得到、离耳约 6 cm、真实房间）
+  --start <秒> --duration <秒>      只处理一段
+  --channel auto|left|right|mix     立体声取哪个声道（auto=更响的那个）
+ 贴耳感
+  --dist <米>             贴耳时嘴到头中心的距离（0.105，即离耳约 1.7 cm）
+  --isolation <dB>        远耳额外压低（32）      --presence <dB>     近耳临场感（3）
+  --warmth <dB>           凑近的低频温暖感（6）  --ear-warmth <dB>   近耳低频（5）
+  --far-lf-cut <dB>       远耳低频再压低（12）    --dark <dB>         近耳 5 kHz 压低（0）
+  --ku100-eq              近耳用 KU100 实测校正曲线
+ 左右移动
+  --mode sweep|random|orbit|static  穿梭 / 随机走位 / 环绕 / 固定（sweep）
+  --hold-time <秒> --move-time <秒> 停留、移动时长（2.5、2.5）
+  --randomness <0–1>      时长和落点的随机程度（0.1）
+  --approach <0–1>        换边时先退远再凑近的概率（0.25）
+  --via front|back|alternate|random  从哪里绕（front）
+  --ear-angle <度>（100）  --pass-dist <米>（0.2）  --az <度>（270）  --radius <米>（0.35）  --period <秒>（12）
+  --level-follow <0–1>    响度随位置变化的程度（按模式：0.2 / 0.5 / 0.3 / 1）
+ 忽远忽近
+  --sway <x>（1）  --sway-period <秒>（4）  --sway-random <0–1>（1）  --sway-follow <x>（1）
+  --sway-level <0–1>      退开时耳边音量保留物理衰减的比例（0.45）
+  --pause-motion <0–1>    停顿时动作的速度，1=一直在动（0.13）
+  --micro <x>             自然晃动幅度（1）
+ 房间与回放
+  --room none|real        KU100 实测真实房间（none）    --wet <dB>（-3）
+  --headphone diffuse|native|<型号>   回放补偿（diffuse）；--headphone list 列出型号
+ 人声处理
+  --denoise [强度]        输入降噪 RNNoise（关；强度 0–1）
+  --gate <dBFS>           响应阈值，低于它当作静音（关）
+  --deess <dB>            去齿音最多压低（0）       --soft-voice <x>   轻声化（0）
+ 输出
+  --lufs <L>（-16）  --peak <dBTP>（-1）  --max-gr <dB>（8）  --bits 16|24（24）  --seed <n>（1）
+  --save-trajectory <csv> 导出实际走位（时间, 方位角, 距离, 不含忽远忽近的距离, 说话活动）
+";
+
+fn parse_f(v: Option<&String>, name: &str) -> Result<f32, String> {
+    v.ok_or(format!("{name} 后面缺少数值"))?.parse::<f32>().map_err(|_| format!("{name} 的值不是数字"))
+}
+
+pub fn run(args: Vec<String>) -> i32 {
+    match args[0].as_str() {
+        "convert" => match run_convert(&args[1..]) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("错误：{e}");
+                2
+            }
+        },
+        "decode" => match run_decode(&args[1..]) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("错误：{e}");
+                2
+            }
+        },
+        "devices" => {
+            crate::realtime::print_devices();
+            0
+        }
+        "rt-test" => {
+            // 调试用：用默认设备实时跑几秒（可加 秒数、--buffer 帧数、--style ku100、--denoise）
+            let secs = args.get(1).and_then(|v| v.parse().ok()).unwrap_or(5.0);
+            let mut p = Params::default();
+            if args.iter().any(|a| a == "ku100") {
+                p = p.style_ku100();
+            }
+            p.denoise = args.iter().any(|a| a == "--denoise");
+            let mut o = crate::realtime::RtOptions::default();
+            if let Some(i) = args.iter().position(|a| a == "--buffer") {
+                o.buffer_frames = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(256);
+            }
+            // --file <音频>：不用麦克风，改用实时引擎播放文件（试听链路）；--gain <dB>：输出增益
+            if let Some(i) = args.iter().position(|a| a == "--gain") {
+                p.out_gain_db = args.get(i + 1).and_then(|v| v.parse().ok()).unwrap_or(0.0);
+                p.auto_level = false;
+            }
+            let file = args.iter().position(|a| a == "--file").and_then(|i| args.get(i + 1)).map(PathBuf::from);
+            match crate::realtime::selftest(secs, &o, Arc::new(EngineConfig::new(p, None)), file) {
+                Ok(()) => 0,
+                Err(e) => {
+                    eprintln!("错误：{e}");
+                    2
+                }
+            }
+        }
+        "bench" => {
+            bench();
+            0
+        }
+        "-h" | "--help" | "help" => {
+            println!("{HELP}");
+            0
+        }
+        other => {
+            eprintln!("不认识的命令：{other}\n\n{HELP}");
+            2
+        }
+    }
+}
+
+fn run_convert(args: &[String]) -> Result<(), String> {
+    let mut p = Params::default();
+    let mut input: Option<PathBuf> = None;
+    let mut output: Option<PathBuf> = None;
+    let (mut start, mut duration) = (0.0f64, None);
+    let mut channel = Channel::Auto;
+    let (mut bits, mut lufs, mut peak, mut max_gr) = (24u16, -16.0f32, -1.0f32, 8.0f32);
+    let mut level_follow: Option<f32> = None;
+    let mut save_traj: Option<PathBuf> = None;
+    // 风格先生效，后面的参数再覆盖
+    if let Some(i) = args.iter().position(|a| a == "--style") {
+        match args.get(i + 1).map(|s| s.as_str()) {
+            Some("ear") => p = p.style_ear(),
+            Some("ku100") => p = p.style_ku100(),
+            _ => return Err("--style 只能是 ear 或 ku100".into()),
+        }
+    }
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        let name = a.as_str();
+        let f = |it: &mut std::iter::Peekable<std::slice::Iter<String>>| parse_f(it.next(), name);
+        match name {
+            "-o" | "--output" => output = Some(PathBuf::from(it.next().ok_or("-o 后面缺少文件名")?)),
+            "--style" => {
+                it.next();
+            }
+            "--start" => start = f(&mut it)? as f64,
+            "--duration" => duration = Some(f(&mut it)? as f64),
+            "--channel" => {
+                channel = match it.next().map(|s| s.as_str()) {
+                    Some("auto") => Channel::Auto,
+                    Some("left") => Channel::Left,
+                    Some("right") => Channel::Right,
+                    Some("mix") => Channel::Mix,
+                    _ => return Err("--channel 只能是 auto / left / right / mix".into()),
+                }
+            }
+            "--dist" => p.ear_dist = f(&mut it)?.clamp(0.095, 1.0),
+            "--isolation" => p.isolation_db = f(&mut it)?,
+            "--presence" => p.presence_db = f(&mut it)?,
+            "--warmth" => p.warmth_db = f(&mut it)?,
+            "--ear-warmth" => p.ear_warmth_db = f(&mut it)?,
+            "--far-lf-cut" => p.far_lf_cut_db = f(&mut it)?,
+            "--dark" => p.dark_db = f(&mut it)?,
+            "--ku100-eq" => p.ku100_eq = true,
+            "--mode" => {
+                p.mode = match it.next().map(|s| s.as_str()) {
+                    Some("sweep") => MotionMode::Sweep,
+                    Some("random") => MotionMode::Random,
+                    Some("orbit") => MotionMode::Orbit,
+                    Some("static") => MotionMode::Static,
+                    _ => return Err("--mode 只能是 sweep / random / orbit / static".into()),
+                }
+            }
+            "--hold-time" => p.hold_s = f(&mut it)?,
+            "--move-time" => p.move_s = f(&mut it)?,
+            "--randomness" => p.randomness = f(&mut it)?,
+            "--approach" => p.approach = f(&mut it)?,
+            "--via" => {
+                p.via = match it.next().map(|s| s.as_str()) {
+                    Some("front") => Via::Front,
+                    Some("back") => Via::Back,
+                    Some("alternate") => Via::Alternate,
+                    Some("random") => Via::Random,
+                    _ => return Err("--via 只能是 front / back / alternate / random".into()),
+                }
+            }
+            "--ear-angle" => p.ear_angle = f(&mut it)?,
+            "--pass-dist" => p.pass_dist = f(&mut it)?,
+            "--az" => p.static_az = f(&mut it)?,
+            "--radius" => p.orbit_radius = f(&mut it)?,
+            "--period" => p.orbit_period = f(&mut it)?,
+            "--level-follow" => level_follow = Some(f(&mut it)?),
+            "--sway" => p.sway = f(&mut it)?,
+            "--sway-period" => p.sway_period = f(&mut it)?,
+            "--sway-random" => p.sway_random = f(&mut it)?,
+            "--sway-follow" => p.sway_follow = f(&mut it)?,
+            "--sway-level" => p.sway_level = f(&mut it)?,
+            "--pause-motion" => p.pause_motion = f(&mut it)?,
+            "--micro" => p.micro = f(&mut it)?,
+            "--room" => {
+                p.room = match it.next().map(|s| s.as_str()) {
+                    Some("none") => false,
+                    Some("real") => true,
+                    _ => return Err("--room 只能是 none 或 real".into()),
+                }
+            }
+            "--wet" => p.wet_db = f(&mut it)?,
+            "--headphone" => {
+                let v = it.next().ok_or("--headphone 后面缺少名称")?;
+                let norm = |s: &str| s.to_lowercase().chars().filter(|c| c.is_ascii_alphanumeric()).collect::<String>();
+                p.playback = match v.to_lowercase().as_str() {
+                    "diffuse" | "df" => Playback::Diffuse,
+                    "native" | "none" | "ku100" => Playback::Native,
+                    "list" => {
+                        println!("diffuse（通用扩散场补偿）\nnative（不补偿，KU100 原机音色）");
+                        for (n, _) in &tables().headphones {
+                            println!("{n}");
+                        }
+                        return Ok(());
+                    }
+                    _ => {
+                        let hits: Vec<&String> = tables().headphones.iter().map(|(n, _)| n).filter(|n| norm(n).contains(&norm(v))).collect();
+                        if hits.len() != 1 {
+                            return Err(format!("耳机型号 {v:?} 没有唯一匹配，用 --headphone list 查看"));
+                        }
+                        Playback::Headphone(hits[0].clone())
+                    }
+                };
+            }
+            "--denoise" => {
+                p.denoise = true;
+                if let Some(v) = it.peek().and_then(|s| s.parse::<f32>().ok()) {
+                    p.denoise_mix = v.clamp(0.0, 1.0);
+                    it.next();
+                }
+            }
+            "--gate" => p.gate_db = f(&mut it)?,
+            "--deess" => p.deess_db = f(&mut it)?,
+            "--soft-voice" => p.soft_voice = f(&mut it)?,
+            "--lufs" => lufs = f(&mut it)?,
+            "--peak" => peak = f(&mut it)?,
+            "--max-gr" => max_gr = f(&mut it)?,
+            "--bits" => bits = if f(&mut it)? as u16 == 16 { 16 } else { 24 },
+            "--seed" => p.seed = f(&mut it)? as u64,
+            "--save-trajectory" => save_traj = Some(PathBuf::from(it.next().ok_or("--save-trajectory 后面缺少文件名")?)),
+            _ if name.starts_with('-') => return Err(format!("不认识的选项 {name}")),
+            _ => input = Some(PathBuf::from(name)),
+        }
+    }
+    p.level_follow = level_follow.unwrap_or(Params::default_level_follow(p.mode));
+    let input = input.ok_or("缺少输入文件")?;
+    let mut opts = ConvertOptions::new(input.clone());
+    opts.output = output.unwrap_or_else(|| default_output(&input));
+    opts.start = start;
+    opts.duration = duration;
+    opts.channel = channel;
+    opts.bits = bits;
+    opts.lufs = lufs;
+    opts.peak_db = peak;
+    opts.max_gr_db = max_gr;
+    opts.save_trajectory = save_traj;
+    let mut last = -1i32;
+    let rep = convert(&opts, &p, Arc::new(AtomicBool::new(false)), |f, stage| {
+        let pc = (f * 100.0) as i32;
+        if pc / 10 != last / 10 {
+            eprintln!("  {stage} {pc}%");
+            last = pc;
+        }
+    })?;
+    if !rep.channel_note.is_empty() {
+        println!("{}", rep.channel_note);
+    }
+    println!(
+        "完成：{}  ({:.1} s，{:.1} LUFS，真峰值 {:.1} dBTP，限制器最多压 {:.1} dB；说话占 {:.0}%，换耳 {} 次，往后让 {} 次；用时 {:.1} s)",
+        opts.output.display(),
+        rep.seconds,
+        rep.lufs,
+        rep.true_peak_db,
+        rep.max_gr_db,
+        rep.speech_pct,
+        rep.n_moves,
+        rep.n_sways,
+        rep.elapsed_s
+    );
+    Ok(())
+}
+
+/// 调试用：只解码并取成 48 kHz 单声道，写成 WAV（用来核对解码器）。
+fn run_decode(args: &[String]) -> Result<(), String> {
+    let input = PathBuf::from(args.first().ok_or("缺少输入文件")?);
+    let out = args.iter().position(|a| a == "-o").and_then(|i| args.get(i + 1)).map(PathBuf::from).unwrap_or_else(|| input.with_extension("decoded.wav"));
+    let mut opts = ConvertOptions::new(input);
+    if let Some(i) = args.iter().position(|a| a == "--duration") {
+        opts.duration = args.get(i + 1).and_then(|v| v.parse().ok());
+    }
+    let (mono, note) = crate::offline::load_mono(&opts, &AtomicBool::new(false))?;
+    let spec = hound::WavSpec { channels: 1, sample_rate: FS_USIZE as u32, bits_per_sample: 24, sample_format: hound::SampleFormat::Int };
+    let mut w = hound::WavWriter::create(&out, spec).map_err(|e| e.to_string())?;
+    for v in &mono {
+        w.write_sample((v.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32).map_err(|e| e.to_string())?;
+    }
+    w.finalize().map_err(|e| e.to_string())?;
+    println!("{note}\n解码 {:.2} s -> {}", mono.len() as f32 / FS, out.display());
+    Ok(())
+}
+
+/// 合成一段像说话的测试信号：带谐波的浊音段和停顿交替。
+pub fn test_voice(seconds: f32) -> Vec<f32> {
+    let n = (seconds * FS) as usize;
+    let mut x = vec![0f32; n];
+    let mut seed = 99u32;
+    for (i, v) in x.iter_mut().enumerate() {
+        let t = i as f32 / FS;
+        let phrase = (t * 0.45).fract() < 0.7; // 约 1.5 s 说话、0.7 s 停顿
+        let syl = (0.5 - 0.5 * (std::f32::consts::TAU * 4.0 * t).cos()).powf(0.6);
+        let f0 = 190.0 + 30.0 * (std::f32::consts::TAU * 0.3 * t).sin();
+        let mut s = 0.0;
+        for h in 1..12 {
+            s += (std::f32::consts::TAU * f0 * h as f32 * t).sin() / h as f32;
+        }
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        let noise = (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5;
+        *v = if phrase { 0.25 * syl * (s * 0.5 + 0.15 * noise) } else { 0.0005 * noise };
+    }
+    x
+}
+
+fn bench() {
+    let x = test_voice(30.0);
+    let cases: [(&str, Params); 3] = [
+        ("贴耳加强（默认）", Params::default()),
+        ("KU100 风格（真实房间）", Params::default().style_ku100()),
+        ("KU100 风格 + 降噪 + 去齿音 + 轻声化", {
+            let mut p = Params::default().style_ku100();
+            p.denoise = true;
+            p.deess_db = 6.0;
+            p.soft_voice = 1.0;
+            p
+        }),
+    ];
+    println!("每次处理 128 个样本（2.67 ms 一块），模拟实时回调：");
+    for (name, p) in cases {
+        let cfg = Arc::new(EngineConfig::new(p, None));
+        let mut eng = Engine::new(cfg, PostMode::Realtime, 0.0);
+        let (mut l, mut r) = ([0f32; 128], [0f32; 128]);
+        let (mut worst, mut total) = (0f64, 0f64);
+        for c in x.chunks_exact(128) {
+            let t0 = std::time::Instant::now();
+            eng.process(c, &mut l, &mut r);
+            let dt = t0.elapsed().as_secs_f64();
+            worst = worst.max(dt);
+            total += dt;
+        }
+        let blocks = (x.len() / 128) as f64;
+        println!(
+            "  {name}：比实时快 {:.0} 倍，单核占用约 {:.1}%；每块平均 {:.0} µs，最慢 {:.0} µs；算法延时 {:.1} ms",
+            (x.len() as f64 / FS_USIZE as f64) / total,
+            100.0 * total / (x.len() as f64 / FS_USIZE as f64),
+            1e6 * total / blocks,
+            1e6 * worst,
+            1000.0 * eng.latency_samples() as f64 / FS_USIZE as f64
+        );
+    }
+}
