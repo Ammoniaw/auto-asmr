@@ -19,6 +19,8 @@ static ENGLISH: AtomicBool = AtomicBool::new(false);
 /// 参数表第一列（文字）的最小宽度，各分组的滑块因此对齐。
 const COL: f32 = 104.0;
 
+const CONFIG_FILE: &str = "auto-asmr.ron";
+
 /// 参数表的一行：文字（悬停显示说明）+ 滑块。
 fn row(ui: &mut egui::Ui, label: &str, tip: &str, w: egui::Slider<'_>) {
     let l = ui.label(label);
@@ -102,7 +104,9 @@ pub struct App {
 
 /// `screenshot`：(PNG 路径, 是否切到文件页, 演示文件)——自检用：打开界面、可选地试听演示文件几秒、截图后退出。
 pub fn run(screenshot: Option<(PathBuf, bool, Option<PathBuf>)>) -> Result<(), String> {
+    let config_path = std::env::current_dir().map_err(|e| format!("无法获取当前运行目录：{e}"))?.join(CONFIG_FILE);
     let opts = eframe::NativeOptions {
+        persistence_path: Some(config_path),
         viewport: egui::ViewportBuilder::default().with_inner_size([1260.0, 840.0]).with_min_inner_size([1040.0, 640.0]).with_title("auto-asmr · KU100 双耳 ASMR"),
         ..Default::default()
     };
@@ -110,6 +114,24 @@ pub fn run(screenshot: Option<(PathBuf, bool, Option<PathBuf>)>) -> Result<(), S
 }
 
 impl App {
+    fn export_config(&mut self) {
+        let Some(path) = rfd::FileDialog::new()
+            .add_filter(t("配置文件", "Configuration"), &["ron"])
+            .set_file_name("auto-asmr-export.ron")
+            .save_file() else { return };
+        // 和自动保存使用相同的 eframe 键值格式，可直接替换运行目录中的配置文件。
+        let result = (|| -> Result<(), String> {
+            let saved = ron::ser::to_string_pretty(&self.s, Default::default()).map_err(|e| e.to_string())?;
+            let values = std::collections::BTreeMap::from([(eframe::APP_KEY, saved)]);
+            let text = ron::ser::to_string_pretty(&values, Default::default()).map_err(|e| e.to_string())?;
+            std::fs::write(&path, text).map_err(|e| e.to_string())
+        })();
+        self.status = match result {
+            Ok(()) => format!("{}：{}", t("配置已导出", "Configuration exported"), path.display()),
+            Err(e) => format!("{}：{e}", t("配置导出失败", "Configuration export failed")),
+        };
+    }
+
     fn new(cc: &eframe::CreationContext<'_>, screenshot: Option<(PathBuf, bool, Option<PathBuf>)>) -> Self {
         let mut s: Saved = cc.storage.and_then(|st| eframe::get_value(st, eframe::APP_KEY)).unwrap_or_default();
         let mut demo = None;
@@ -801,6 +823,9 @@ impl eframe::App for App {
                     ui.selectable_value(&mut self.s.english, true, "English");
                     ui.selectable_value(&mut self.s.english, false, "中文");
                     egui::widgets::global_theme_preference_buttons(ui);
+                    if ui.button(t("导出配置", "Export config")).clicked() {
+                        self.export_config();
+                    }
                 });
             });
             ui.add_space(4.0);

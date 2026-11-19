@@ -455,6 +455,7 @@ dependencies = [
  "png",
  "realfft",
  "rfd",
+ "ron",
  "rustfft",
  "serde",
  "symphonia",

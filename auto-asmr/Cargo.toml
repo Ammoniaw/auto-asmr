@@ -17,6 +17,7 @@ hound = "3.5"
 eframe = { version = "0.37", features = ["persistence", "glow"] }
 rfd = "0.18"
 serde = { version = "1", features = ["derive"] }
+ron = "0.12"
 png = "0.18"
 
 [profile.release]
