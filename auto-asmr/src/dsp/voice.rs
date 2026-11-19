@@ -200,6 +200,25 @@ pub fn ear_eq_fir(presence_db: f32, dark_db: f32, ku100_eq: bool, concha_db: f32
     Some(minphase_from_mag(&mag, nfft, EAR_EQ_TAPS))
 }
 
+/// 远耳高频遮挡的转折频率。
+pub const FAR_SHADOW_F: f32 = 6000.0;
+
+/// 贴耳时远耳的高频遮挡（最小相位 FIR，64 点）：球头模型低估了近处声源在远耳的高频头影
+/// （与 BEM 近距仿真比，离耳 3.8 cm 时远耳 6 kHz 以上偏亮 2–9 dB）。`db` 是最高频压低的量；0 时返回 None。
+pub fn far_shadow_fir(db: f32) -> Option<Vec<f32>> {
+    if db <= 0.0 {
+        return None;
+    }
+    let nfft = 512;
+    let mag: Vec<f32> = (0..=nfft / 2)
+        .map(|k| {
+            let f = (k as f32 * FS / nfft as f32).max(1.0);
+            db_to_lin(-db / (1.0 + (FAR_SHADOW_F / f).powi(2)))
+        })
+        .collect();
+    Some(minphase_from_mag(&mag, nfft, EAR_EQ_TAPS))
+}
+
 /// 气流脉冲的标定增益（`puff` = 1 时）。
 pub const PUFF_K: f32 = 1.5;
 /// 气声带下限：F3 以上送气噪声取代谐波（Klatt & Klatt 1990）。
@@ -343,6 +362,18 @@ impl BreathFx {
 mod tests {
     use super::*;
     use crate::dsp::filters::fir_mag;
+
+    /// 远耳高频遮挡：6 kHz 处压一半，最高频接近设定值，500 Hz 基本不动。
+    #[test]
+    fn far_shadow_shape() {
+        let h = far_shadow_fir(5.0).unwrap();
+        let m = fir_mag(&h, 4096);
+        let db = |f: f32| 20.0 * m[(f / FS * 4096.0).round() as usize].log10();
+        assert!(db(500.0).abs() < 0.3, "500 Hz {}", db(500.0));
+        assert!((db(6000.0) + 2.5).abs() < 0.4, "6 kHz {}", db(6000.0));
+        assert!(db(16000.0) < -4.0 && db(16000.0) > -5.2, "16 kHz {}", db(16000.0));
+        assert!(far_shadow_fir(0.0).is_none());
+    }
 
     /// 耳甲共鸣：4.3 kHz 处约 +4 dB，1 kHz 和 12 kHz 基本不动。
     #[test]

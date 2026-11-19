@@ -45,7 +45,7 @@ uv run asmr/asmr_binaural.py 输入.m4a -o 输出.wav --mode wander  # 在你身
 - 最响 1% 的瞬时响度比中位数高 9.9 dB（不晃时 11.3 dB）。
 - 停顿前后的位置差：距离中位变化 1.4 倍（旧版 2.0 倍），方向 90% 在 23° 以内（旧版 90°），不会"跳"到另一侧。
 
-`--sway 0 --sway-follow 0` 关闭忽远忽近；再加 `--pause-motion 1 --updown 0 --breath 0 --puff 0 --concha 0`，结果与旧版默认逐样本相同。
+`--sway 0 --sway-follow 0` 关闭忽远忽近；再加 `--pause-motion 1 --updown 0 --breath 0 --puff 0 --concha 0 --soft-near 0 --mouth 0 --far-shadow 0`，结果与旧版默认逐样本相同。
 
 文献（DOI）：Pelegrín-García 等 2011 JASA [10.1121/1.3552881](https://doi.org/10.1121/1.3552881)；Arend 等 2016 Tonmeistertagung（KU100 近场 HRIR 的感知评测，[Zenodo 4297951](https://zenodo.org/records/4297951)）；Lundbeck 等 2017 Trends Hear [10.1177/2331216517717152](https://doi.org/10.1177/2331216517717152)；Neuhoff 2016 CRPI [10.1186/s41235-016-0017-4](https://doi.org/10.1186/s41235-016-0017-4)；Ghazanfar 等 2002 PNAS [10.1073/pnas.242469699](https://doi.org/10.1073/pnas.242469699)；Serino 等 2015 Sci Rep [10.1038/srep18603](https://doi.org/10.1038/srep18603)；Noel 等 2018 J Neurophysiol [10.1152/jn.00652.2017](https://doi.org/10.1152/jn.00652.2017)；Kolarik 等 2016 APP [10.3758/s13414-015-1015-1](https://doi.org/10.3758/s13414-015-1015-1)；Zahorik 2002 JASA [10.1121/1.1506692](https://doi.org/10.1121/1.1506692)；Brungart & Rabinowitz 1999 JASA [10.1121/1.427180](https://doi.org/10.1121/1.427180)；Kan 等 2009 JASA [10.1121/1.3081395](https://doi.org/10.1121/1.3081395)；Honda 等 2020 Front Psychol [10.3389/fpsyg.2020.00316](https://doi.org/10.3389/fpsyg.2020.00316)；Koumura 等 2021 QJEP [10.1177/1747021820977174](https://doi.org/10.1177/1747021820977174)；Shimokura 2022 Audiol Res [10.3390/audiolres12050056](https://doi.org/10.3390/audiolres12050056)。
 
@@ -106,9 +106,72 @@ uv run asmr/asmr_binaural.py 输入.m4a -o 输出.wav --mode wander  # 在你身
 
 实录是耳语，普通配音是有声的嗓音，这个差别程序不去改（把嗓音改成耳语的做法试过，听起来不自然，已删除）；气流脉冲也比实录轻得多，想更明显可以调大 `--puff`。输入有底噪时气声增强会把贴耳时的高频底噪一起提高，先降噪。
 
+**用数值仿真校验贴耳外推**：Salvador 等 2018 用边界元法（BEM）算了一个真人头模在离头中心 0.10–1.5 m、每 1 cm 一档的 HRTF（水平圈，每 1°）。在这套数据上照本程序的做法——由 0.25 m 的数据按"声学视差 + 球头模型"外推到更近——再和它自己的近距真值比（近耳，方位 55–125°，2–16 kHz，1/6 倍频程，去掉整体电平差）：
+
+| 离耳 | 谱形均方根误差：视差 + 球头（本程序） | 不用视差 | 4–5 kHz 的平均偏差（方位 85–115°） | `--concha 4` 在同样离耳距离给的增益 |
+|---|---|---|---|---|
+| 13.8 cm | 0.5 dB | 0.7 dB | −0.5 dB | 0 dB |
+| 7.8 cm | 1.9 dB | 2.5 dB | −1.7 dB | +1.2 dB |
+| 5.8 cm | 2.8 dB | 3.6 dB | −2.3 dB | +1.9 dB |
+| 4.8 cm | 3.4 dB | 4.4 dB | −2.7 dB | +2.3 dB |
+| 3.8 cm | 3.9 dB | 5.3 dB | −2.8 dB | +2.6 dB |
+
+- 视差取"从耳朵看出去"的方向（强度 1.0）就在最优附近：减弱视差误差变大，加强到 1.15 倍只再好 0.15 dB。
+- 外推系统性少掉的正是 4–5 kHz 的耳甲共鸣，越近少得越多；`--concha 4` 补的量与它相差 0.2–0.6 dB，所以默认值不动。
+- 剩下的误差主要是 7–10 kHz 耳廓谷的位置随距离移动，这是每个人耳廓各自的细节，换一个头不能照搬，没有去改。
+- 远耳：贴耳时外推出来的高频偏亮（离耳 3.8 cm 时 9–10 kHz 高 8–9 dB）。默认风格远耳已另外压低 32 dB，不受影响；`--style ku100` 的远耳高频会比真实的略亮。
+- 没有校验到的：离耳 3.8 cm 以内（数据最近到这里，默认贴耳是 1.7 cm）、上下方向、KU100 自己的耳廓（这是另一个头）。
+
+该数据在文件里注明"Freely accessible for non-profit academic purposes"，所以只用来校验，数据本身和由它得到的任何表都不放进仓库。出处：C. D. Salvador, S. Sakamoto, J. Treviño, Y. Suzuki, "Dataset of near-distance head-related transfer functions calculated using the boundary element method", AES Int. Conf. Spatial Reproduction, Tokyo, 2018（[下载页](https://cesardsalvador.github.io/download.html)）。
+
 `--breath 0 --puff 0 --concha 0` 时结果与加入这三项之前逐样本相同。
 
 文献：Klatt & Klatt 1990 JASA [10.1121/1.398894](https://doi.org/10.1121/1.398894)；Hillenbrand 等 1994 JSHR [10.1044/jshr.3704.769](https://doi.org/10.1044/jshr.3704.769)；Shaw 1979 [The external ear: new knowledge](https://jcaa.caa-aca.ca/index.php/jcaa/article/download/441/103/493)；Terashima 等 2024 [PMC11444235](https://pmc.ncbi.nlm.nih.gov/articles/PMC11444235/)（该研究排除了耳语视频）；Tajadura-Jiménez 等 2009 Neuropsychologia 47:195；Bernschütz 2013 [DAGA](https://audiogroup.web.th-koeln.de/FILES/AIA-DAGA2013_HRIRs.pdf)；Monson & Ananthanarayana 2023（语音正前方 7–9 kHz 指向性最强，[Forum Acusticum](https://dael.euracoustics.org/confs/fa2023/data/articles/000414.pdf)）。喷麦声的频段和时长来自录音工程资料（[The Broadcast Bridge](https://thebroadcastbridge.com/content/entry/10570/getting-rid-of-plosives-in-your-audio)），不是论文。
+
+### 贴耳轻声、嘴的大小、远耳高频遮挡（默认开启）
+
+近场文献调研和 BEM 校验里能直接落到参数上的三项，都随贴耳程度渐入，离开耳边时为 0；都只是均衡 / 取样方式的变化，不加任何声音。
+
+| 做法 | 依据 | 参数（默认值） |
+|---|---|---|
+| 贴耳轻声：凑到耳边时把嗓音均衡成"放轻声音"（和 `--soft-voice` 同一条 ANSI S3.5 说话力度曲线，但只在贴耳时），退开时恢复。默认 0.5：贴耳时 1–2.5 kHz 约 −1.3 dB、低频约 +1.3 dB | 说话力度是语音最主要的距离线索，越轻听起来越近，耳语第一次听就被判为最近（Brungart & Scott 2001；Philbeck & Mershon 2002）；人离听者越近说得越轻（Pelegrín-García 等 2011）。原来只模拟了"凑近时音量放轻"，没有模拟音色跟着变 | `--soft-near 0.5`（0 = 关闭） |
+| 嘴的大小：嘴是约 2 cm 宽的开口而不是一个点。沿嘴宽方向取 5 个点，把各点的 HRIR 加权相加。贴耳时开口从耳朵看过去张角很大（离耳 1.7 cm、宽 2 cm 约 ±30°），点声源才有的又窄又深的耳廓谷变浅；离头中心 20 cm 以外与点声源没有差别 | ITU-T P.51：人工嘴的唇环直径 25 mm，声音不是从一个点出来的；Halkosaari & Vaalgamaa 2004：真人等效口半径约 0.5 cm，人工嘴 1.5 cm。实测：默认贴耳位置（100°、离耳 1.7 cm）近耳 3.6–4.5 kHz 的谷从 −12.7 dB 变成 −10.6 dB（宽 4 cm 时 −7.2 dB），其他位置变化在 1 dB 以内，是个很轻的修正 | `--mouth 2`（cm，0 = 点声源） |
+| 远耳高频遮挡：贴耳时远耳 6 kHz 以上再压低，默认最多 5 dB（5 kHz −2 dB、8 kHz −3 dB、12 kHz −3.9 dB） | 上一节的 BEM 校验：球头模型低估了近处声源在远耳的高频头影，离耳 3.8 cm 时远耳 6 kHz 以上偏亮 2–9 dB；Brungart & Rabinowitz 1999：声源越近，远耳的头影越深。默认风格远耳已压低 32 dB，基本听不出；`--style ku100` 的远耳会更接近真实 | `--far-shadow 5`（dB，0 = 关闭） |
+
+`--soft-near 0 --mouth 0 --far-shadow 0` 时结果与加入这三项之前逐样本相同。
+
+调研里没有做成选项的：颅骨共振 / 骨导 / 次低频压力感（耳机的气导声做不出来）、为了亲近感加房间声（Lieberman 等 2022：加空间混响反而降低亲近感，所以默认仍然不加房间）、把耳廓谷按 BEM 结果移动（那是另一个人耳廓的细节，不能照搬）。
+
+文献：Philbeck & Mershon 2002 JASA（[摘要](https://ro.uow.edu.au/sspapers/654/)）；[ITU-T P.51](https://www.itu.int/rec/T-REC-P.51)；Halkosaari & Vaalgamaa 2004（[ETSI 研讨会](https://portal.etsi.org/stq/workshop2004/presentations2004/060-directivity%20of%20human%20and%20artificial%20mouth%20-%20wsq%20workshop%200604.pdf)）；Lieberman 等 2022（[A voice inside my head](https://julianaschroeder.com/s/A-voice-inside-my-head-The-psychological-and-behavioral-consequences-of-auditory-technologies.pdf)）。
+
+### 耳廓选择（默认 KU100）
+
+把 KU100 的耳廓换成真人的：`--pinna A` … `--pinna G`（`--pinna list` 列出，默认 `ku100`）。
+
+- **换的是什么**：近场的距离、两耳差、时延都保留 KU100 的实测数据，整体音色也仍是 KU100 的；换掉的只是 1.5 kHz 以上"随方向变化"的耳廓峰谷。做法是给每只耳朵的 HRIR 再卷上一个 64 点的修正滤波器 = 真人的方向传递函数 ÷ 本程序 KU100 渲染结果的方向传递函数（方向传递函数 = 某方向的响应 ÷ 所有方向的平均）。方向按"从这只耳朵看向声源"算，所以贴耳时与近场的声学视差一致；耳朵背对声源（在头影里）时不换。
+- **数据**：HUTUBS 真人 HRTF 库（TU Berlin，96 个编号，实测 440 个方向，1.47 m），去掉 2 次人工头测量和 1 次重复测量后是 93 个真人。
+- **为什么是 7 只**：每个人的耳廓不同，别人的耳廓不一定比 KU100 好——KU100 本来就是按平均人耳做的。有用的是能挑到像自己的那只：Katz & Parseihian 2012 让 45 人给 46 套 HRTF 打分，一小组就能让每个人都找到合适的，而且用自己评分最高的那套定位更准。这里把 93 个真人的修正曲线做聚类，取 7 个类的中心（按频谱聚类，不是按听感评分）：
+
+| 名字 | HUTUBS 编号 | 这一类有多少人 | 与 KU100 相差（3–12.5 kHz 均方根） |
+|---|---|---|---|
+| A | pp40 | 46 | 3.5 dB |
+| B | pp26 | 22 | 4.0 dB |
+| C | pp76 | 12 | 3.5 dB |
+| D | pp46 | 6 | 3.9 dB |
+| E | pp54 | 5 | 4.7 dB |
+| F | pp83 | 1 | 5.2 dB |
+| G | pp74 | 1 | 4.4 dB |
+
+- **怎么挑**：自己听时，用 `--mode orbit`（绕头转圈）各渲染一段，选前后最分得清、声音最不"贴在脑袋里"的那只。给别人听的成品建议仍用 `ku100`：听众的耳朵各不相同，没有哪只真人耳朵对所有人都更好。
+- **实测**：贴耳位置近耳 2 kHz 以下不变，3–16 kHz 各频带变化 ±2–7 dB，每只耳朵各不一样；远耳不变。64 点滤波器与目标曲线相差均方根 0.11 dB。
+- **要知道的局限**：
+  - 93 个真人两两之间的差（中位 2.9 dB）比他们与 KU100 的差（中位 3.8 dB）小，说明修正里也带着两个实验室测量方式的差别，不全是耳廓的差别。
+  - 选 7 只后每个人到最像那只的距离是中位 2.3 dB，只比随便两个人之间略好；F、G 是各自成一类的"特别的耳朵"。
+  - 真人数据是 1.47 m 测的，贴耳时按从耳朵看的方向取用，没有近距离的验证。
+
+`--pinna ku100`（默认）时结果与加入这一项之前逐样本相同。滤波表在 `data/pinna_hutubs.npz`（Rust 版在 `auto-asmr/assets/pinna.bin`），随仓库 / 程序分发，运行时不需要原始数据集；重新生成用 `auto-asmr/tools/build_pinna.py`。
+
+文献：Katz & Parseihian 2012 JASA [10.1121/1.3672641](https://doi.org/10.1121/1.3672641)；Brinkmann 等 2019，[HUTUBS HRTF database](https://depositonce.tu-berlin.de/handle/11303/9429)。
 
 ### KU100 实录风格 `--style ku100`
 
@@ -216,3 +279,5 @@ uv run asmr/asmr_binaural.py 输入.m4a -o 输出.wav --mode wander  # 在你身
 ## 数据与许可
 
 `hrtf/` 中的数据来自 TH Köln 的 Spherical Near-Field HRIR Compilation of the Neumann KU100，作者 J. M. Arend、A. Neidhardt、C. Pörschmann，[Zenodo 4297951](https://zenodo.org/records/4297951)，CC BY 4.0。程序第一次运行时会自动下载这些数据。`ku100_tables_v4.npz` 是预处理缓存，删掉后会自动重建。
+
+`data/pinna_hutubs.npz` 和 `auto-asmr/assets/pinna.bin`（耳廓选择的滤波表）由 HUTUBS 真人 HRTF 库生成：F. Brinkmann, M. Dinakaran, R. Pelzer, P. Grosche, D. Voss, S. Weinzierl, "A cross-validated database of measured and simulated HRTFs including 3D head meshes and anthropometric features", J. Audio Eng. Soc., 2019（按数据集说明文档给出的引用方式）；数据集本身："The HUTUBS HRTF database"，DOI 10.14279/depositonce-8487，[depositonce.tu-berlin.de/handle/11303/9429](https://depositonce.tu-berlin.de/handle/11303/9429)，CC BY 4.0。原始数据集（1.36 GB）不在仓库里，只有重新生成表时才需要。

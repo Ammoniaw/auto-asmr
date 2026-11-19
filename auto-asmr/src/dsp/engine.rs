@@ -7,9 +7,10 @@ use super::dynamics::{Leveler, Limiter};
 use super::filters::{Biquad, Fir, OnePoleLp, BUTTER_Q};
 use super::motion::{clock_step, clock_step_live, Motion, Pose};
 use super::params::{Params, Playback};
+use super::pinna::pinnas;
 use super::room::{conv_energy, Room};
 use super::tables::{tables, Hrir, Tables};
-use super::voice::{ear_eq_fir, soft_voice_fir, BreathFx, DeEsser, Denoiser, Gate, DENOISE_DELAY, EAR_EQ_TAPS};
+use super::voice::{ear_eq_fir, far_shadow_fir, soft_voice_fir, BreathFx, DeEsser, Denoiser, Gate, DENOISE_DELAY, EAR_EQ_TAPS};
 use super::{db_to_lin, lin_to_db, C, CTRL, CTRL_DT, EAR_R, FS, NTAP, R_MAX, R_MIN};
 use std::sync::Arc;
 
@@ -24,6 +25,12 @@ pub struct Derived {
     pub ear_eq: Option<Arc<Vec<f32>>>,
     pub playback: Option<Arc<Vec<f32>>>,
     pub soft: Option<Arc<Vec<f32>>>,
+    /// 贴耳时远耳的高频遮挡。
+    pub far_eq: Option<Arc<Vec<f32>>>,
+    /// 贴耳轻声用的均衡（与轻声化同一种滤波器，强度按 `soft_near`）。
+    pub soft_near: Option<Arc<Vec<f32>>>,
+    /// 耳廓选择：真人耳廓在 [`pinnas`] 里的序号；None = KU100 自己的耳廓。
+    pub pinna: Option<usize>,
     pub room_gain: f32,
     pub pref: f32,
 }
@@ -76,7 +83,16 @@ impl EngineConfig {
             ((e_near / e_room.max(1e-30)) as f32 * 10f32.powf((REAL_ROOM_DB + params.wet_db) / 10.0)).sqrt()
         };
         let pref = tab.lookup_power(270.0, 0.14);
-        EngineConfig { params, derived: Derived { ear_eq, playback, soft, room_gain, pref } }
+        let far_eq = if same(&|q| q.far_shadow_db == params.far_shadow_db) { pd.unwrap().far_eq.clone() } else { far_shadow_fir(params.far_shadow_db).map(Arc::new) };
+        let soft_near = if same(&|q| q.soft_near == params.soft_near) {
+            pd.unwrap().soft_near.clone()
+        } else if params.soft_near > 0.0 {
+            Some(Arc::new(soft_voice_fir(params.soft_near)))
+        } else {
+            None
+        };
+        let pinna = pinnas().index(&params.pinna);
+        EngineConfig { params, derived: Derived { ear_eq, playback, soft, far_eq, soft_near, pinna, room_gain, pref } }
     }
 }
 
@@ -128,6 +144,31 @@ impl EarLf {
     }
 }
 
+/// 嘴的大小：沿嘴宽方向的取样点（相对半宽）和权重；中心点的权重是 0.30。
+const MOUTH_SPREAD: [(f32, f32); 4] = [(-1.0, 0.10), (-0.5, 0.25), (0.5, 0.25), (1.0, 0.10)];
+/// 离头中心超过这个距离时嘴可以当成一个点。
+const MOUTH_R: f32 = 0.4;
+
+/// 把 64 点的均衡滤波器作用到一只耳朵的 HRIR 上，并按贴耳程度 `cl` 与原来的混合（尾部 16 点淡出）。
+fn eq_blend(h: &mut [f32; NTAP], eq: &[f32], cl: f32) {
+    let mut he = [0f32; NTAP];
+    for (n, o) in he.iter_mut().enumerate() {
+        let kmax = n.min(EAR_EQ_TAPS - 1);
+        let mut s = 0.0;
+        for k in 0..=kmax {
+            s += eq[k] * h[n - k];
+        }
+        *o = s;
+    }
+    for i in 0..16 {
+        let t = i as f32 / 15.0;
+        he[NTAP - 16 + i] *= 0.5 * (1.0 + (std::f32::consts::PI * t).cos());
+    }
+    for (v, e) in h.iter_mut().zip(he.iter()) {
+        *v += cl * (e - *v);
+    }
+}
+
 /// 嘴贴近某一侧耳朵的程度（0–1）：距离越近、越偏向正侧方越大；转到脸前 / 脑后 / 头顶时为 0。
 #[inline]
 pub fn closeness(az: f32, el: f32, r: f32) -> f32 {
@@ -145,6 +186,9 @@ pub struct Engine {
     deess: DeEsser,
     soft: Option<Fir>,
     soft_src: Option<Arc<Vec<f32>>>,
+    softn: Option<Fir>,
+    softn_src: Option<Arc<Vec<f32>>>,
+    softw: (f32, f32),
     analyzer: Analyzer,
     la_buf: Vec<f32>,
     la_pos: usize,
@@ -167,6 +211,7 @@ pub struct Engine {
     pose: Pose,
     hr: Hrir,
     hr_tmp: Hrir,
+    hr_sp: Hrir,
     xa: [f32; CTRL],
     xr: [f32; CTRL],
     room_dl: [f32; ROOM_DELAY],
@@ -204,6 +249,9 @@ impl Engine {
             deess: DeEsser::new(),
             soft: None,
             soft_src: None,
+            softn: None,
+            softn_src: None,
+            softw: (0.0, 0.0),
             analyzer,
             la_buf: vec![0.0; la],
             la_pos: 0,
@@ -226,6 +274,7 @@ impl Engine {
             pose: Pose::default(),
             hr: Hrir::default(),
             hr_tmp: Hrir::default(),
+            hr_sp: Hrir::default(),
             xa: [0.0; CTRL],
             xr: [0.0; CTRL],
             room_dl: [0.0; ROOM_DELAY],
@@ -273,6 +322,14 @@ impl Engine {
                 (_, None) => self.soft = None,
             }
             self.soft_src = d.soft.clone();
+        }
+        if changed(&self.softn_src, &d.soft_near) {
+            match (&mut self.softn, &d.soft_near) {
+                (Some(f), Some(h)) if f.len() == h.len() => f.set_taps(h),
+                (_, Some(h)) => self.softn = Some(Fir::new(h)),
+                (_, None) => self.softn = None,
+            }
+            self.softn_src = d.soft_near.clone();
         }
         self.cfg = cfg;
     }
@@ -331,6 +388,34 @@ impl Engine {
         }
         let az_sofa = (360.0 - pose.az).rem_euclid(360.0); // 顺时针 -> SOFA 逆时针
         self.tab.lookup3(az_sofa, pose.el, pose.r, &mut self.hr, &mut self.hr_tmp);
+        // 耳廓选择：换成真人的耳廓
+        if let Some(pi) = cfg.derived.pinna {
+            pinnas().apply(pi, &mut self.hr.h, az_sofa, pose.el, pose.r);
+        }
+        // 嘴的大小：嘴是一个开口而不是一个点。沿嘴宽方向取 5 个点，把各点的 HRIR 加权相加；
+        // 贴耳时开口从耳朵看过去张角很大，耳廓的窄谷被平均变浅，离远了与点声源相同
+        let r_m = pose.r.clamp(R_MIN, R_MAX);
+        if p.mouth_cm > 0.0 && r_m < MOUTH_R {
+            let half = 0.005 * p.mouth_cm;
+            let w0 = 1.0 - MOUTH_SPREAD.iter().map(|&(_, w)| w).sum::<f32>();
+            for e in 0..2 {
+                for v in self.hr.h[e].iter_mut() {
+                    *v *= w0;
+                }
+            }
+            for (t, w) in MOUTH_SPREAD {
+                let d = (t * half).atan2(r_m).to_degrees();
+                self.tab.lookup3((az_sofa + d).rem_euclid(360.0), pose.el, pose.r, &mut self.hr_sp, &mut self.hr_tmp);
+                if let Some(pi) = cfg.derived.pinna {
+                    pinnas().apply(pi, &mut self.hr_sp.h, (az_sofa + d).rem_euclid(360.0), pose.el, pose.r);
+                }
+                for e in 0..2 {
+                    for (v, s) in self.hr.h[e].iter_mut().zip(self.hr_sp.h[e].iter()) {
+                        *v += w * s;
+                    }
+                }
+            }
+        }
 
         // 响度：沿不含忽远忽近的轨迹补偿；退开时说话人自己会说大声一点（只保留一部分物理衰减）
         let az_base_sofa = (360.0 - pose.az_base).rem_euclid(360.0);
@@ -376,6 +461,12 @@ impl Engine {
                 }
             }
         }
+        // 贴耳时远耳的高频遮挡
+        if cl > 0.0 {
+            if let Some(eq) = &cfg.derived.far_eq {
+                eq_blend(&mut self.hr.h[1 - ipsi], eq, cl);
+            }
+        }
         let d = [rc / C * FS + self.hr.tau[0] + BASE_DELAY, rc / C * FS + self.hr.tau[1] + BASE_DELAY];
         self.direct.set_target(&self.hr.h, d);
 
@@ -391,11 +482,13 @@ impl Engine {
         }
         if self.primed {
             self.warm = (self.warm.1, warm);
+            self.softw = (self.softw.1, cl);
             for e in 0..2 {
                 self.lfg[e] = (self.lfg[e].1, lfg[e]);
             }
         } else {
             self.warm = (warm, warm);
+            self.softw = (cl, cl);
             for e in 0..2 {
                 self.lfg[e] = (lfg[e], lfg[e]);
             }
@@ -480,6 +573,13 @@ impl Engine {
             self.room_dl_pos = (self.room_dl_pos + 1) % ROOM_DELAY;
             let wp = (ph + i) as f32 / CTRL as f32;
             let gb = self.warm.0 + (self.warm.1 - self.warm.0) * wp;
+            // 贴耳轻声：只作用于直达声，随贴耳程度渐入
+            let a = if let Some(f) = &mut self.softn {
+                let s = f.process(a);
+                a + (self.softw.0 + (self.softw.1 - self.softw.0) * wp) * (s - a)
+            } else {
+                a
+            };
             self.xd[i] = if breath_on {
                 // 只作用于直达声；房间声仍用原来的人声
                 let (ab, pf) = self.breath.process(a, wp);

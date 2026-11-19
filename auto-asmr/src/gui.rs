@@ -819,6 +819,9 @@ impl App {
                 row(ui, t("气声增强", "Breath lift"), t("贴耳时把嗓音里轻的送气声 / 气息提上来（最多这么多），响的齿音不提；只用嗓音自己的气声，不加噪声。0 = 关闭", "Lifts the soft breathy part of the voice when close (by at most this much); loud sibilants are left alone. No noise is added. 0 = off"), egui::Slider::new(&mut p.breath_db, 0.0..=12.0).suffix(" dB").fixed_decimals(1));
                 row(ui, t("气流扑耳", "Breath puff"), t("送气时气流扑到耳朵上的低频脉冲（耳朵痒的感觉），由嗓音自己的送气声导出。0 = 关闭，1 倍 = 标准；滑块到 8 倍，手输可更高", "Low-frequency pulses of breath hitting the ear, derived from the voice's own aspiration. 0 = off, 1x = standard; slider up to 8x, type for higher values"), egui::Slider::new(&mut p.puff, 0.0..=8.0).suffix(t(" 倍", "x")).fixed_decimals(2));
                 row(ui, t("耳甲共鸣", "Concha resonance"), t("贴耳时近耳 4.3 kHz 的耳甲腔共振（KU100 贴耳实录的共有特征）。0 = 关闭", "4.3 kHz concha resonance at the near ear when close. 0 = off"), egui::Slider::new(&mut p.concha_db, 0.0..=8.0).suffix(" dB").fixed_decimals(1));
+                row(ui, t("贴耳轻声", "Soft when close"), t("凑到耳边时把嗓音均衡成「放轻声音」，退开时恢复（只做均衡）。0 = 关闭", "EQ towards a lowered voice when at the ear, back to normal when away (EQ only). 0 = off"), egui::Slider::new(&mut p.soft_near, 0.0..=1.5).fixed_decimals(2));
+                row(ui, t("嘴的大小", "Mouth size"), t("嘴是一个开口而不是一个点：贴耳时耳廓的窄谷被平均变浅，离远了没有区别。0 = 点声源", "The mouth is an opening, not a point: narrow pinna notches smooth out when close. 0 = point source"), egui::Slider::new(&mut p.mouth_cm, 0.0..=5.0).suffix(" cm").fixed_decimals(1));
+                row(ui, t("远耳高频遮挡", "Far-ear shadow"), t("贴耳时另一只耳朵 6 kHz 以上再压低（近处声源的头影更深）。0 = 关闭", "Extra cut above 6 kHz at the far ear when close (deeper head shadow for near sources). 0 = off"), egui::Slider::new(&mut p.far_shadow_db, 0.0..=12.0).suffix(" dB").fixed_decimals(1));
             });
             ui.checkbox(&mut p.ku100_eq, t("近耳用 KU100 实测校正曲线（高频更收）", "KU100-calibrated near-ear EQ (softer highs)"));
         });
@@ -917,6 +920,18 @@ impl App {
             egui::Grid::new("g4").num_columns(2).min_col_width(COL).spacing([10.0, 6.0]).show(ui, |ui| {
                 ui.add_enabled_ui(p.room, |ui| ui.label(t("房间声大小", "Room level")));
                 ui.add_enabled(p.room, egui::Slider::new(&mut p.wet_db, -12.0..=9.0).clamping(egui::SliderClamping::Never).suffix(" dB").fixed_decimals(0));
+                ui.end_row();
+                ui.label(t("耳廓", "Pinna")).on_hover_text(t("KU100：人工头自己的耳廓（按平均人耳做的，给别人听选这个最稳）；真人 A–G：HUTUBS 实测的真人耳廓，自己听时挑前后、上下最分得清的那只", "KU100: the dummy head's own ear (an average ear, safest for an audience). Human A–G: measured human ears; for your own listening pick the one that gives the clearest front/back and up/down"));
+                let cur = match crate::dsp::pinna::pinnas().index(&p.pinna) {
+                    Some(i) => format!("{} {}", t("真人", "Human"), crate::dsp::pinna::pinnas().items[i].name),
+                    None => t("KU100（人工头）", "KU100 (dummy head)").to_string(),
+                };
+                egui::ComboBox::from_id_salt("pinna").width(190.0).selected_text(cur).show_ui(ui, |ui| {
+                    ui.selectable_value(&mut p.pinna, "KU100".to_string(), t("KU100（人工头）", "KU100 (dummy head)"));
+                    for q in &crate::dsp::pinna::pinnas().items {
+                        ui.selectable_value(&mut p.pinna, q.name.clone(), format!("{} {}", t("真人", "Human"), q.name));
+                    }
+                });
                 ui.end_row();
                 ui.label(t("回放补偿", "Playback EQ")).on_hover_text(t("扩散场：通用；KU100 原机：和真实 KU100 录音一样（高频略暗）；或按你的耳机型号补偿", "Diffuse: generic; Native: like a real KU100 recording (slightly darker); or pick your headphone model"));
                 let cur = match &p.playback {

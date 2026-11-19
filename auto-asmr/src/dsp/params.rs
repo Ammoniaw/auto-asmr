@@ -67,6 +67,14 @@ pub struct Params {
     pub puff: f32,
     /// 耳甲共鸣：贴耳时近耳 4.3 kHz 的耳甲腔共振，dB。0 = 关闭。
     pub concha_db: f32,
+    /// 嘴的大小（厘米）：嘴是约 2 cm 宽的开口而不是一个点，贴耳时耳廓的窄谷被平均变浅。0 = 点声源。
+    pub mouth_cm: f32,
+    /// 贴耳时远耳 6 kHz 以上再压低多少 dB（近处声源在远耳的高频头影比球头模型深）。0 = 关闭。
+    pub far_shadow_db: f32,
+    /// 贴耳轻声：凑到耳边时嗓音均衡成"放轻声音"（同 `soft_voice`，但只在贴耳时），退开时恢复。0 = 关闭。
+    pub soft_near: f32,
+    /// 耳廓选择："KU100" = 人工头自己的耳廓；"A"、"B"… = 真人耳廓（HUTUBS 实测，挑最像自己耳朵的那只）。
+    pub pinna: String,
 
     // ---- 左右移动
     pub mode: MotionMode,
@@ -170,6 +178,10 @@ impl Default for Params {
             breath_db: 6.0,
             puff: 1.0,
             concha_db: 4.0,
+            mouth_cm: 2.0,
+            far_shadow_db: 5.0,
+            soft_near: 0.5,
+            pinna: "KU100".to_string(),
             mode: MotionMode::Sweep,
             hold_s: 2.5,
             move_s: 2.5,

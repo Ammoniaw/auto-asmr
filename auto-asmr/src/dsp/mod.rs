@@ -8,6 +8,7 @@ pub mod engine;
 pub mod filters;
 pub mod motion;
 pub mod params;
+pub mod pinna;
 pub mod resample;
 pub mod rng;
 pub mod room;

@@ -23,6 +23,8 @@
     离耳约 6 cm、真实房间）。不改变原来的嗓音，也不添加任何底噪或呼吸声。
   * 贴耳气声（默认开启）：贴耳时把嗓音里轻的送气声提上来（--breath），加上气流扑到耳朵上的
     低频脉冲（--puff，由嗓音自己的送气声导出），并补上近耳 4.3 kHz 的耳甲共鸣（--concha）。
+  * 贴耳轻声（--soft-near）、嘴的大小（--mouth，嘴是开口而不是点）、远耳高频遮挡（--far-shadow），默认开启。
+  * 耳廓选择（--pinna A…G）：把 KU100 的耳廓换成真人的（HUTUBS 实测），默认仍是 KU100。
   * 房间（可选）：TH Köln 用同一个 KU100 实测的真实房间，或镜像声源法的合成房间。
   * KU100 公共扩散场均衡（CDFC），然后按 BS.1770 响度归一化。
 
@@ -80,6 +82,7 @@ REAL_ROOM_DB = -28.0       # 真实房间：贴耳时远耳听到的房间声比
 HERE = Path(__file__).resolve().parent
 HRTF_DIR = HERE / "hrtf"
 DATA_DIR = HERE / "data"
+PINNA_FILE = DATA_DIR / "pinna_hutubs.npz"   # 耳廓选择的滤波表（由 auto-asmr/tools/build_pinna.py 从 HUTUBS 生成）
 ZENODO = "https://zenodo.org/records/4297951/files/{}?download=1"
 CIRC_FILES = [f"HRIR_CIRC360_NF{round(r * 100):03d}.sofa" for r in R_MEAS]
 SPH_FILE = "HRIR_L2702_NF150.sofa"
@@ -110,6 +113,10 @@ BREATH_FC = 2500.0         # 气声带下限：F3 以上送气噪声取代谐波
 BREATH_HOP = 64            # 气声电平检测的块长（1.33 ms，与 Rust 版的控制块相同）
 BREATH_REF0 = -90.0        # "响的"电平跟踪的初值（dBFS）：从很低开始，听到第一个响的音就跟上去，与输入音量无关
 PUFF_K = 1.5               # 气流脉冲的标定增益（--puff 1 时）
+MOUTH_SPREAD = ((-1.0, 0.10), (-0.5, 0.25), (0.5, 0.25), (1.0, 0.10))   # 嘴宽方向的取样点（相对半宽）和权重，中心点权重 0.30
+MOUTH_R = 0.4              # 离头中心超过这个距离时嘴可以当成一个点
+FAR_SHADOW_F = 6000.0      # 远耳高频遮挡的转折频率
+PINNA_TAPS = 64            # 耳廓选择的滤波器长度
 
 # 语句模式的落点：(方位角范围, 距离范围)，右侧定义，左侧镜像
 # 风格预设：ear=贴耳加强（默认，远耳额外压低，嘴离耳约 1.7 cm）；
@@ -458,9 +465,8 @@ def cone_coords(az_sofa: np.ndarray, el: np.ndarray):
     return (dx, dy, dz), alpha, beta, 0.5 * (1.0 + np.cos(np.radians(beta)))
 
 
-def elev_taps(tab: Tables, ear: int, lat: np.ndarray, beta: np.ndarray) -> np.ndarray:
-    """高度修正滤波器 (n, ELEV_TAPS)：在（从耳朵看的侧向角, 极角）网格上双线性插值。"""
-    g = tab.elev[ear]
+def grid_taps(g: np.ndarray, lat: np.ndarray, beta: np.ndarray) -> np.ndarray:
+    """在（从耳朵看的侧向角, 极角）网格上双线性插值出滤波器 (n, taps)。g 为一只耳朵的表 (NA, NB, taps)。"""
     na, nb = g.shape[0], g.shape[1]
     x = (np.clip(lat, -90.0, 90.0) + 90.0) / ELEV_DA
     i0 = np.minimum(np.floor(x).astype(int), na - 2)
@@ -470,6 +476,46 @@ def elev_taps(tab: Tables, ear: int, lat: np.ndarray, beta: np.ndarray) -> np.nd
     j1 = (j0 + 1) % nb
     fb = (y - np.floor(y))[:, None]
     return (1 - fa) * ((1 - fb) * g[i0, j0] + fb * g[i0, j1]) + fa * ((1 - fb) * g[i0 + 1, j0] + fb * g[i0 + 1, j1])
+
+
+def elev_taps(tab: Tables, ear: int, lat: np.ndarray, beta: np.ndarray) -> np.ndarray:
+    """高度修正滤波器 (n, ELEV_TAPS)：在（从耳朵看的侧向角, 极角）网格上双线性插值。"""
+    return grid_taps(tab.elev[ear], lat, beta)
+
+
+def pinna_names() -> list[str]:
+    return [str(n) for n in np.load(PINNA_FILE)["names"]] if PINNA_FILE.exists() else []
+
+
+def load_pinna(name: str):
+    """耳廓选择：返回 (2, NA, NB, PINNA_TAPS) 的滤波表；"ku100" 返回 None（用 KU100 自己的耳廓）。"""
+    if name.strip().lower() in ("", "ku100", "none"):
+        return None
+    z = np.load(PINNA_FILE)
+    names = [str(n).upper() for n in z["names"]]
+    if name.strip().upper() not in names:
+        raise SystemExit(f"--pinna 只能是 ku100 或 {' / '.join(names)}")
+    return z["tables"][names.index(name.strip().upper())]
+
+
+def pinna_apply(h: np.ndarray, az_sofa: np.ndarray, el: np.ndarray | None, r: np.ndarray, P: np.ndarray) -> None:
+    """换耳廓（原地修改 h）：给每只耳朵卷上"真人方向传递函数 ÷ KU100 方向传递函数"的修正，方向按从这只耳朵
+    看向声源算（所以贴耳时用的是耳朵看到的方向，与近场的声学视差一致）。近场的距离、两耳差、时延仍是 KU100 实测的，
+    整体音色也仍是 KU100 的；换掉的只是 1.5 kHz 以上"随方向变化"的耳廓峰谷。表由 HUTUBS 真人实测 HRTF 生成。"""
+    a = np.radians(az_sofa)
+    e = np.zeros_like(a) if el is None else np.radians(el)
+    dx, dy, dz = np.cos(e) * np.cos(a), np.cos(e) * np.sin(a), np.sin(e)
+    rr = np.maximum(r, R_MIN)
+    fade = np.ones(NTAP)
+    fade[-16:] = 0.5 * (1 + np.cos(np.linspace(0, np.pi, 16)))
+    for ear, ey in enumerate((HEAD_A, -HEAD_A)):
+        vx, vy, vz = rr * dx, rr * dy - ey, rr * dz
+        lat = np.degrees(np.arcsin(np.clip((vy if ear == 0 else -vy) / np.sqrt(vx ** 2 + vy ** 2 + vz ** 2), -1, 1)))
+        beta = np.mod(np.degrees(np.arctan2(vz, vx)), 360.0)
+        for i in range(0, len(h), 8192):
+            d = grid_taps(P[ear], lat[i:i + 8192], beta[i:i + 8192])
+            h[i:i + 8192, ear] = np.fft.irfft(np.fft.rfft(h[i:i + 8192, ear], NFFT_BLK, axis=-1) * np.fft.rfft(d, NFFT_BLK, axis=-1),
+                                              NFFT_BLK, axis=-1)[:, :NTAP] * fade
 
 
 def lookup3(tab: Tables, az_sofa: np.ndarray, el: np.ndarray | None, r: np.ndarray):
@@ -521,7 +567,7 @@ def frac_delay(x: np.ndarray, idx: np.ndarray, d: np.ndarray, up: int = 4, pad: 
 
 def ear_intimacy(h_b: np.ndarray, az_b: np.ndarray, r_b: np.ndarray, iso_db: float, presence_db: float,
                  ear_eq: bool = True, dark_db: float = 0.0, el_b: np.ndarray | None = None,
-                 concha_db: float = 0.0) -> None:
+                 concha_db: float = 0.0, far_shadow_db: float = 0.0) -> None:
     """人头麦贴耳感（原地修改 h_b）：嘴贴近一侧耳朵时，近耳加临场 / 空气感，远耳额外压低（单耳独占）；
     离开耳边、转到脸前时按距离和侧向程度平滑恢复。"""
     p = closeness(az_b, r_b, el_b)
@@ -542,6 +588,19 @@ def ear_intimacy(h_b: np.ndarray, az_b: np.ndarray, r_b: np.ndarray, iso_db: flo
         fade[-16:] = 0.5 * (1 + np.cos(np.linspace(0, np.pi, 16)))
         for i in range(0, len(h_b), 8192):
             kk, e = k[i:i + 8192], ipsi[i:i + 8192]
+            hi = h_b[kk, e]
+            he = np.fft.irfft(np.fft.rfft(hi, NFFT_BLK, axis=-1) * eq, NFFT_BLK, axis=-1)[:, :NTAP] * fade
+            h_b[kk, e] = hi + p[i:i + 8192, None] * (he - hi)
+    if far_shadow_db > 0:
+        # 贴耳时远耳的高频遮挡：球头模型低估了近处声源在远耳的高频头影（与 BEM 近距仿真比，离耳 3.8 cm 时
+        # 远耳 6 kHz 以上偏亮 2–9 dB；Brungart & Rabinowitz 1999：声源越近，远耳的头影越深）
+        fz = np.maximum(np.fft.rfftfreq(NFFT_BLK, 1 / FS), 1.0)
+        d = -far_shadow_db / (1 + (FAR_SHADOW_F / fz) ** 2)
+        eq = np.fft.rfft(minphase_from_mag(10 ** (d / 20), NFFT_BLK, 64), NFFT_BLK)
+        fade = np.ones(NTAP, np.float32)
+        fade[-16:] = 0.5 * (1 + np.cos(np.linspace(0, np.pi, 16)))
+        for i in range(0, len(h_b), 8192):
+            kk, e = k[i:i + 8192], 1 - ipsi[i:i + 8192]
             hi = h_b[kk, e]
             he = np.fft.irfft(np.fft.rfft(hi, NFFT_BLK, axis=-1) * eq, NFFT_BLK, axis=-1)[:, :NTAP] * fade
             h_b[kk, e] = hi + p[i:i + 8192, None] * (he - hi)
@@ -591,6 +650,43 @@ def soften_voice(x: np.ndarray, amount: float) -> np.ndarray:
     db = amount * np.interp(np.log(np.maximum(f, 20.0)), np.log(ANSI_F), shape)
     fir = minphase_from_mag(10 ** (db / 20), nfft, 1024)
     return signal.oaconvolve(x, fir)[:len(x)].astype(np.float32)
+
+
+def soften_near(x: np.ndarray, p_b: np.ndarray, amount: float) -> np.ndarray:
+    """贴耳轻声：人凑到耳边会不自觉地放轻声音、退开时说大声一点（Pelegrín-García 等 2011），而说话力度本身就是
+    语音最主要的距离线索——越轻听起来越近，耳语最近（Brungart & Scott 2001；Philbeck & Mershon 2002）。
+    这里让"轻声化"的均衡（soften_voice）跟着贴耳程度走：贴耳时为 amount，离开耳边时恢复原样。只做均衡。
+    p_b 是各块边界处的贴耳程度（0–1）。"""
+    if amount <= 0:
+        return x
+    soft = soften_voice(x, amount)
+    y = np.empty_like(x)
+    for n0 in range(0, len(x), 1 << 22):
+        n1 = min(len(x), n0 + (1 << 22))
+        y[n0:n1] = x[n0:n1] + block_interp(p_b, n0, n1) * (soft[n0:n1] - x[n0:n1])
+    return y
+
+
+def mouth_spread(tab: "Tables", h_b: np.ndarray, az_sofa: np.ndarray, el_b: np.ndarray | None, r_b: np.ndarray,
+                 width: float, pinna: np.ndarray | None = None) -> None:
+    """嘴的大小（原地修改 h_b）：嘴不是一个点，而是一个约 2 cm 宽的开口（ITU-T P.51 的人工嘴唇环直径 25 mm；
+    Halkosaari & Vaalgamaa 2004：真人的等效口半径约 0.5 cm、人工嘴 1.5 cm）。贴耳时这个开口从耳朵看过去张角很大
+    （离耳 1.7 cm、宽 2 cm 约 ±30°），耳廓对各个方向的响应被平均，点声源才有的又窄又深的谷会变浅；
+    离远了张角趋于 0，和点声源没有区别。做法：沿嘴宽方向（水平、垂直于"头中心—声源"连线）取 5 个点，
+    把各点的 HRIR 加权相加（时延已另外处理，这里是对齐后的最小相位响应）。"""
+    rc = np.clip(r_b, R_MIN, R_MAX)
+    near = np.nonzero(rc < MOUTH_R)[0]
+    for i in range(0, len(near), 8192):
+        m = near[i:i + 8192]
+        acc = (1.0 - sum(w for _, w in MOUTH_SPREAD)) * h_b[m]
+        for t, w in MOUTH_SPREAD:
+            d = np.degrees(np.arctan2(t * width / 2, rc[m]))
+            em = None if el_b is None else el_b[m]
+            hk = lookup3(tab, np.mod(az_sofa[m] + d, 360.0), em, r_b[m])[0]
+            if pinna is not None:
+                pinna_apply(hk, np.mod(az_sofa[m] + d, 360.0), em, r_b[m], pinna)
+            acc += w * hk
+        h_b[m] = acc
 
 
 def _sosfilt32(sos: np.ndarray, x: np.ndarray, chunk: int = 1 << 21) -> np.ndarray:
@@ -716,7 +812,8 @@ def render_direct(x: np.ndarray, az_b: np.ndarray, r_b: np.ndarray, tab: Tables,
                   level_follow: float = 1.0, iso_db: float = 0.0, presence_db: float = 0.0, ear_eq: bool = True,
                   dark_db: float = 0.0, r_level: np.ndarray | None = None, gain_b: np.ndarray | None = None,
                   chunk_blocks: int = 2048, el_b: np.ndarray | None = None, level_pos=None,
-                  concha_db: float = 0.0) -> np.ndarray:
+                  concha_db: float = 0.0, mouth: float = 0.0, far_shadow_db: float = 0.0,
+                  pinna: np.ndarray | None = None) -> np.ndarray:
     """时变 HRIR 卷积（重叠保留 + 块内交叉淡化）+ 逐样本分数时延。az_b/r_b 为各块边界处的位置。
     r_level：响度补偿按这条轨迹算（不含忽远忽近，退开时的音量变化另由 gain_b 决定）。
     el_b：各块边界处的仰角（度）；level_pos：带高度时响度补偿所用轨迹的 (方位角, 仰角, 距离)。"""
@@ -727,6 +824,9 @@ def render_direct(x: np.ndarray, az_b: np.ndarray, r_b: np.ndarray, tab: Tables,
         el_b = None
     h_b, tau_b = lookup3(tab, np.mod(-az_b, 360.0), el_b, r_b)   # 用户方位角顺时针 -> SOFA 逆时针
     rc = np.clip(r_b, R_MIN, R_MAX)
+    if pinna is not None:
+        pinna_apply(h_b, np.mod(-az_b, 360.0), el_b, r_b, pinna)
+    lg = None
     if level_follow != 1.0:
         # 响度补偿：按语音频段加权的双耳总功率，相对"贴耳 0.14 m"拉平；方向线索（ITD/ILD/耳廓）不变
         if el_b is not None:
@@ -737,11 +837,15 @@ def render_direct(x: np.ndarray, az_b: np.ndarray, r_b: np.ndarray, tab: Tables,
         else:
             p = path_power(tab, az_b, r_level)
         pref = binaural_power(lookup(tab, np.array([270.0]), np.array([0.14]))[0])[0]
-        h_b *= ((p / pref) ** (-(1.0 - level_follow) / 2))[:, None, None].astype(np.float32)
+        lg = ((p / pref) ** (-(1.0 - level_follow) / 2))[:, None, None].astype(np.float32)
+    if mouth > 0:
+        mouth_spread(tab, h_b, np.mod(-az_b, 360.0), el_b, r_b, mouth, pinna)
+    if lg is not None:
+        h_b *= lg
     if gain_b is not None:
         h_b *= gain_b[:, None, None].astype(np.float32)
-    if ear_eq or iso_db > 0 or presence_db != 0 or dark_db != 0 or concha_db != 0:
-        ear_intimacy(h_b, az_b, rc, iso_db, presence_db, ear_eq, dark_db, el_b, concha_db)
+    if ear_eq or iso_db > 0 or presence_db != 0 or dark_db != 0 or concha_db != 0 or far_shadow_db > 0:
+        ear_intimacy(h_b, az_b, rc, iso_db, presence_db, ear_eq, dark_db, el_b, concha_db, far_shadow_db)
     d_b = (rc / C * FS)[:, None] + tau_b + D0
     tb = np.arange(nb + 1, dtype=float) * BLOCK
     L = NTAP
@@ -1575,6 +1679,14 @@ def main(argv=None) -> int:
                          "不加噪声；0=关闭，1=标准）")
     ap.add_argument("--concha", type=float, default=4.0,
                     help="耳甲共鸣：贴耳时近耳 4.3 kHz 的耳甲腔共振，dB（KU100 贴耳实录的共有特征；0=关闭）")
+    ap.add_argument("--mouth", type=float, default=2.0,
+                    help="嘴的大小（cm）：嘴是一个约 2 cm 宽的开口而不是一个点，贴耳时耳廓的窄谷被平均变浅（0=点声源）")
+    ap.add_argument("--far-shadow", type=float, default=5.0,
+                    help="贴耳时远耳 6 kHz 以上再压低多少 dB（近处声源在远耳的高频头影比球头模型深；0=关闭）")
+    ap.add_argument("--soft-near", type=float, default=0.5,
+                    help="贴耳轻声：凑到耳边时嗓音均衡成\"放轻声音\"（同 --soft-voice，但只在贴耳时），退开时恢复（0=关闭）")
+    ap.add_argument("--pinna", default="ku100",
+                    help="耳廓选择：ku100（默认，人工头自己的耳廓）或真人耳廓 A–G（HUTUBS 实测，挑最像自己耳朵的那只）；list 列出")
     ap.add_argument("--soft-voice", type=float, default=0.0,
                     help="轻声化：按 ANSI S3.5 说话力度频谱，把嗓音往\"压低声音说\"的方向均衡（0=关闭，1=低一档力度）")
     ap.add_argument("--deess", type=float, default=0.0, help="去齿音：齿音最多压低多少 dB（0=关闭，建议 4–8）")
@@ -1595,6 +1707,12 @@ def main(argv=None) -> int:
         ap.error("--mode path 需要 --path")
 
     t_start = time.time()
+    if a.pinna.strip().lower() == "list":
+        print("ku100（默认，KU100 人工头自己的耳廓）")
+        if PINNA_FILE.exists():
+            z = np.load(PINNA_FILE)
+            print("\n".join(f"{n}（真人，HUTUBS pp{sid}）" for n, sid in zip(z["names"], z["subjects"])))
+        return 0
     if a.headphone.strip().lower() == "list":
         print("diffuse（默认，通用扩散场补偿）\nnative（不补偿，KU100 原机音色）")
         print("\n".join(f.stem for f in headphone_models(a.hrtf_dir)))
@@ -1697,8 +1815,10 @@ def main(argv=None) -> int:
                    delimiter=",", fmt="%.3f", header="t_sec,az_deg,dist_m,el_deg", comments="")
 
     y = np.zeros((2, len(x)), np.float32)
-    # 贴耳气声：气声增强 + 气流扑耳，只作用于直达声（房间声仍用原来的人声）
-    xs, puffs = breath_fx(x, closeness(az, r, el), a.breath, a.puff)
+    # 贴耳轻声、贴耳气声（气声增强 + 气流扑耳）：只作用于直达声（房间声仍用原来的人声）
+    p_ear = closeness(az, r, el)
+    xs = soften_near(x, p_ear, a.soft_near)
+    xs, puffs = breath_fx(xs, p_ear, a.breath, a.puff)
     xd = apply_warmth(xs, r, a.warmth)
     if puffs is not None:
         xd = xd + puffs
@@ -1706,7 +1826,7 @@ def main(argv=None) -> int:
     del xs, puffs
     direct = render_direct(xd, az, r, tab, a.level_follow, a.isolation, a.presence, a.ku100_eq, a.dark,
                            r_level=r_base if g_sway is not None else None, gain_b=g_sway, el_b=el, level_pos=base_pos,
-                           concha_db=a.concha)
+                           concha_db=a.concha, mouth=a.mouth / 100.0, far_shadow_db=a.far_shadow, pinna=load_pinna(a.pinna))
     del xd
     apply_ear_lf(direct, az, r, a.ear_warmth, a.far_lf_cut, el_b=el)
     if pb is None:

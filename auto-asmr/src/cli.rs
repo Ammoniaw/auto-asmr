@@ -30,6 +30,10 @@ convert 的选项（括号里是默认值）：
   --ku100-eq              近耳用 KU100 实测校正曲线
   --breath <dB>           气声增强：贴耳时轻的送气声 / 气息最多提高多少，响的齿音不提（6，0=关闭）
   --puff <x>              气流扑耳：送气时气流扑到耳朵上的低频脉冲，由嗓音自己的送气声导出（1，0=关闭）
+  --pinna ku100|A…G       耳廓选择：ku100=人工头自己的耳廓；A…G=真人耳廓（挑最像自己耳朵的）；--pinna list 列出（ku100）
+  --mouth <cm>            嘴的大小：嘴是约 2 cm 宽的开口而不是一个点，贴耳时耳廓的窄谷变浅（2，0=点声源）
+  --far-shadow <dB>       贴耳时远耳 6 kHz 以上再压低（5，0=关闭）
+  --soft-near <x>         贴耳轻声：凑到耳边时嗓音均衡成放轻声音，退开时恢复（0.5，0=关闭）
   --concha <dB>           耳甲共鸣：贴耳时近耳 4.3 kHz 的耳甲腔共振（4，0=关闭）
  左右移动
   --mode sweep|random|orbit|static  穿梭 / 随机走位 / 环绕 / 固定（sweep）
@@ -180,6 +184,27 @@ fn run_convert(args: &[String]) -> Result<(), String> {
             "--breath" => p.breath_db = f(&mut it)?.max(0.0),
             "--puff" => p.puff = f(&mut it)?.max(0.0),
             "--concha" => p.concha_db = f(&mut it)?,
+            "--pinna" => {
+                let v = it.next().ok_or("--pinna 需要一个名字")?;
+                let ps = crate::dsp::pinna::pinnas();
+                if v.eq_ignore_ascii_case("list") {
+                    println!("ku100（默认，KU100 人工头自己的耳廓）");
+                    for q in &ps.items {
+                        println!("{}（真人，HUTUBS pp{}）", q.name, q.subject);
+                    }
+                    return Ok(());
+                }
+                if v.eq_ignore_ascii_case("ku100") {
+                    p.pinna = "KU100".to_string();
+                } else if let Some(i) = ps.index(v) {
+                    p.pinna = ps.items[i].name.clone();
+                } else {
+                    return Err(format!("--pinna {v:?} 不认识，用 --pinna list 查看"));
+                }
+            }
+            "--mouth" => p.mouth_cm = f(&mut it)?.clamp(0.0, 8.0),
+            "--far-shadow" => p.far_shadow_db = f(&mut it)?.max(0.0),
+            "--soft-near" => p.soft_near = f(&mut it)?.max(0.0),
             "--mode" => {
                 p.mode = match it.next().map(|s| s.as_str()) {
                     Some("sweep") => MotionMode::Sweep,
