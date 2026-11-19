@@ -100,7 +100,7 @@ pub struct Shared {
     /// 最近每次输出回调的处理时间（微秒，平滑 / 最大）。
     pub proc_us: AtomicU32,
     pub proc_max_us: AtomicU32,
-    /// 断流次数（输入来不及 / 积压过多）。
+    /// 断流次数（设备报告的短暂断流，或输入来不及 / 积压过多）。
     pub xruns: AtomicU32,
     /// 引擎算法延时（样本，48 kHz）。
     pub algo_samples: AtomicU32,
@@ -175,6 +175,17 @@ impl Shared {
     /// 设备出错（拔掉、被占用等）时的说明；读一次即清空。
     pub fn take_error(&self) -> Option<String> {
         self.error.lock().ok().and_then(|mut e| e.take())
+    }
+
+    fn stream_error(&self, device: &str, error: cpal::Error) {
+        // Xrun 表示短暂音频不连续；CPAL 后端仍在运行，不能因此停掉音频流。
+        if error.kind() == cpal::ErrorKind::Xrun {
+            self.xruns.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
+        if let Ok(mut pending) = self.error.lock() {
+            *pending = Some(format!("{device}设备出错：{error}"));
+        }
     }
 
     pub fn seek_preview(&self, sample: u64) {
@@ -271,11 +282,7 @@ where
             }
             sink(&tmp);
         },
-        move |e| {
-            if let Ok(mut g) = sh.error.lock() {
-                *g = Some(format!("输入设备出错：{e}"));
-            }
-        },
+        move |e| sh.stream_error("输入", e),
         None,
     )
 }
@@ -309,11 +316,7 @@ where
                 }
             }
         },
-        move |e| {
-            if let Ok(mut g) = sh.error.lock() {
-                *g = Some(format!("输出设备出错：{e}"));
-            }
-        },
+        move |e| sh.stream_error("输出", e),
         None,
     )
 }
@@ -811,6 +814,30 @@ pub fn selftest(seconds: f32, opts: &RtOptions, cfg: Arc<EngineConfig>, file: Op
 mod tests {
     use super::*;
     use crate::dsp::params::Params;
+
+    #[test]
+    fn stream_xruns_are_counted_without_stopping_audio() {
+        let shared = Shared::new(Arc::new(EngineConfig::new(Params::default(), None)));
+        for device in ["输入", "输出"] {
+            shared.stream_error(device, cpal::ErrorKind::Xrun.into());
+        }
+        assert_eq!(shared.xruns.load(Ordering::Relaxed), 2);
+        assert!(shared.take_error().is_none());
+    }
+
+    #[test]
+    fn stream_xruns_do_not_hide_a_fatal_device_error() {
+        let shared = Shared::new(Arc::new(EngineConfig::new(Params::default(), None)));
+        for device in ["输入", "输出"] {
+            shared.stream_error(device, cpal::ErrorKind::DeviceNotAvailable.into());
+            shared.stream_error(device, cpal::ErrorKind::Xrun.into());
+            let error = shared.take_error().expect("disconnected devices must still stop audio");
+            assert!(error.starts_with(&format!("{device}设备出错：")));
+            assert!(error.contains(&cpal::ErrorKind::DeviceNotAvailable.to_string()));
+            assert!(shared.take_error().is_none());
+        }
+        assert_eq!(shared.xruns.load(Ordering::Relaxed), 2);
+    }
 
     fn preview_pump(audio: Vec<f32>, out_rate: f64, dry: bool) -> (Pump, Arc<Shared>) {
         let params = Params { auto_level: false, ..Params::default() };
