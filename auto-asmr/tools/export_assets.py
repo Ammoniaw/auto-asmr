@@ -11,7 +11,7 @@
   高度修正表（2 耳 × 37 个侧向角 × 36 个极角 × 48 点，int16）。
 
 用法：uv run tools/export_assets.py            （在 auto-asmr/auto-asmr 目录下运行）
-数据来源与许可见 README：TH Köln，Zenodo 4297951 / 5031335，CC BY 4.0。
+数据来源与许可见 doc/data-license.md：TH Köln，Zenodo 4297951 / 5031335，CC BY 4.0。
 """
 from __future__ import annotations
 
