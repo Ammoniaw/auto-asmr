@@ -28,6 +28,13 @@ pub const R_MIN: f32 = 0.095;
 pub const R_MAX: f32 = 3.0;
 /// 贴耳轻语时嘴到头中心的距离（离耳朵约 1.7 cm）。
 pub const EAR_R: f32 = 0.105;
+/// 入耳（掏耳）：物体还在耳道口时，它与话筒之间那段"耳甲 + 耳道"的等效长度（米）。
+/// 两段 KU100 掏耳实录里，棉签在最外面时共振约 3 kHz（四分之一波长：343 / (4 × 0.029) ≈ 2.96 kHz）。
+pub const CANAL_L0: f32 = 0.029;
+/// 物体伸到最里面时与话筒之间最短还剩多长（米）：0.6 cm ≈ 14 kHz。
+pub const CANAL_L_MIN: f32 = 0.006;
+/// 入耳深度的上限（厘米）。
+pub const INEAR_MAX_CM: f32 = (CANAL_L0 - CANAL_L_MIN) * 100.0;
 /// 最小相位 HRIR 长度。
 pub const NTAP: usize = 128;
 /// 控制块长度：每 64 个样本（1.33 ms）更新一次位置和滤波器。

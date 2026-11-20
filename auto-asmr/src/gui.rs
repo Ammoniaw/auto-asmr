@@ -225,6 +225,8 @@ pub struct App {
     view3d: view3d::View3d,
     /// 最近一次用的自动模式（关掉"手动摆位"时回到它）、上一帧的模式。
     auto_mode: MotionMode,
+    /// 进手动摆位之前的"响度随位置变化"（风格预设可能定过自己的值），取消手动摆位时恢复。
+    auto_level_follow: f32,
     last_mode: MotionMode,
     shot: Option<(PathBuf, u32)>,
     /// 截图自检时模拟的一次拖动：按下点和松开点（窗口坐标），以及是否用右键。
@@ -297,6 +299,7 @@ impl App {
                 self.s = s;
                 self.last_mode = mode;
                 self.auto_mode = if mode == MotionMode::Manual { MotionMode::Sweep } else { mode };
+                self.auto_level_follow = if mode == MotionMode::Manual { Params::default_level_follow(MotionMode::Sweep) } else { self.s.params.level_follow };
                 self.reload_devices();
                 // 参数由 sync_params 和 self.sent 比较后提交给引擎
                 self.status = format!("{}：{}", t("配置已导入", "Configuration imported"), path.display());
@@ -335,6 +338,7 @@ impl App {
         style.spacing.item_spacing = egui::vec2(8.0, 6.0);
         cc.egui_ctx.set_global_style(style);
         let s_mode = s.params.mode;
+        let s_level_follow = s.params.level_follow;
         let is_shot = shot.is_some();
         let mut app = App {
             sent: s.params.clone(),
@@ -362,6 +366,7 @@ impl App {
             trail: Vec::new(),
             view3d: view3d::View3d::default(),
             auto_mode: if s_mode == MotionMode::Manual { MotionMode::Sweep } else { s_mode },
+            auto_level_follow: if s_mode == MotionMode::Manual { Params::default_level_follow(MotionMode::Sweep) } else { s_level_follow },
             last_mode: s_mode,
             shot,
             shot_drag: std::env::var("AUTO_ASMR_SHOT_DRAG").ok().and_then(|v| {
@@ -1241,7 +1246,9 @@ impl App {
         // 高度角：以"耳朵"为支点（与运动里倾斜的支点相同：正侧方时是那只耳朵，正前 / 正后方时是头中心）
         let (up, _, plan_r) = up_angle(self.tele.az, self.tele.el, r3);
         p.circle_filled(egui::pos2(gx, gauge_y(up)), if speaking && active { 5.0 } else { 4.0 }, col);
-        p.text(rect.left_top() + egui::vec2(8.0, 6.0), egui::Align2::LEFT_TOP, format!("{} {:.1} cm   {:.0}°{}", t("离耳", "from ear"), ((plan_r - HEAD_A) * 100.0).max(0.0), self.tele.az, hgt_text(up)), egui::FontId::proportional(12.0), fg);
+        // 伸进耳道时显示入耳深度，否则显示离耳多远
+        let near = if self.tele.depth_cm > 0.05 { format!("{} {:.1} cm", t("入耳", "in ear"), self.tele.depth_cm) } else { format!("{} {:.1} cm", t("离耳", "from ear"), ((plan_r - HEAD_A) * 100.0).max(0.0)) };
+        p.text(rect.left_top() + egui::vec2(8.0, 6.0), egui::Align2::LEFT_TOP, format!("{near}   {:.0}°{}", self.tele.az, hgt_text(up)), egui::FontId::proportional(12.0), fg);
     }
 
     /// 电平条：`frac` 0–1 是填充比例，`hot` 时变红。
@@ -1294,7 +1301,8 @@ impl App {
             if r.on_hover_text(tip).on_disabled_hover_text(t("多音频合成·各自固定时，直接在位置图上拖各音频的圆圈", "While mixing with fixed positions, drag each file's ring on the map")).changed() {
                 let p = &mut self.s.params;
                 p.mode = if manual { MotionMode::Manual } else { self.auto_mode };
-                p.level_follow = Params::default_level_follow(p.mode);
+                // 取消手动摆位：回到原来的自动模式，"响度随位置变化"也恢复成进手动之前的值（进手动时在 sync_params 里记下）
+                p.level_follow = if manual { Params::default_level_follow(p.mode) } else { self.auto_level_follow };
             }
             ui.checkbox(&mut self.s.view3d, t("3D 视图：立体观察人头和音源的相对位置", "3D view: see the source around the head in 3D"))
                 .on_hover_text(t("打开一个小窗口：左键拖动音源（自动切到手动摆位），右键拖动旋转视角；关掉时不绘制，不占资源", "Opens a small window: left-drag moves the source (switches to manual), right-drag rotates the view; nothing is drawn while it is off"));
@@ -1768,17 +1776,29 @@ impl App {
 
     /// 右侧第一栏：风格、贴耳感、左右移动。`mix`：多音频合成中时是 Some(是否一起移动)——各自固定时左右移动不起作用，
     /// 一起移动时几个音频按这里的方式一起走。
-    fn params_left(ui: &mut egui::Ui, p: &mut Params, mix: Option<bool>) {
+    ///
+    /// 返回值：按了风格按钮、文件转换的目标响度也该跟着换时，是新的目标响度（掏耳 −20 LUFS，其余 −16）。
+    fn params_left(ui: &mut egui::Ui, p: &mut Params, mix: Option<bool>) -> Option<f32> {
+        let mut file_lufs = None;
         ui.horizontal(|ui| {
             ui.label(RichText::new(t("风格", "Style")).strong());
-            if ui.button(t("贴耳加强", "Close to ear")).on_hover_text(t("嘴离耳约 1.7 cm，另一只耳朵几乎听不到，不加房间", "Mouth ≈1.7 cm from the ear, far ear almost silent, no room")).clicked() {
+            // 从掏耳切回人声的风格：文件转换的目标响度也恢复成 −16
+            let back = (p.inear_cm > 0.0).then_some(Params::default().target_lufs);
+            if ui.button(t("贴耳加强", "Close to ear")).on_hover_text(t("嘴离耳约 1.7 cm，另一只耳朵几乎听不到，不加房间，左右耳慢慢穿梭", "Mouth ≈1.7 cm from the ear, far ear almost silent, no room, slow sweeps between the ears")).clicked() {
                 *p = p.clone().style_ear();
+                file_lufs = back;
             }
-            if ui.button(t("KU100 实录", "KU100 natural")).on_hover_text(t("按真实 KU100 录音标定：远耳听得到、离耳约 6 cm、真实房间、KU100 原机音色", "Calibrated to real KU100 recordings: far ear audible, ≈6 cm, real room, native KU100 tone")).clicked() {
+            if ui.button(t("KU100 实录", "KU100 natural")).on_hover_text(t("按真实 KU100 轻语录音标定：远耳听得到、真实房间、KU100 原机音色；像真人一样随机走位，约三分之一的停留在正面，贴耳时离耳约 2–4 cm；贴耳与正面的响度差更小，气流更明显，齿音和 5 kHz 附近更柔", "Calibrated to real KU100 whisper recordings: far ear audible, real room, native KU100 tone; moves like a person (about a third of the stops in front, 2–4 cm from the ear when close); smaller level difference between ear and front, more breath on the ear, softer sibilants and 5 kHz region")).clicked() {
                 *p = p.clone().style_ku100();
+                file_lufs = back;
+            }
+            if ui.button(t("掏耳", "Ear cleaning")).on_hover_text(t("给棉签、挖耳勺、刮擦这类触发音用（不是给人声用的）：声源伸进耳道进进出出，带耳道共鸣、耳内低频和堵耳的闷感，另一只耳朵基本听不到，每只耳朵约 40 秒才换边。按两段 KU100 掏耳实录标定。降噪会把这类声音当噪声压掉，请把降噪关掉或调低", "For trigger sounds such as cotton swabs, ear picks and scratching (not for voice): the source moves in and out of the ear canal with canal resonance, in-ear rumble and an occluded tone; the other ear is almost silent and the ear changes about every 40 s. Calibrated to two KU100 ear-cleaning recordings. Denoise treats such sounds as noise: turn it off or down")).clicked() {
+                *p = p.clone().style_earclean();
+                file_lufs = Some(crate::dsp::params::EARCLEAN_LUFS);
             }
             if ui.button(t("恢复默认", "Reset")).clicked() {
                 *p = Params::default();
+                file_lufs = back;
             }
         });
         egui::CollapsingHeader::new(RichText::new(t("贴耳感", "Closeness")).strong()).default_open(true).show(ui, |ui| {
@@ -1802,6 +1822,23 @@ impl App {
             });
             ui.checkbox(&mut p.ku100_eq, t("近耳用 KU100 实测校正曲线（高频更收）", "KU100-calibrated near-ear EQ (softer highs)"));
         });
+        // 没启用（入耳深度为 0）时默认折叠，启用后默认展开；两种状态各记各的展开 / 折叠
+        let inear_on = p.inear_cm > 0.0;
+        egui::CollapsingHeader::new(RichText::new(t("入耳（掏耳）", "In the ear (ear cleaning)")).strong()).id_salt(if inear_on { "inear_on" } else { "inear_off" }).default_open(inear_on).show(ui, |ui| {
+            egui::Grid::new("g1b").num_columns(2).min_col_width(COL).spacing([10.0, 6.0]).show(ui, |ui| {
+                row(ui, t("入耳深度", "Depth in ear"), t("声源贴到耳朵上之后，最深伸进耳道多少。0 = 不进耳道，这一组都不起作用。给棉签、挖耳勺、刮擦这类触发音用；只有贴在耳朵上时才会伸进去，换边前先退出来", "How far the source goes into the ear canal once it is at the ear. 0 = never enters, and this whole group is off. Meant for trigger sounds (cotton swab, ear pick, scratching); it only goes in while at the ear and comes out before changing ears"), egui::Slider::new(&mut p.inear_cm, 0.0..=crate::dsp::INEAR_MAX_CM).suffix(" cm").fixed_decimals(1));
+            });
+            ui.add_enabled_ui(p.inear_cm > 0.0, |ui| {
+                egui::Grid::new("g1c").num_columns(2).min_col_width(COL).spacing([10.0, 6.0]).show(ui, |ui| {
+                    row(ui, t("进出节奏", "In / out period"), t("有声音时，一次「伸进去—退出来」大约几秒（KU100 掏耳实录 2–6 秒）", "Seconds of sound per in-and-out stroke (KU100 ear-cleaning recordings: 2–6 s)"), egui::Slider::new(&mut p.inear_period, 1.5..=12.0).suffix(" s").fixed_decimals(1));
+                    row(ui, t("随机程度", "Randomness"), t("0 = 进出的节奏和深浅固定，1 = 都随机，偶尔只伸到一半、偶尔整个拿出来", "0 = fixed rhythm and depth, 1 = random, sometimes only halfway in, sometimes fully out"), egui::Slider::new(&mut p.inear_random, 0.0..=1.0).fixed_decimals(2));
+                    row(ui, t("耳道共鸣", "Canal resonance"), t("伸进耳道后，物体与话筒（鼓膜）之间那段耳道的共振峰：伸得越深共振越高（约 3 → 11 kHz），听得出进出的深浅。0 = 关闭", "Resonance of the part of the canal left between the object and the microphone (eardrum): the deeper, the higher (≈3 → 11 kHz), which is what makes the depth audible. 0 = off"), egui::Slider::new(&mut p.canal_db, 0.0..=16.0).suffix(" dB").fixed_decimals(1));
+                    row(ui, t("耳内低频", "In-ear rumble"), t("摩擦 / 触碰在耳道里形成的低频压力（隆隆声），由输入自己的包络导出，不加噪声。0 = 关闭，1 倍 = 标准（比摩擦声高约 15 dB，实录 10–20 dB）。输入本身低频就重（直接摩擦话筒录的）时调低", "Low-frequency pressure (rumble) that rubbing and touching build up inside the canal, derived from the input's own envelope, no noise added. 0 = off, 1x = standard (≈15 dB above the friction sound; recordings: 10–20 dB). Turn it down if the input is already bass-heavy (recorded by rubbing the microphone itself)"), egui::Slider::new(&mut p.rumble, 0.0..=3.0).suffix(t(" 倍", "x")).fixed_decimals(2));
+                    row(ui, t("堵耳闷感", "Occluded tone"), t("伸进耳道时近耳 2.5 kHz 以上压低多少：物体堵住了耳道口，声音更闷。0 = 关闭", "Cut above 2.5 kHz at the near ear while inside the canal: the object blocks the entrance, so it sounds more muffled. 0 = off"), egui::Slider::new(&mut p.muffle_db, 0.0..=12.0).suffix(" dB").fixed_decimals(1));
+                });
+            });
+            ui.add(egui::Label::new(RichText::new(t("入耳深度为 0 时这一组不起作用。人声用的气声增强、气流扑耳、忽远忽近等，掏耳时建议关掉（点上面的「掏耳」一键设置）", "This group is inactive while the depth is 0. For ear cleaning, switch off the voice-only effects (breath lift, puff, near / far sway…): the Ear cleaning style button does it in one click")).weak().small()).wrap());
+        });
         egui::CollapsingHeader::new(RichText::new(t("左右移动", "Left / right motion")).strong()).default_open(true).show(ui, |ui| {
             let accent = Color32::from_rgb(70, 150, 240);
             match mix {
@@ -1821,6 +1858,7 @@ impl App {
                 ui.add(egui::Label::new(RichText::new(t("手动：声源停在你摆的位置，在左边的位置图上拖动。忽远忽近、上下、自然晃动此时不起作用", "Manual: the source stays where you put it; drag it on the map at the left. Near / far sway, up / down and micro motion are inactive")).weak().small()).wrap());
             }
         });
+        file_lufs
     }
 
     /// "左右移动"里的模式按钮和各模式的参数（合成时整块变灰）。
@@ -1845,9 +1883,12 @@ impl App {
                             p.hold_s = (p.hold_s * k).max(0.001);
                             p.move_s = (p.move_s * k).max(0.001);
                         }
-                        row(ui, t("停留时间", "Hold time"), t("每只耳朵边停留多久", "How long it stays at each ear"), egui::Slider::new(&mut p.hold_s, 0.3..=12.0).suffix(" s").fixed_decimals(1));
+                        row(ui, t("停留时间", "Hold time"), t("每只耳朵边停留多久（掏耳时一般几十秒）", "How long it stays at each ear (tens of seconds for ear cleaning)"), egui::Slider::new(&mut p.hold_s, 0.3..=60.0).logarithmic(true).suffix(" s").fixed_decimals(1));
                         row(ui, t("移动时间", "Move time"), t("从一只耳朵移到另一只耳朵用多久", "How long a crossing takes"), egui::Slider::new(&mut p.move_s, 0.3..=12.0).suffix(" s").fixed_decimals(1));
                         row(ui, t("随机程度", "Randomness"), t("时长和落点的随机程度：0 = 完全规律", "Randomness of timing and landing spots: 0 = strictly regular"), egui::Slider::new(&mut p.randomness, 0.0..=1.0).fixed_decimals(2));
+                        if p.mode == MotionMode::Random {
+                            row(ui, t("正面比例", "Stops in front"), t("每次停下来，有多大比例停在正前方（两只耳朵听到的差不多），其余停在耳边、侧前、侧后。KU100 轻语实录里约三成的时间两耳差不多", "Share of the stops that land in front (both ears about equal); the rest land at an ear, front-side or back-side. In KU100 whisper recordings both ears are about equal for roughly 30% of the time"), egui::Slider::new(&mut p.front, 0.0..=0.7).fixed_decimals(2));
+                        }
                         if p.mode == MotionMode::Sweep {
                             row(ui, t("从远处凑近", "Approach"), t("换边时先退到约 0.5 m 再慢慢凑近的概率", "Chance that a switch backs off to ≈0.5 m and then looms in"), egui::Slider::new(&mut p.approach, 0.0..=1.0).fixed_decimals(2));
                             row(ui, t("贴耳角度", "Ear angle"), t("90 = 正侧方，100 = 略靠后", "90 = straight to the side, 100 = slightly behind"), egui::Slider::new(&mut p.ear_angle, 60.0..=140.0).suffix("°").fixed_decimals(0));
@@ -1974,6 +2015,7 @@ impl App {
         if mode != self.last_mode {
             if mode == MotionMode::Manual {
                 self.auto_mode = self.last_mode;
+                self.auto_level_follow = self.sent.level_follow;
                 if self.rt.is_some()
                     && self.s.params.manual_az == self.sent.manual_az
                     && self.s.params.manual_dist == self.sent.manual_dist
@@ -2226,10 +2268,14 @@ impl eframe::App for App {
         egui::CentralPanel::default().show(ui, |ui| {
             egui::ScrollArea::vertical().id_salt("rightscroll").show(ui, |ui| {
                 let p = &mut self.s.params;
+                let mut style_lufs = None;
                 ui.columns(2, |c| {
-                    Self::params_left(&mut c[0], p, layout);
+                    style_lufs = Self::params_left(&mut c[0], p, layout);
                     Self::params_right(&mut c[1], p, layout == Some(false));
                 });
+                if let Some(l) = style_lufs {
+                    self.s.file_lufs = l;
+                }
             });
         });
 
@@ -2352,7 +2398,7 @@ fn job_progress(j: &Job) -> (f32, usize, usize) {
 /// 单个文件转换完成后的说明。
 fn report_text(rep: &ConvertReport, out: &Path) -> String {
     format!(
-        "{}：{}\n{:.1} s，{:.1} LUFS，{} {:.1} dBTP，{} {:.1} dB；{} {:.0}%，{} {}（{} {}），{} {}，{} {}；{} {:.1} s{}",
+        "{}：{}\n{:.1} s，{:.1} LUFS，{} {:.1} dBTP，{} {:.1} dB；{} {:.0}%，{} {}（{} {}），{} {}，{} {}{}；{} {:.1} s{}",
         t("已保存", "Saved"),
         out.display(),
         rep.seconds,
@@ -2371,6 +2417,7 @@ fn report_text(rep: &ConvertReport, out: &Path) -> String {
         rep.n_sways,
         t("上下换位", "up / down moves"),
         rep.n_updowns,
+        if rep.n_strokes > 0 { format!("，{} {}", t("伸进耳道", "strokes into the ear"), rep.n_strokes) } else { String::new() },
         t("用时", "took"),
         rep.elapsed_s,
         if rep.channel_note.is_empty() { String::new() } else { format!("\n{}", rep.channel_note) }
@@ -2419,9 +2466,13 @@ mod tests {
 
     #[test]
     fn extended_parameter_values_survive_redraw_and_serialization() {
-        for mode in [MotionMode::Sweep, MotionMode::Manual] {
+        for mode in [MotionMode::Sweep, MotionMode::Manual, MotionMode::Random] {
             let mut params = Params {
                 mode,
+                inear_cm: 3.5,
+                rumble: 5.0,
+                canal_db: 20.0,
+                front: 0.9,
                 puff: 10.0,
                 warmth_db: 18.0,
                 hold_s: 30.0,

@@ -355,6 +355,7 @@ impl Mixer {
             t.n_sways += u.n_sways;
             t.n_tops += u.n_tops;
             t.n_updowns += u.n_updowns;
+            t.n_strokes += u.n_strokes;
         }
         t.out_db = lin_to_db(self.out_pk);
         let rt = self.post == PostMode::Realtime;

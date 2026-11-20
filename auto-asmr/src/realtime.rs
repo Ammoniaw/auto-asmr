@@ -94,7 +94,7 @@ pub struct Shared {
     cfg_ver: AtomicU64,
     /// true = 监听原声（不经过效果），false = 输出效果。
     pub monitor_dry: AtomicBool,
-    tele: [AtomicU32; 13],
+    tele: [AtomicU32; 15],
     /// 环形缓冲里平均积压的时间（微秒）。
     pub fill_us: AtomicU32,
     /// 最近每次输出回调的处理时间（微秒，平滑 / 最大）。
@@ -147,7 +147,7 @@ impl Shared {
     }
 
     fn store_tele(&self, t: &Telemetry) {
-        let v = [t.az, t.r, t.closeness, t.act, t.in_db, t.out_db, t.gr_db, t.level_gain_db, t.n_moves as f32, t.n_sways as f32, t.el, t.n_tops as f32, t.n_updowns as f32];
+        let v = [t.az, t.r, t.closeness, t.act, t.in_db, t.out_db, t.gr_db, t.level_gain_db, t.n_moves as f32, t.n_sways as f32, t.el, t.n_tops as f32, t.n_updowns as f32, t.depth_cm, t.n_strokes as f32];
         for (a, x) in self.tele.iter().zip(v) {
             a.store(x.to_bits(), Ordering::Relaxed);
         }
@@ -169,6 +169,8 @@ impl Shared {
             el: g(10),
             n_tops: g(11) as u32,
             n_updowns: g(12) as u32,
+            depth_cm: g(13),
+            n_strokes: g(14) as u32,
         }
     }
 

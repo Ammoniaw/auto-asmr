@@ -4,7 +4,7 @@
 use super::filters::{Biquad, BUTTER_Q};
 use super::params::{MotionMode, Params, Via};
 use super::rng::Rng;
-use super::{smoothstep, CTRL_DT, FS, HEAD_A, R_MAX, R_MIN};
+use super::{smoothstep, CANAL_L0, CANAL_L_MIN, CTRL_DT, FS, HEAD_A, INEAR_MAX_CM, R_MAX, R_MIN};
 use std::collections::VecDeque;
 use std::f32::consts::{FRAC_PI_2, PI, TAU};
 
@@ -22,6 +22,22 @@ pub struct Pose {
     /// 不含忽远忽近的位置的方位角、仰角（带高度时与 `az` / `el` 略有不同）。
     pub az_base: f32,
     pub el_base: f32,
+    /// 入耳深度（米）：声源贴在耳朵上时伸进耳道多深；0 = 没有进耳道。
+    pub depth: f32,
+}
+
+/// 贴到耳朵上多近才算"可以伸进耳道"：贴耳程度从 0.80 到 0.95 渐入。
+#[inline]
+fn inear_gate(az: f32, el: f32, r: f32) -> f32 {
+    smoothstep((super::engine::closeness(az, el, r.clamp(R_MIN, R_MAX)) - 0.80) / 0.15)
+}
+
+/// 进出手势（0–1）换成入耳深度（米）。手势在"共振频率的对数"上是线性的——实录里共振峰在对数频率轴上
+/// 走的是直线（V 字形），所以剩余的耳道长度按几何插值：L = L0^(1−u) · Lmin^u，深度 = L0 − L。
+#[inline]
+pub fn inear_depth(u: f32, inear_cm: f32) -> f32 {
+    let l_min = (CANAL_L0 - 0.01 * inear_cm.clamp(0.0, INEAR_MAX_CM)).max(CANAL_L_MIN);
+    (CANAL_L0 - CANAL_L0.powf(1.0 - u) * l_min.powf(u)).max(0.0)
 }
 
 /// 把水平面上的位置（方位角 `az`、距离 `r`）抬离水平面，返回（方位角, 仰角, 距离）。
@@ -140,6 +156,15 @@ pub struct Motion {
     ud_init: bool,
     micro_z: [(f32, f32, f32); 4],
     micro_z_norm: f32,
+    // 入耳进出
+    dp_rng: Rng,
+    dp_k0: (f64, f32),
+    dp_k1: (f64, f32),
+    dp_stage: u8,
+    dp_deep: f32,
+    dp_init: bool,
+    dp_lp: Biquad,
+    dp_on: bool,
     // 手动摆位
     /// 上一步输出的位置（方位角, 仰角, 距离）：切到手动时从这里出发。
     last: (f32, f32, f32),
@@ -152,6 +177,8 @@ pub struct Motion {
     pub n_sways: u32,
     pub n_tops: u32,
     pub n_updowns: u32,
+    /// 统计：伸进耳道的次数。
+    pub n_strokes: u32,
 }
 
 impl Motion {
@@ -209,6 +236,14 @@ impl Motion {
             ud_init: false,
             micro_z,
             micro_z_norm: pz.sqrt(),
+            dp_rng: Rng::new(seed.wrapping_add(505)), // 单独的随机数，不打乱原来的走位
+            dp_k0: (0.0, 0.0),
+            dp_k1: (0.0, 0.0),
+            dp_stage: 0,
+            dp_deep: 0.9,
+            dp_init: false,
+            dp_lp: Biquad::lowpass_at(2.5, BUTTER_Q, FS / super::CTRL as f32),
+            dp_on: false,
             last: (270.0, 0.0, 0.105),
             man: None,
             leave: None,
@@ -216,6 +251,7 @@ impl Motion {
             n_sways: 0,
             n_tops: 0,
             n_updowns: 0,
+            n_strokes: 0,
         }
     }
 
@@ -345,11 +381,13 @@ impl Motion {
         let q = self.rng.unit();
         let scale = p.ear_dist / 0.105;
         // (方位角范围, 距离范围)，右侧定义，左侧镜像
-        let (kind, (a0, a1), (r0, r1)) = if q < 0.58 {
+        // 停在正前方的比例可调（默认 0.08 = 原来的比例，其余三种位置按原来的比例分）
+        let k = if (p.front - 0.08).abs() < 1e-6 { 1.0 } else { (1.0 - p.front.clamp(0.0, 1.0)) / 0.92 };
+        let (kind, (a0, a1), (r0, r1)) = if q < 0.58 * k {
             (0, (80.0, 98.0), (0.105 * scale, 0.12 * scale))
-        } else if q < 0.80 {
+        } else if q < 0.80 * k {
             (1, (28.0, 60.0), (0.22f32.max(p.ear_dist), 0.38f32.max(p.ear_dist + 0.05)))
-        } else if q < 0.92 {
+        } else if q < 0.92 * k {
             (2, (112.0, 150.0), (0.20f32.max(p.ear_dist), 0.38f32.max(p.ear_dist + 0.05)))
         } else {
             (3, (-15.0, 15.0), (0.30f32.max(p.ear_dist + 0.05), 0.50f32.max(p.ear_dist + 0.1)))
@@ -474,6 +512,80 @@ impl Motion {
         v0 + (v1 - v0) * smoothstep(((tm - t0) / (t1 - t0).max(1e-6)) as f32)
     }
 
+    /// 入耳的进出手势（0 = 在耳道口，1 = 伸到最深）：在外面停一下 → 伸进去 → 在里面停一会儿 → 退出来，循环。
+    /// 两段 KU100 掏耳实录里，共振峰一个来回 2–6 s，在"浅"（约 3–4 kHz）和"深"（约 8–12 kHz）两头停得多、中间走得快
+    /// （约每秒 1 个倍频程）。随机程度为 0 时节奏和深浅固定；为 1 时都随机，偶尔只伸到一半、偶尔整个退出来。
+    fn depth_gesture(&mut self, p: &Params, tm: f64) -> f32 {
+        let rho = p.inear_random.clamp(0.0, 1.0);
+        let sc = p.inear_period.max(0.5) / 4.05;
+        let mix = |rng: &mut Rng, lo: f32, hi: f32| {
+            let mid = 0.5 * (lo + hi);
+            mid + (rng.uniform(lo, hi) - mid) * rho
+        };
+        if !self.dp_init {
+            let v = mix(&mut self.dp_rng, 0.05, 0.3);
+            self.dp_k0 = (tm, v);
+            self.dp_k1 = (tm + (mix(&mut self.dp_rng, 0.2, 1.2) * sc) as f64, v);
+            self.dp_stage = 0;
+            self.dp_init = true;
+        }
+        while tm >= self.dp_k1.0 {
+            let (t, v) = self.dp_k1;
+            let rng = &mut self.dp_rng;
+            let nk = match self.dp_stage {
+                0 => {
+                    // 伸进去：多数伸到底，偶尔只到一半
+                    self.dp_deep = if rng.unit() < 0.18 * rho { mix(rng, 0.45, 0.7) } else { mix(rng, 0.8, 1.0) };
+                    self.n_strokes += 1;
+                    (t + (mix(rng, 0.7, 1.6) * sc) as f64, self.dp_deep)
+                }
+                1 => (t + (mix(rng, 0.3, 1.8) * sc) as f64, (self.dp_deep * mix(rng, 0.9, 1.04)).min(1.0)),
+                2 => {
+                    // 退出来：多数退到耳道口附近，偶尔整个拿出来
+                    let out = if rng.unit() < 0.12 * rho { 0.0 } else { mix(rng, 0.05, 0.3) };
+                    (t + (mix(rng, 0.7, 1.6) * sc) as f64, out)
+                }
+                _ => (t + (mix(rng, 0.2, 1.2) * sc) as f64, v),
+            };
+            self.dp_stage = (self.dp_stage + 1) % 4;
+            self.dp_k0 = self.dp_k1;
+            self.dp_k1 = nk;
+        }
+        let (t0, v0) = self.dp_k0;
+        let (t1, v1) = self.dp_k1;
+        v0 + (v1 - v0) * smoothstep(((tm - t0) / (t1 - t0).max(1e-6)) as f32)
+    }
+
+    /// 这一步的入耳深度（米）。只有贴在耳朵上时才伸得进去；快要换边时先退出来；`auto` = false（手动摆位）时
+    /// 没有自动进出，贴上耳朵就伸到设定的深度。入耳深度为 0 时恒为 0。
+    fn depth_step(&mut self, p: &Params, tm: f64, pos: (f32, f32, f32), auto: bool) -> f32 {
+        if p.inear_cm <= 0.0 {
+            self.dp_on = false;
+            return 0.0;
+        }
+        let gate = inear_gate(pos.0, pos.1, pos.2);
+        if gate < 0.02 {
+            // 不在耳边：手势停下；下次贴上耳朵时从"在耳道口停一下、再慢慢伸进去"重新开始，而不是一下子捅到底
+            self.dp_init = false;
+        }
+        let mut u = if !auto {
+            gate
+        } else if gate >= 0.02 {
+            gate * self.depth_gesture(p, tm)
+        } else {
+            0.0
+        };
+        if auto && matches!(p.mode, MotionMode::Sweep | MotionMode::Random) {
+            // 快要换边时先退出来（提前 0.8 s）；换边途中一直在外面，到了另一只耳朵再伸进去
+            u *= if self.segs.is_empty() { smoothstep((self.next_t - tm) as f32 / 0.8) } else { 0.0 };
+        }
+        if !self.dp_on {
+            self.dp_lp.prime(0.0);
+            self.dp_on = true;
+        }
+        inear_depth(self.dp_lp.process(u).clamp(0.0, 1.0), p.inear_cm)
+    }
+
     /// 手动模式的一步：位置跟着用户拖到的目标走，没有任何自动移动。
     fn step_manual(&mut self, p: &Params) -> Pose {
         let tgt = lift_tilt(p.manual_az.rem_euclid(360.0), p.manual_dist.clamp(R_MIN, R_MAX), 0.0, p.manual_tilt.clamp(-80.0, 85.0));
@@ -489,7 +601,8 @@ impl Motion {
         self.lift = 0.0;
         self.mode = Some(MotionMode::Manual);
         self.last = now;
-        Pose { az: now.0, el: now.1, r: now.2, r_base: now.2, az_base: now.0, el_base: now.1 }
+        let depth = self.depth_step(p, 0.0, now, false);
+        Pose { az: now.0, el: now.1, r: now.2, r_base: now.2, az_base: now.0, el_base: now.1, depth }
     }
 
     /// 推进到说话时钟 `tm`（秒），返回这个边界上的位置。
@@ -630,7 +743,7 @@ impl Motion {
         let tilt = tilt.clamp(-80.0, 85.0);
         let (az3, el, r3) = lift_tilt(az, r, self.lift, tilt);
         let (az_base, el_base, rb) = lift_tilt(az, r_base, self.lift, tilt);
-        let mut pose = Pose { az: az3, el, r_base: rb, r: r3, az_base, el_base };
+        let mut pose = Pose { az: az3, el, r_base: rb, r: r3, az_base, el_base, depth: 0.0 };
         if let Some((hold, t)) = self.leave {
             // 从手动切回来的头 0.6 秒：从切换时的位置平滑过渡到自动的走位
             let t = t + CTRL_DT;
@@ -641,9 +754,10 @@ impl Motion {
                 self.leave = Some((hold, t));
                 let now = mix_pos(hold, (pose.az, pose.el, pose.r), s);
                 let base = mix_pos(hold, (pose.az_base, pose.el_base, pose.r_base), s);
-                pose = Pose { az: now.0, el: now.1, r: now.2, r_base: base.2, az_base: base.0, el_base: base.1 };
+                pose = Pose { az: now.0, el: now.1, r: now.2, r_base: base.2, az_base: base.0, el_base: base.1, depth: 0.0 };
             }
         }
+        pose.depth = self.depth_step(p, tm, (pose.az, pose.el, pose.r), true);
         self.last = (pose.az, pose.el, pose.r);
         pose
     }
@@ -912,6 +1026,127 @@ mod tests {
         assert!(m.n_moves > moves_before, "sweeps should resume");
         // 两次切换都没有跳变：最快也就是手动跟随的限速（40 cm 处每块约 4 mm）
         assert!(step_max < 0.006, "largest step {step_max} m");
+    }
+
+    #[test]
+    fn inear_depth_mapping() {
+        // 手势 0 = 耳道口，1 = 设定的最深处；中间按"剩余长度的几何插值"单调变深
+        assert_eq!(inear_depth(0.0, 2.1), 0.0);
+        assert!((inear_depth(1.0, 2.1) - 0.021).abs() < 1e-6);
+        let mut last = 0.0;
+        for k in 1..=20 {
+            let d = inear_depth(k as f32 / 20.0, 2.1);
+            assert!(d > last);
+            last = d;
+        }
+        // 共振频率（c / 4L）在手势上是对数线性的：一半的手势 = 两端频率的几何平均
+        let f = |d: f32| 343.0 / (4.0 * (CANAL_L0 - d));
+        let (f0, f1, fm) = (f(0.0), f(inear_depth(1.0, 2.1)), f(inear_depth(0.5, 2.1)));
+        assert!((fm / (f0 * f1).sqrt() - 1.0).abs() < 1e-3, "{f0} {fm} {f1}");
+        assert!(f0 > 2900.0 && f0 < 3000.0 && f1 > 10000.0 && f1 < 11500.0);
+        // 设得再深也不会超过耳道的长度
+        assert!((inear_depth(1.0, 9.0) - (CANAL_L0 - CANAL_L_MIN)).abs() < 1e-6);
+        assert_eq!(inear_depth(1.0, 0.0), 0.0);
+    }
+
+    #[test]
+    fn inear_is_off_by_default() {
+        // 入耳深度为 0（默认、贴耳加强、KU100 实录）：深度恒为 0，也不计伸进耳道的次数
+        for p in [Params::default(), Params::default().style_ku100()] {
+            let mut m = Motion::new(1);
+            let mut tm = 0.0f64;
+            for _ in 0..(30.0 / CTRL_DT) as usize {
+                assert_eq!(m.step(&p, tm, 1.0, 0.0).depth, 0.0);
+                tm += clock_step(1.0, 0.13);
+            }
+            assert_eq!(m.n_strokes, 0);
+        }
+    }
+
+    #[test]
+    fn earclean_strokes_in_and_out_and_pulls_out_before_switching() {
+        let p = Params::default().style_earclean();
+        let max = 0.01 * p.inear_cm;
+        let mut m = Motion::new(1);
+        let (mut tm, mut deep, mut shallow, mut prev, mut glide_max) = (0.0f64, 0usize, 0usize, 0f32, 0f32);
+        // 深度对应的耳道共振频率（log2 Hz）
+        let lf = |d: f32| (343.0 / (4.0 * (CANAL_L0 - d))).log2();
+        let (mut left, mut right, mut crossing) = (0usize, 0usize, 0usize);
+        let n = (200.0 / CTRL_DT) as usize;
+        for _ in 0..n {
+            let q = m.step(&p, tm, 1.0, 0.0);
+            assert!(q.depth >= 0.0 && q.depth <= max + 1e-5, "depth {}", q.depth);
+            glide_max = glide_max.max((lf(q.depth) - lf(prev)).abs() / CTRL_DT);
+            prev = q.depth;
+            let s = q.az.to_radians().sin() * q.el.to_radians().cos();
+            if s.abs() > 0.9 {
+                if s > 0.0 {
+                    right += 1;
+                } else {
+                    left += 1;
+                }
+                deep += (q.depth > 0.8 * max) as usize;
+                shallow += (q.depth < 0.25 * max) as usize;
+            } else if s.abs() < 0.6 {
+                // 换边途中（离开耳朵）：一定已经退出来了
+                crossing += 1;
+                assert!(q.depth < 5e-4, "换边途中还在耳道里：{} m，方位 {}", q.depth, q.az);
+            }
+            tm += clock_step(1.0, 0.13);
+        }
+        // 200 秒里每只耳朵都掏过，换过 4 次左右的边；一个来回约 4 秒
+        assert!(m.n_moves >= 3 && m.n_moves <= 6, "moves {}", m.n_moves);
+        assert!(left > n / 5 && right > n / 5 && crossing > 100, "left {left} right {right} crossing {crossing}");
+        assert!(m.n_strokes >= 35 && m.n_strokes <= 65, "strokes {}", m.n_strokes);
+        // 在"深"和"浅"两头都停得不少
+        assert!(deep > n / 5 && shallow > n / 12, "deep {deep} shallow {shallow} of {n}");
+        // 进出是平滑的：共振峰最快每秒滑 5 个倍频程以内（实录：中位约 1，最快的 10% 在 2.5–4.8）
+        assert!(glide_max < 5.0, "fastest resonance glide {glide_max} oct/s");
+    }
+
+    #[test]
+    fn manual_position_enters_the_ear_only_at_the_ear() {
+        let mut p = Params::default().style_earclean();
+        p.mode = MotionMode::Manual;
+        (p.manual_az, p.manual_dist, p.manual_tilt) = (270.0, R_MIN, 0.0);
+        let mut m = Motion::new(1);
+        let mut q = m.step(&p, 0.0, 1.0, 0.0);
+        for _ in 0..(1.5 / CTRL_DT) as usize {
+            q = m.step(&p, 0.0, 1.0, 0.0);
+        }
+        // 手动摆在耳朵上：伸到设定的深度，没有自动进出
+        assert!((q.depth - 0.021).abs() < 2e-4, "depth {}", q.depth);
+        let held = q.depth;
+        for _ in 0..500 {
+            assert!((m.step(&p, 0.0, 1.0, 0.0).depth - held).abs() < 1e-5);
+        }
+        // 拖到脸前 30 cm：退出来
+        (p.manual_az, p.manual_dist) = (0.0, 0.3);
+        for _ in 0..(1.5 / CTRL_DT) as usize {
+            q = m.step(&p, 0.0, 1.0, 0.0);
+        }
+        assert_eq!(q.depth, 0.0);
+    }
+
+    #[test]
+    fn random_mode_front_share() {
+        // 随机走位：正面比例调大后，在正前方（±25° 以内）的时间明显变多；默认比例下与原来一样少
+        let share = |front: f32| {
+            let mut p = Params::default();
+            p.mode = MotionMode::Random;
+            p.front = front;
+            let mut m = Motion::new(5);
+            let (mut tm, mut n_front, n) = (0.0f64, 0usize, (600.0 / CTRL_DT) as usize);
+            for _ in 0..n {
+                let q = m.step(&p, tm, 1.0, 0.0);
+                n_front += (q.az < 25.0 || q.az > 335.0) as usize;
+                tm += clock_step(1.0, 0.13);
+            }
+            n_front as f32 / n as f32
+        };
+        let (lo, hi) = (share(0.08), share(0.4));
+        assert!(lo < 0.14, "默认 {lo}");
+        assert!(hi > 0.22 && hi > 2.0 * lo, "正面比例 0.4：{hi}（默认 {lo}）");
     }
 
     #[test]

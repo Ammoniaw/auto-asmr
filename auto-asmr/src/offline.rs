@@ -41,7 +41,7 @@ pub struct ConvertOptions {
     pub lufs: f32,
     pub peak_db: f32,
     pub max_gr_db: f32,
-    /// 把实际走位写成 CSV（时间, 方位角, 距离, 不含忽远忽近的距离, 说话活动）。
+    /// 把实际走位写成 CSV（时间, 方位角, 距离, 不含忽远忽近的距离, 说话活动, 仰角, 入耳深度）。
     pub save_trajectory: Option<PathBuf>,
 }
 
@@ -84,6 +84,8 @@ pub struct ConvertReport {
     /// 从头顶绕的次数、上下换位的次数。
     pub n_tops: u32,
     pub n_updowns: u32,
+    /// 伸进耳道的次数（入耳深度大于 0 时）。
+    pub n_strokes: u32,
     pub speech_pct: f32,
     pub elapsed_s: f64,
 }
@@ -402,9 +404,9 @@ pub fn convert(opts: &ConvertOptions, params: &Params, cancel: Arc<AtomicBool>, 
     })?;
     if let (Some(path), Some(tr)) = (&opts.save_trajectory, &eng.trace) {
         let mut f = BufWriter::new(File::create(path).map_err(|e| format!("无法写入轨迹文件：{e}"))?);
-        writeln!(f, "t_sec,az_deg,dist_m,base_dist_m,speech,el_deg").map_err(|e| e.to_string())?;
+        writeln!(f, "t_sec,az_deg,dist_m,base_dist_m,speech,el_deg,inear_depth_m").map_err(|e| e.to_string())?;
         for row in tr.iter().step_by(8) {
-            writeln!(f, "{:.4},{:.2},{:.5},{:.5},{:.3},{:.2}", row[0], row[1], row[2], row[3], row[4], row[5]).map_err(|e| e.to_string())?;
+            writeln!(f, "{:.4},{:.2},{:.5},{:.5},{:.3},{:.2},{:.5}", row[0], row[1], row[2], row[3], row[4], row[5], row[6]).map_err(|e| e.to_string())?;
         }
     }
     let fin = finish(opts, rendered, n_sig, &cancel, &mut progress)?;
@@ -418,6 +420,7 @@ pub fn convert(opts: &ConvertOptions, params: &Params, cancel: Arc<AtomicBool>, 
         n_sways: eng.tele.n_sways,
         n_tops: eng.tele.n_tops,
         n_updowns: eng.tele.n_updowns,
+        n_strokes: eng.tele.n_strokes,
         speech_pct: 100.0 * eng.n_speech as f32 / eng.n_blocks.max(1) as f32,
         elapsed_s: t_start.elapsed().as_secs_f64(),
     })
@@ -496,6 +499,7 @@ pub fn convert_mix(opts: &ConvertOptions, inputs: &[MixInput], params: &Params, 
         n_sways: t.n_sways,
         n_tops: t.n_tops,
         n_updowns: t.n_updowns,
+        n_strokes: t.n_strokes,
         speech_pct: speech,
         elapsed_s: t_start.elapsed().as_secs_f64(),
     })

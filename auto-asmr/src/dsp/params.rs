@@ -1,10 +1,17 @@
 //! 所有可调参数。实时模式和文件模式共用；界面上每个滑块对应这里的一个字段。
 
-use super::{db_to_lin, EAR_R};
+use super::{db_to_lin, EAR_R, R_MIN};
 use serde::{Deserialize, Serialize};
 
 /// 降噪强度的最大值：取这个值（或更大）表示不设上限，降到最干净。
 pub const DENOISE_MAX_DB: f32 = 100.0;
+
+/// 掏耳预设文件转换的目标响度（LUFS）：能量集中在低频，K 加权的响度读数偏低、峰值却很高，所以比人声的 −16 低。
+/// 两段 KU100 掏耳实录是 −18.3 和 −20.8 LUFS（峰值已经削顶）。
+pub const EARCLEAN_LUFS: f32 = -20.0;
+/// 掏耳预设实时 / 试听的目标响度：实时的自动响度按"有声音时的平均"来拉，一下一下的摩擦声实际会比目标高 3–5 LU，
+/// 所以定得再低一些，实际落在 −19 LUFS 上下，限制器不用压太多。
+pub const EARCLEAN_LIVE_LUFS: f32 = -23.0;
 
 /// 左右移动的方式。
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -76,6 +83,20 @@ pub struct Params {
     /// 耳廓选择："KU100" = 人工头自己的耳廓；"A"、"B"… = 真人耳廓（HUTUBS 实测，挑最像自己耳朵的那只）。
     pub pinna: String,
 
+    // ---- 入耳（掏耳）：声源贴到耳朵上之后再伸进耳道。`inear_cm` 为 0 时这一组全部不起作用
+    /// 入耳深度（厘米）：贴到耳朵上之后最深伸进耳道多少；0 = 不进耳道（关闭）。
+    pub inear_cm: f32,
+    /// 进出节奏：有声音时，一次"伸进去—退出来"大约几秒。
+    pub inear_period: f32,
+    /// 进出的随机程度（0 = 节奏和深浅固定，1 = 都随机）。
+    pub inear_random: f32,
+    /// 耳道共鸣：伸进耳道后，物体与话筒（鼓膜）之间那段耳道的共振峰，dB；伸得越深共振越高（约 3 → 11 kHz）。0 = 关闭。
+    pub canal_db: f32,
+    /// 耳内低频：伸进耳道时摩擦 / 触碰在耳道里形成的低频压力（25–170 Hz 的隆隆声），由输入自己的包络导出。0 = 关闭，1 = 标准。
+    pub rumble: f32,
+    /// 堵耳闷感：伸进耳道时近耳 2.5 kHz 以上压低多少 dB。0 = 关闭。
+    pub muffle_db: f32,
+
     // ---- 左右移动
     pub mode: MotionMode,
     /// 每只耳朵边停留多少秒。
@@ -86,6 +107,8 @@ pub struct Params {
     pub randomness: f32,
     /// 换边时改成"先退远再凑近"的概率。
     pub approach: f32,
+    /// 随机走位：停在正前方（两耳听到的差不多）的比例。0.08 = 原来的比例。
+    pub front: f32,
     pub via: Via,
     /// 贴耳的方位角（90 = 正侧方，100 = 略靠后）。
     pub ear_angle: f32,
@@ -182,11 +205,18 @@ impl Default for Params {
             far_shadow_db: 5.0,
             soft_near: 0.5,
             pinna: "KU100".to_string(),
+            inear_cm: 0.0,
+            inear_period: 4.0,
+            inear_random: 0.7,
+            canal_db: 10.0,
+            rumble: 1.0,
+            muffle_db: 6.0,
             mode: MotionMode::Sweep,
             hold_s: 2.5,
             move_s: 2.5,
             randomness: 0.1,
             approach: 0.25,
+            front: 0.08,
             via: Via::Front,
             ear_angle: 100.0,
             pass_dist: 0.2,
@@ -227,24 +257,80 @@ impl Default for Params {
 }
 
 impl Params {
-    /// 贴耳加强（默认）：嘴离耳约 1.7 cm，远耳额外压低 32 dB，不加房间。
-    pub fn style_ear(mut self) -> Self {
-        self.ear_dist = EAR_R;
-        self.isolation_db = 32.0;
-        self.far_lf_cut_db = 12.0;
-        self.room = false;
-        self.playback = Playback::Diffuse;
+    /// 把"风格"管的那些参数恢复成默认值（= 贴耳加强）：贴耳感、入耳、左右移动的方式和节奏、忽远忽近、上下、
+    /// 房间与回放、去齿音 / 轻声化、目标响度。其余的——降噪、响应阈值、耳廓、自动响度开关、输出增益、峰值上限、
+    /// 随机种子、环绕 / 固定 / 手动模式的位置——保持不变。三个风格都先做这一步，所以按哪个按钮结果都是确定的，
+    /// 从"掏耳"切回人声的风格时不会留下"伸进耳道、每只耳朵停 40 秒"之类的设置。
+    fn style_base(mut self) -> Self {
+        let d = Params::default();
+        (self.ear_dist, self.isolation_db, self.presence_db, self.ku100_eq, self.dark_db) = (d.ear_dist, d.isolation_db, d.presence_db, d.ku100_eq, d.dark_db);
+        (self.warmth_db, self.ear_warmth_db, self.far_lf_cut_db, self.breath_db, self.puff) = (d.warmth_db, d.ear_warmth_db, d.far_lf_cut_db, d.breath_db, d.puff);
+        (self.concha_db, self.mouth_cm, self.far_shadow_db, self.soft_near) = (d.concha_db, d.mouth_cm, d.far_shadow_db, d.soft_near);
+        (self.inear_cm, self.inear_period, self.inear_random, self.canal_db, self.rumble, self.muffle_db) = (d.inear_cm, d.inear_period, d.inear_random, d.canal_db, d.rumble, d.muffle_db);
+        (self.mode, self.hold_s, self.move_s, self.randomness, self.approach, self.front) = (d.mode, d.hold_s, d.move_s, d.randomness, d.approach, d.front);
+        (self.via, self.ear_angle, self.pass_dist, self.level_follow) = (d.via, d.ear_angle, d.pass_dist, d.level_follow);
+        (self.sway, self.sway_period, self.sway_random, self.sway_follow, self.sway_level, self.pause_motion, self.micro) = (d.sway, d.sway_period, d.sway_random, d.sway_follow, d.sway_level, d.pause_motion, d.micro);
+        (self.height, self.updown, self.updown_period, self.updown_random, self.over_top) = (d.height, d.updown, d.updown_period, d.updown_random, d.over_top);
+        (self.room, self.wet_db, self.playback) = (d.room, d.wet_db, d.playback);
+        (self.deess_db, self.soft_voice, self.target_lufs) = (d.deess_db, d.soft_voice, d.target_lufs);
         self
     }
 
-    /// KU100 实录风格：按两段 KU100 实录标定——远耳听得到、离耳约 6 cm、真实房间、KU100 原机音色。
-    pub fn style_ku100(mut self) -> Self {
-        self.ear_dist = 0.15;
-        self.isolation_db = 0.0;
-        self.far_lf_cut_db = 0.0;
-        self.room = true;
-        self.playback = Playback::Native;
-        self
+    /// 贴耳加强（默认）：嘴离耳约 1.7 cm，远耳额外压低 32 dB，不加房间，左右耳慢慢穿梭。
+    pub fn style_ear(self) -> Self {
+        self.style_base()
+    }
+
+    /// KU100 实录风格：按 KU100 轻语实录标定——远耳听得到（不额外压低）、真实房间、KU100 原机音色；
+    /// 走位像真人：随机地停在耳边（离耳约 2–4 cm）、侧前、侧后，约三分之一的停留在正面说话，停多久也不固定；
+    /// 贴耳与正面之间的响度差收小，贴耳时气流扑耳更明显，齿音和 5 kHz 附近收一点（更柔、更耐听）。
+    pub fn style_ku100(self) -> Self {
+        let mut p = self.style_base();
+        p.ear_dist = 0.11;
+        p.isolation_db = 0.0;
+        p.far_lf_cut_db = 0.0;
+        p.room = true;
+        p.playback = Playback::Native;
+        p.mode = MotionMode::Random;
+        p.level_follow = 0.2;
+        p.front = 0.35;
+        p.hold_s = 3.0;
+        p.move_s = 2.5;
+        p.randomness = 0.5;
+        p.puff = 1.5;
+        p.dark_db = 2.0;
+        p.deess_db = 5.0;
+        p
+    }
+
+    /// 掏耳：按两段 KU100 掏耳实录标定。给棉签 / 挖耳勺 / 刮擦这类"触发音"用，不是给人声用的——
+    /// 声源贴在耳朵上并伸进耳道进进出出（耳道共鸣跟着在约 3–11 kHz 之间滑动），带耳内低频和堵耳的闷感；
+    /// 另一只耳朵基本听不到；每只耳朵停留约 40 秒才换边，换边时先退出来。人声用的几项（气声、气流、轻声、
+    /// 忽远忽近、耳甲共鸣、临场感、嘴的大小）都关掉。
+    pub fn style_earclean(self) -> Self {
+        let mut p = self.style_base();
+        p.ear_dist = R_MIN;
+        p.isolation_db = 40.0;
+        p.playback = Playback::Native;
+        p.presence_db = 0.0;
+        p.breath_db = 0.0;
+        p.puff = 0.0;
+        p.concha_db = 0.0;
+        p.mouth_cm = 0.0;
+        p.soft_near = 0.0;
+        p.inear_cm = 2.1;
+        p.hold_s = 40.0;
+        p.move_s = 2.0;
+        p.randomness = 0.2;
+        p.approach = 0.0;
+        p.ear_angle = 90.0;
+        p.level_follow = 0.5;
+        p.sway = 0.0;
+        p.sway_follow = 0.0;
+        p.micro = 0.3;
+        p.updown = 10.0;
+        p.target_lufs = EARCLEAN_LIVE_LUFS;
+        p
     }
 
     /// 降噪强度换成"降噪后的声音占多少"：输出 = 原声 × (1 − m) + 降噪后 × m。
@@ -267,5 +353,47 @@ impl Params {
             MotionMode::Static => 1.0,
             MotionMode::Manual => 0.5,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn styles_are_complete_and_leave_other_settings_alone() {
+        let d = Params::default();
+        // 贴耳加强就是默认值；从掏耳、KU100 实录切回来不留下任何痕迹
+        assert_eq!(d.clone().style_ear(), d);
+        assert_eq!(d.clone().style_earclean().style_ear(), d);
+        assert_eq!(d.clone().style_ku100().style_ear(), d);
+        // 先按哪个按钮都一样
+        assert_eq!(d.clone().style_earclean().style_ku100(), d.clone().style_ku100());
+        assert_eq!(d.clone().style_ku100().style_earclean(), d.clone().style_earclean());
+        // 默认和 KU100 实录不进耳道；掏耳进耳道、每只耳朵停得久、人声用的几项关掉
+        assert_eq!(d.inear_cm, 0.0);
+        assert_eq!(d.clone().style_ku100().inear_cm, 0.0);
+        let e = d.clone().style_earclean();
+        assert!(e.inear_cm > 1.0 && e.hold_s >= 20.0 && e.isolation_db >= 40.0);
+        assert!(e.breath_db == 0.0 && e.puff == 0.0 && e.sway == 0.0 && e.sway_follow == 0.0 && e.soft_near == 0.0);
+        assert!(!e.room && e.target_lufs == EARCLEAN_LIVE_LUFS && EARCLEAN_LUFS < d.target_lufs);
+        // 风格不管的设置保持不变：降噪、响应阈值、耳廓、输出、随机种子、各模式的位置
+        let mine = Params { denoise: true, denoise_db: 12.0, gate_db: -50.0, pinna: "B".to_string(), out_gain_db: -3.0, ceiling_db: -2.0, auto_level: false, seed: 9, static_az: 45.0, orbit_radius: 0.5, manual_az: 10.0, ..d.clone() };
+        for q in [mine.clone().style_ear(), mine.clone().style_ku100(), mine.clone().style_earclean()] {
+            assert!(q.denoise && q.denoise_db == 12.0 && q.gate_db == -50.0 && q.pinna == "B");
+            assert!(q.out_gain_db == -3.0 && q.ceiling_db == -2.0 && !q.auto_level && q.seed == 9);
+            assert!(q.static_az == 45.0 && q.orbit_radius == 0.5 && q.manual_az == 10.0);
+        }
+    }
+
+    #[test]
+    fn old_config_files_load_with_the_new_fields_at_their_defaults() {
+        // 旧配置文件里没有入耳和正面比例这几项：读进来是默认值（不进耳道）
+        let p: Params = ron::from_str("(ear_dist:0.15,isolation_db:0.0,room:true)").unwrap();
+        assert_eq!(p.inear_cm, 0.0);
+        assert_eq!((p.front, p.canal_db, p.rumble, p.muffle_db), (0.08, 10.0, 1.0, 6.0));
+        assert!(p.room && p.ear_dist == 0.15);
+        let e = Params::default().style_earclean();
+        assert_eq!(ron::from_str::<Params>(&ron::to_string(&e).unwrap()).unwrap(), e);
     }
 }

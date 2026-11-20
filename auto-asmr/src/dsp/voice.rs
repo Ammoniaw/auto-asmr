@@ -219,6 +219,146 @@ pub fn far_shadow_fir(db: f32) -> Option<Vec<f32>> {
     Some(minphase_from_mag(&mag, nfft, EAR_EQ_TAPS))
 }
 
+/// 堵耳闷感的转折频率。
+pub const MUFFLE_F: f32 = 2500.0;
+
+/// 入耳时近耳的高频闷感（最小相位 FIR，64 点）：物体伸进耳道后把耳道口堵住一部分，外面传进来的高频变少。
+/// `db` 是最高频压低的量（2.5 kHz 处压一半）；0 时返回 None。
+pub fn muffle_fir(db: f32) -> Option<Vec<f32>> {
+    if db <= 0.0 {
+        return None;
+    }
+    let nfft = 512;
+    let mag: Vec<f32> = (0..=nfft / 2)
+        .map(|k| {
+            let f = (k as f32 * FS / nfft as f32).max(1.0);
+            db_to_lin(-db / (1.0 + (MUFFLE_F / f).powi(2)))
+        })
+        .collect();
+    Some(minphase_from_mag(&mag, nfft, EAR_EQ_TAPS))
+}
+
+/// 耳道共鸣（入耳）：物体伸进耳道后，它和话筒（鼓膜）之间剩下的那段耳道是一根一头堵住的短管，
+/// 在四分之一波长的奇数倍频率上共振（f = c / 4L，3f，5f…）。伸得越深、管越短，共振越高——
+/// 两段 KU100 掏耳实录里这条共振峰随棉签进出在约 3–11 kHz 之间来回滑动，峰高中位约 8 dB。
+///
+/// 做法：带负反馈的梳状滤波器 y[n] = (1 + g)·x[n] − g·y[n − D]，D = 2L / c（来回一趟的时间，样本）。
+/// 直流和偶数倍频率上增益为 1，奇数倍频率上是 (1 + g) / (1 − g)。D 逐样本变化（线性插值），滑动时没有拉链声；
+/// 插值在反馈环里带来的高频损耗正好让 3f、5f 比基频弱。
+#[derive(Clone)]
+pub struct CanalComb {
+    buf: [f32; 16],
+    pos: usize,
+}
+
+impl CanalComb {
+    pub fn new() -> Self {
+        CanalComb { buf: [0.0; 16], pos: 0 }
+    }
+
+    /// 共振峰高度（dB）换成反馈系数。
+    pub fn feedback(peak_db: f32) -> f32 {
+        let g = db_to_lin(peak_db.clamp(0.0, 24.0));
+        (g - 1.0) / (g + 1.0)
+    }
+
+    /// 剩余耳道长度（米）换成梳状滤波器的时延（样本）。
+    pub fn delay(len_m: f32) -> f32 {
+        (2.0 * len_m / super::C * FS).clamp(1.0, 14.0)
+    }
+
+    /// `g`：反馈系数（0 = 直通）；`d`：时延（样本，1–14）。
+    #[inline]
+    pub fn process(&mut self, x: f32, g: f32, d: f32) -> f32 {
+        let di = d as usize;
+        let fr = d - di as f32;
+        let a = self.buf[(self.pos + di - 1) & 15];
+        let b = self.buf[(self.pos + di) & 15];
+        let y = (1.0 + g) * x - g * (a + fr * (b - a));
+        self.pos = (self.pos + 15) & 15;
+        self.buf[self.pos] = y;
+        y
+    }
+}
+
+/// 耳内低频的标定增益（`rumble` = 1 时）：掏耳预设下输出的 20–160 Hz 比 300–2000 Hz 高约 15 dB
+/// （两段 KU100 掏耳实录：+10…+20 dB）。
+pub const RUMBLE_K: f32 = 21.0;
+/// 摩擦声的频带下限：这以上的内容当作"摩擦 / 触碰声"，由它的包络导出耳内低频。
+pub const RUMBLE_SRC_HP: f32 = 250.0;
+
+/// 耳内低频（入耳）：物体在耳道里摩擦 / 触碰时，话筒前那个很小的腔体里会有很强的低频压力——
+/// 两段 KU100 掏耳实录的近耳，20–160 Hz 比 300–2000 Hz 的摩擦声高 10–20 dB，两者的包络同步（相关 0.6–0.76，时差 0–20 ms），
+/// 低频段内是粉红谱（25–160 Hz 各 1/3 倍频程一样响）。普通话筒隔着空气录的摩擦声里没有这部分。
+///
+/// 做法与"气流扑耳"同一个思路，只用输入自己的成分、不生成噪声：取 250 Hz 以上摩擦声的整流包络，
+/// 留下它在 25–170 Hz 的起伏（每一下微小的黏滑 / 磕碰就是一个压力脉冲），整形成粉红谱；
+/// 再按"慢包络 ÷ 快包络"的平方根做 2:1 的压缩，让它像实录那样连续地隆隆响，而不是一下一下地蹦。
+/// 幅度与输入成正比（输入大 6 dB，它也大 6 dB），没有声音时为 0。
+pub struct ContactFx {
+    hp: Biquad,
+    res: Biquad,
+    lp: Biquad,
+    sh: [f32; 3],
+    sh_x1: f32,
+    sh_y1: f32,
+    fast: OnePoleLp,
+    slow: f32,
+    gain: (f32, f32),
+    primed: bool,
+}
+
+impl ContactFx {
+    pub fn new() -> Self {
+        // 一阶低架：极点 40 Hz、零点 80 Hz（把平坦的包络起伏往粉红谱上靠：越低越强），整体再提 √2
+        let (kp, kz) = ((std::f32::consts::PI * 40.0 / FS).tan(), (std::f32::consts::PI * 80.0 / FS).tan());
+        let n = (kp / kz) * std::f32::consts::SQRT_2 / (kp + 1.0);
+        ContactFx {
+            hp: Biquad::highpass(RUMBLE_SRC_HP, BUTTER_Q),
+            res: Biquad::highpass(32.0, 1.0),
+            lp: Biquad::lowpass(170.0, BUTTER_Q),
+            sh: [n * (kz + 1.0), n * (kz - 1.0), (kp - 1.0) / (kp + 1.0)],
+            sh_x1: 0.0,
+            sh_y1: 0.0,
+            fast: OnePoleLp::new(16.0),
+            slow: 0.0,
+            gain: (0.0, 0.0),
+            primed: false,
+        }
+    }
+
+    /// 控制块开始：`g` = 块末尾的增益（入耳程度 × `rumble`）。
+    pub fn begin_block(&mut self, g: f32) {
+        let g = RUMBLE_K * g.max(0.0);
+        if self.primed {
+            self.gain = (self.gain.1, g);
+        } else {
+            self.gain = (g, g);
+            self.primed = true;
+        }
+    }
+
+    /// 处理一个样本：`a` = 输入，`wp` = 在控制块里的进度（0–1）。返回要加到直达声上的低频。
+    #[inline]
+    pub fn process(&mut self, a: f32, wp: f32) -> f32 {
+        let q = self.hp.process(a).abs();
+        let w = self.lp.process(self.res.process(q));
+        let y = self.sh[0] * w + self.sh[1] * self.sh_x1 - self.sh[2] * self.sh_y1;
+        self.sh_x1 = w;
+        self.sh_y1 = y;
+        let sf = self.fast.process(q).max(0.0);
+        // 慢包络：30 ms 跟上去，150 ms 落下来
+        const CA: f32 = 1.0 / (0.030 * FS);
+        const CR: f32 = 1.0 / (0.150 * FS);
+        self.slow += (if sf > self.slow { CA } else { CR }) * (sf - self.slow);
+        let g = self.gain.0 + (self.gain.1 - self.gain.0) * wp;
+        if g <= 0.0 {
+            return 0.0;
+        }
+        g * y * ((self.slow + 1e-9) / (sf + 0.05 * self.slow + 1e-9)).sqrt()
+    }
+}
+
 /// 气流脉冲的标定增益（`puff` = 1 时）。
 pub const PUFF_K: f32 = 1.5;
 /// 气声带下限：F3 以上送气噪声取代谐波（Klatt & Klatt 1990）。
@@ -456,6 +596,164 @@ mod tests {
         assert!((p2 - p1 - 6.02).abs() < 0.1, "puff 加倍 +6 dB：{}", p2 - p1);
         assert!(p1 > -30.0 && p1 < 0.0, "脉冲电平相对输入 {p1} dB");
         assert!(p0 < -200.0, "离开耳边没有脉冲：{p0}");
+    }
+
+    /// 堵耳闷感：2.5 kHz 处压一半，最高频接近设定值，500 Hz 基本不动。
+    #[test]
+    fn muffle_shape() {
+        let h = muffle_fir(6.0).unwrap();
+        let m = fir_mag(&h, 4096);
+        let db = |f: f32| 20.0 * m[(f / FS * 4096.0).round() as usize].log10();
+        assert!(db(500.0).abs() < 0.5, "500 Hz {}", db(500.0));
+        assert!((db(2500.0) + 3.0).abs() < 0.5, "2.5 kHz {}", db(2500.0));
+        assert!(db(10000.0) < -5.0 && db(10000.0) > -6.2, "10 kHz {}", db(10000.0));
+        assert!(muffle_fir(0.0).is_none());
+    }
+
+    /// 梳状滤波器在给定时延下的幅频响应（dB）：喂一个单位冲激，取冲激响应的谱。
+    fn comb_response(g: f32, d: f32) -> Vec<f32> {
+        let mut c = CanalComb::new();
+        let h: Vec<f32> = (0..2048).map(|n| c.process(if n == 0 { 1.0 } else { 0.0 }, g, d)).collect();
+        fir_mag(&h, 8192).iter().map(|v| 20.0 * v.max(1e-9).log10()).collect()
+    }
+
+    /// 耳道共鸣：共振峰在 c / 4L（和它的 3 倍）上，峰高接近设定值，直流增益为 1；伸得越深（L 越短）峰越高。
+    #[test]
+    fn canal_resonance_follows_the_remaining_length() {
+        let g = CanalComb::feedback(10.0);
+        let bin = |f: f32| (f / FS * 8192.0).round() as usize;
+        let mut last = 0.0;
+        for len in [0.029f32, 0.020, 0.012, 0.008] {
+            let m = comb_response(g, CanalComb::delay(len));
+            let f1 = crate::dsp::C / (4.0 * len);
+            // 在 f1 的 ±1/3 倍频程里找峰
+            let (lo, hi) = (bin(f1 / 1.26), bin(f1 * 1.26).min(m.len() - 1));
+            let (k, pk) = (lo..=hi).map(|k| (k, m[k])).fold((0, f32::MIN), |a, b| if b.1 > a.1 { b } else { a });
+            let f_pk = k as f32 * FS / 8192.0;
+            assert!((f_pk / f1).log2().abs() < 0.08, "L {len}: 峰在 {f_pk} Hz，应在 {f1} Hz");
+            assert!(pk > 7.5 && pk < 10.3, "L {len}: 峰高 {pk} dB");
+            assert!(m[0].abs() < 0.05, "直流 {} dB", m[0]);
+            // 两个共振峰之间（2·f1）回到 0 dB 附近
+            if 2.0 * f1 < 20000.0 {
+                assert!(m[bin(2.0 * f1)].abs() < 1.5, "L {len}: 2f1 处 {} dB", m[bin(2.0 * f1)]);
+            }
+            assert!(f_pk > last, "越短越高");
+            last = f_pk;
+        }
+        // 3 倍频率上还有一个峰，比基频的矮（反馈环里插值的高频损耗）
+        let m = comb_response(g, CanalComb::delay(0.029));
+        let (p1, p3) = (m[bin(2957.0)], m[bin(3.0 * 2957.0)]);
+        assert!(p3 > 3.0 && p3 < p1, "f1 {p1} dB，3f1 {p3} dB");
+        // 反馈为 0 时原样通过
+        let mut c = CanalComb::new();
+        for n in 0..500 {
+            let x = (n as f32 * 0.37).sin();
+            assert_eq!(c.process(x, 0.0, 3.3 + 0.01 * n as f32), x);
+        }
+    }
+
+    /// 共振频率飞快地来回滑动时输出仍然有界（时变梳状滤波器稳定）。
+    #[test]
+    fn canal_comb_stays_bounded_while_sweeping() {
+        let x = noise(48000, -12.0, true);
+        let g = CanalComb::feedback(16.0);
+        let mut c = CanalComb::new();
+        let mut pk = 0f32;
+        for (n, &v) in x.iter().enumerate() {
+            let d = 4.9 + 3.2 * (n as f32 * 0.002).sin() + 0.9 * (n as f32 * 0.11).sin();
+            let y = c.process(v, g, d);
+            assert!(y.is_finite());
+            pk = pk.max(y.abs());
+        }
+        let in_pk = x.iter().fold(0f32, |a, v| a.max(v.abs()));
+        assert!(pk < 12.0 * in_pk, "输出峰值 {pk}，输入峰值 {in_pk}");
+    }
+
+    /// 一下一下的摩擦声（每 0.5 s 一段 0.3 s 的噪声，带起音和收尾）。
+    fn strokes(seconds: f32, rms_db: f32) -> Vec<f32> {
+        let n = (seconds * FS) as usize;
+        noise(n, rms_db, true)
+            .iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                let t = (i % 24000) as f32 / 14400.0;
+                if t < 1.0 {
+                    v * (std::f32::consts::PI * t).sin().powi(2)
+                } else {
+                    0.0
+                }
+            })
+            .collect()
+    }
+
+    fn run_rumble(x: &[f32], gain: f32) -> Vec<f32> {
+        let mut fx = ContactFx::new();
+        let mut out = Vec::with_capacity(x.len());
+        for blk in x.chunks(super::super::CTRL) {
+            fx.begin_block(gain);
+            for (i, &a) in blk.iter().enumerate() {
+                out.push(fx.process(a, i as f32 / super::super::CTRL as f32));
+            }
+        }
+        out
+    }
+
+    /// 耳内低频：能量集中在 200 Hz 以下，幅度与输入成正比，没伸进耳道（增益 0）或没有声音时为 0。
+    #[test]
+    fn rumble_is_low_frequency_and_follows_the_input() {
+        let x = strokes(6.0, -26.0);
+        let y = run_rumble(&x, 1.0);
+        let (mut lo, mut hi) = (Biquad::lowpass(200.0, BUTTER_Q), Biquad::highpass(400.0, BUTTER_Q));
+        let (mut e_all, mut e_lo, mut e_hi) = (0f64, 0f64, 0f64);
+        for &v in &y {
+            let (l, h) = (lo.process(v), hi.process(v));
+            e_all += (v * v) as f64;
+            e_lo += (l * l) as f64;
+            e_hi += (h * h) as f64;
+        }
+        assert!(e_all > 0.0);
+        assert!(e_lo / e_all > 0.85, "200 Hz 以下占 {}", e_lo / e_all);
+        assert!(e_hi / e_all < 0.05, "400 Hz 以上占 {}", e_hi / e_all);
+        // 输入大 6 dB，低频也大 6 dB；增益加倍也是 +6 dB
+        let x2: Vec<f32> = x.iter().map(|v| 2.0 * v).collect();
+        let d_in = rms_db(&run_rumble(&x2, 1.0)) - rms_db(&y);
+        let d_gain = rms_db(&run_rumble(&x, 2.0)) - rms_db(&y);
+        assert!((d_in - 6.02).abs() < 0.1 && (d_gain - 6.02).abs() < 0.1, "输入 ×2：{d_in} dB，增益 ×2：{d_gain} dB");
+        // 增益 0 或没有声音：没有低频
+        assert!(run_rumble(&x, 0.0).iter().all(|&v| v == 0.0));
+        assert!(run_rumble(&vec![0.0; 48000], 1.0).iter().all(|&v| v.abs() < 1e-9));
+        // 只在有摩擦声的时候响：两下之间（每 0.5 s 的后 0.15 s）比摩擦声中间低 25 dB 以上
+        let seg = |a: usize, b: usize| -> Vec<f32> { y.chunks(24000).skip(2).flat_map(|c| c[a.min(c.len())..b.min(c.len())].to_vec()).collect() };
+        let (on, off) = (rms_db(&seg(4800, 10800)), rms_db(&seg(19200, 23800)));
+        assert!(on - off > 25.0, "摩擦时 {on} dB，间隙里 {off} dB");
+    }
+
+    /// 耳内低频的谱形：31.5–125 Hz 各 1/3 倍频程差不多一样响（粉红谱，实录如此），200 Hz 以上逐渐往下掉
+    /// （实录里 400 Hz 比 100 Hz 低约 10 dB，低频与摩擦声之间是连着的），1 kHz 处已经很弱。
+    #[test]
+    fn rumble_is_pinkish() {
+        let x = strokes(20.0, -26.0);
+        let y = run_rumble(&x, 1.0);
+        let band = |fc: f32| -> f32 {
+            // 1/3 倍频程带通：两级二阶（高通 fc/1.12 + 低通 fc·1.12）
+            let (mut a, mut b) = ([Biquad::highpass(fc / 1.122, BUTTER_Q); 2], [Biquad::lowpass(fc * 1.122, BUTTER_Q); 2]);
+            let v: Vec<f32> = y
+                .iter()
+                .map(|&v| {
+                    let mut u = v;
+                    for f in a.iter_mut().chain(b.iter_mut()) {
+                        u = f.process(u);
+                    }
+                    u
+                })
+                .collect();
+            rms_db(&v[48000..])
+        };
+        let l: Vec<f32> = [31.5f32, 40.0, 50.0, 63.0, 80.0, 100.0, 125.0].iter().map(|&f| band(f)).collect();
+        let (mx, mn) = (l.iter().cloned().fold(f32::MIN, f32::max), l.iter().cloned().fold(f32::MAX, f32::min));
+        assert!(mx - mn < 5.0, "31.5–125 Hz 各带 {l:?}");
+        assert!(band(400.0) < mn - 5.0 && band(400.0) > mn - 16.0, "400 Hz {} dB，低频段最低 {mn} dB", band(400.0));
+        assert!(band(1000.0) < mn - 18.0, "1 kHz {} dB，低频段最低 {mn} dB", band(1000.0));
     }
 
     #[test]

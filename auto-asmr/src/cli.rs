@@ -33,7 +33,9 @@ convert 的选项（括号里是默认值）：
   --mix-gain <dB,…>       各音源的音量增减，在自动对齐响度之后再加（默认都是 0），如 0,-3
   --mix-follow            一起移动：几个音源按 --mode 的方式（穿梭 / 随机走位 / 环绕 / 固定）一起走，彼此相隔 360°/个数
                           （两个时正好相对：一个贴左耳时另一个贴右耳，换边时一个从脸前、一个从脑后绕）；不加就是各自固定
-  --style ear|ku100       ear=贴耳加强；ku100=像真实 KU100 实录（远耳听得到、离耳约 6 cm、真实房间）
+  --style ear|ku100|earclean   ear=贴耳加强；ku100=像真实 KU100 轻语实录（远耳听得到、真实房间、像真人一样随机走位，
+                          约三分之一的停留在正面，贴耳时离耳约 2–4 cm）；earclean=掏耳（给棉签 / 挖耳勺 / 刮擦这类触发音用：伸进耳道进进出出，
+                          带耳道共鸣和耳内低频，每只耳朵约 40 秒才换边，目标响度默认 −20 LUFS）
   --start <秒> --duration <秒>      只处理一段
   --channel auto|left|right|mix     立体声取哪个声道（auto=更响的那个）
  贴耳感
@@ -49,11 +51,18 @@ convert 的选项（括号里是默认值）：
   --far-shadow <dB>       贴耳时远耳 6 kHz 以上再压低（5，0=关闭）
   --soft-near <x>         贴耳轻声：凑到耳边时嗓音均衡成放轻声音，退开时恢复（0.5，0=关闭）
   --concha <dB>           耳甲共鸣：贴耳时近耳 4.3 kHz 的耳甲腔共振（4，0=关闭）
+ 入耳（掏耳；--inear 为 0 时这一组不起作用）
+  --inear <cm>            入耳深度：贴到耳朵上之后最深伸进耳道多少（0=不进耳道；earclean 2.1；最大 2.3）
+  --inear-period <秒>     一次伸进去—退出来大约几秒（4）    --inear-random <0–1>  进出的随机程度（0.7）
+  --canal <dB>            耳道共鸣：伸得越深共振越高，约 3 → 11 kHz（10，0=关闭）
+  --rumble <x>            耳内低频：摩擦 / 触碰在耳道里的低频压力，由输入自己的包络导出（1，0=关闭）
+  --muffle <dB>           堵耳闷感：伸进耳道时近耳 2.5 kHz 以上压低（6，0=关闭）
  左右移动
   --mode sweep|random|orbit|static  穿梭 / 随机走位 / 环绕 / 固定（sweep）
   --hold-time <秒> --move-time <秒> 停留、移动时长（2.5、2.5）
   --randomness <0–1>      时长和落点的随机程度（0.1）
   --approach <0–1>        换边时先退远再凑近的概率（0.25）
+  --front <0–1>           随机走位：停在正前方的比例（0.08；ku100 0.35）
   --via front|back|alternate|random  从哪里绕（front）
   --ear-angle <度>（100）  --pass-dist <米>（0.2）  --az <度>（270）  --radius <米>（0.35）  --period <秒>（12）
   --level-follow <0–1>    响度随位置变化的程度（按模式：0.2 / 0.5 / 0.3 / 1）
@@ -75,7 +84,7 @@ convert 的选项（括号里是默认值）：
   --deess <dB>            去齿音最多压低（0）       --soft-voice <x>   轻声化（0）
  输出
   --lufs <L>（-16）  --peak <dBTP>（-1）  --max-gr <dB>（8）  --bits 16|24（24）  --seed <n>（1）
-  --save-trajectory <csv> 导出实际走位（时间, 方位角, 距离, 不含忽远忽近的距离, 说话活动, 仰角）
+  --save-trajectory <csv> 导出实际走位（时间, 方位角, 距离, 不含忽远忽近的距离, 说话活动, 仰角, 入耳深度）
 ";
 
 fn parse_f(v: Option<&String>, name: &str) -> Result<f32, String> {
@@ -195,6 +204,8 @@ fn run_convert(args: &[String]) -> Result<(), String> {
     let (mut start, mut duration) = (0.0f64, None);
     let mut channel = Channel::Auto;
     let (mut bits, mut lufs, mut peak, mut max_gr) = (24u16, -16.0f32, -1.0f32, 8.0f32);
+    let mut lufs_set = false;
+    let (mut earclean, mut style_ku) = (false, false);
     let mut level_follow: Option<f32> = None;
     let mut save_traj: Option<PathBuf> = None;
     let (mut mix_on, mut mix_follow) = (false, false);
@@ -203,8 +214,15 @@ fn run_convert(args: &[String]) -> Result<(), String> {
     if let Some(i) = args.iter().position(|a| a == "--style") {
         match args.get(i + 1).map(|s| s.as_str()) {
             Some("ear") => p = p.style_ear(),
-            Some("ku100") => p = p.style_ku100(),
-            _ => return Err("--style 只能是 ear 或 ku100".into()),
+            Some("ku100") => {
+                p = p.style_ku100();
+                style_ku = true;
+            }
+            Some("earclean") | Some("ear-clean") | Some("掏耳") => {
+                p = p.style_earclean();
+                earclean = true;
+            }
+            _ => return Err("--style 只能是 ear、ku100 或 earclean".into()),
         }
     }
     let mut it = args.iter().peekable();
@@ -265,6 +283,13 @@ fn run_convert(args: &[String]) -> Result<(), String> {
             "--mouth" => p.mouth_cm = f(&mut it)?.clamp(0.0, 8.0),
             "--far-shadow" => p.far_shadow_db = f(&mut it)?.max(0.0),
             "--soft-near" => p.soft_near = f(&mut it)?.max(0.0),
+            "--inear" => p.inear_cm = f(&mut it)?.clamp(0.0, crate::dsp::INEAR_MAX_CM),
+            "--inear-period" => p.inear_period = f(&mut it)?.max(0.5),
+            "--inear-random" => p.inear_random = f(&mut it)?.clamp(0.0, 1.0),
+            "--canal" => p.canal_db = f(&mut it)?.clamp(0.0, 24.0),
+            "--rumble" => p.rumble = f(&mut it)?.max(0.0),
+            "--muffle" => p.muffle_db = f(&mut it)?.max(0.0),
+            "--front" => p.front = f(&mut it)?.clamp(0.0, 1.0),
             "--mode" => {
                 p.mode = match it.next().map(|s| s.as_str()) {
                     Some("sweep") => MotionMode::Sweep,
@@ -346,7 +371,10 @@ fn run_convert(args: &[String]) -> Result<(), String> {
             "--gate" => p.gate_db = f(&mut it)?,
             "--deess" => p.deess_db = f(&mut it)?,
             "--soft-voice" => p.soft_voice = f(&mut it)?,
-            "--lufs" => lufs = f(&mut it)?,
+            "--lufs" => {
+                lufs = f(&mut it)?;
+                lufs_set = true;
+            }
             "--peak" => peak = f(&mut it)?,
             "--max-gr" => max_gr = f(&mut it)?,
             "--bits" => bits = if f(&mut it)? as u16 == 16 { 16 } else { 24 },
@@ -356,7 +384,16 @@ fn run_convert(args: &[String]) -> Result<(), String> {
             _ => inputs.push(PathBuf::from(name)),
         }
     }
-    p.level_follow = level_follow.unwrap_or(Params::default_level_follow(p.mode));
+    // 掏耳预设：目标响度默认 −20 LUFS（低频为主，K 加权读数偏低）
+    p.level_follow = match level_follow {
+        Some(v) => v,
+        // 掏耳、KU100 实录这两个风格自己定了"响度随位置变化"；另选了别的模式时按模式的默认值
+        None if (earclean && p.mode == MotionMode::Sweep) || (style_ku && p.mode == MotionMode::Random) => p.level_follow,
+        None => Params::default_level_follow(p.mode),
+    };
+    if earclean && !lufs_set {
+        lufs = crate::dsp::params::EARCLEAN_LUFS;
+    }
     if (pos_list.is_some() || gain_list.is_some() || mix_follow) && !mix_on {
         return Err("--pos / --mix-gain / --mix-follow 只用于多音频合成，请同时加 --mix".into());
     }
@@ -524,7 +561,7 @@ fn run_convert(args: &[String]) -> Result<(), String> {
         println!("{}", rep.channel_note);
     }
     println!(
-        "完成：{}  ({:.1} s，{:.1} LUFS，真峰值 {:.1} dBTP，限制器最多压 {:.1} dB；说话占 {:.0}%，换耳 {} 次（其中从头顶绕 {} 次），往后让 {} 次，上下换位 {} 次；用时 {:.1} s)",
+        "完成：{}  ({:.1} s，{:.1} LUFS，真峰值 {:.1} dBTP，限制器最多压 {:.1} dB；说话占 {:.0}%，换耳 {} 次（其中从头顶绕 {} 次），往后让 {} 次，上下换位 {} 次{}；用时 {:.1} s)",
         opts.output.display(),
         rep.seconds,
         rep.lufs,
@@ -535,6 +572,7 @@ fn run_convert(args: &[String]) -> Result<(), String> {
         rep.n_tops,
         rep.n_sways,
         rep.n_updowns,
+        if p.inear_cm > 0.0 { format!("，伸进耳道 {} 次", rep.n_strokes) } else { String::new() },
         rep.elapsed_s
     );
     Ok(())
@@ -548,8 +586,10 @@ fn run_convert(args: &[String]) -> Result<(), String> {
 fn run_rt_sim(args: &[String]) -> Result<(), String> {
     let mut p = Params::default();
     if let Some(i) = args.iter().position(|a| a == "--style") {
-        if args.get(i + 1).map(|s| s.as_str()) == Some("ku100") {
-            p = p.style_ku100();
+        match args.get(i + 1).map(|s| s.as_str()) {
+            Some("ku100") => p = p.style_ku100(),
+            Some("earclean") => p = p.style_earclean(),
+            _ => {}
         }
     }
     let get = |name: &str| args.iter().position(|a| a == name).and_then(|i| args.get(i + 1));
@@ -711,6 +751,13 @@ fn run_rt_sim(args: &[String]) -> Result<(), String> {
         crate::dsp::lin_to_db(rms(&x)),
         crate::dsp::lin_to_db(rms(&l).max(rms(&r)))
     );
+    if cur.inear_cm > 0.0 && !tr.is_empty() {
+        // 入耳（掏耳）：在耳道里的时间占比、深度的中位数
+        let mut d: Vec<f32> = tr.iter().map(|v| v[6] * 100.0).collect();
+        d.sort_by(|a, b| a.total_cmp(b));
+        let inside = d.iter().filter(|&&v| v > 0.3).count() as f32 / d.len() as f32;
+        println!("  伸进耳道 {} 次，{:.0}% 的时间在耳道里，深度中位 {:.1} cm、最深 {:.1} cm", eng.tele.n_strokes, 100.0 * inside, d[d.len() / 2], d[d.len() - 1]);
+    }
     if let Some(out) = get("-o") {
         let spec = hound::WavSpec { channels: 2, sample_rate: FS_USIZE as u32, bits_per_sample: 24, sample_format: hound::SampleFormat::Int };
         let mut w = hound::WavWriter::create(out, spec).map_err(|e| e.to_string())?;
@@ -777,10 +824,43 @@ pub fn test_voice(seconds: f32) -> Vec<f32> {
     x
 }
 
+/// 合成一段像棉签 / 刮擦的测试信号：约每 0.6 s 一下的摩擦噪声（300 Hz–5 kHz，起音和收尾平滑），夹着稀疏的咔嗒。
+pub fn test_scratch(seconds: f32) -> Vec<f32> {
+    let n = (seconds * FS) as usize;
+    let mut x = vec![0f32; n];
+    let mut seed = 4321u32;
+    let mut rnd = move || {
+        seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+        (seed >> 8) as f32 / (1u32 << 23) as f32 - 1.0
+    };
+    let (mut lp, mut hp, mut click) = (0f32, 0f32, 0f32);
+    for (i, v) in x.iter_mut().enumerate() {
+        let ph = (i as f32 / FS / 0.62).fract();
+        let env = if ph < 0.7 { (std::f32::consts::PI * ph / 0.7).sin().powi(2) } else { 0.0 };
+        lp += 0.45 * (rnd() - lp);
+        hp += 0.04 * (lp - hp);
+        if rnd() > 0.9996 {
+            click = 1.0;
+        }
+        click *= 0.9;
+        *v = 0.2 * env * ((lp - hp) + 0.8 * click * rnd());
+    }
+    // 隔着空气录的摩擦声没有低频：300 Hz 以下滤掉（4 阶）
+    let mut f = [crate::dsp::filters::Biquad::highpass(300.0, crate::dsp::filters::BUTTER_Q); 2];
+    for v in x.iter_mut() {
+        let u = f[0].process(*v);
+        *v = f[1].process(u);
+    }
+    x
+}
+
 fn bench() {
     let x = test_voice(30.0);
-    let cases: [(&str, Params); 3] = [
+    // 掏耳预设用刮擦声来测（给触发音用的），其余用人声
+    let scratch = test_scratch(30.0);
+    let cases: [(&str, Params); 4] = [
         ("贴耳加强（默认）", Params::default()),
+        ("掏耳（入耳：耳道共鸣 + 耳内低频）", Params::default().style_earclean()),
         ("KU100 风格（真实房间）", Params::default().style_ku100()),
         ("KU100 风格 + 降噪 + 去齿音 + 轻声化", {
             let mut p = Params::default().style_ku100();
@@ -792,6 +872,7 @@ fn bench() {
     ];
     println!("每次处理 128 个样本（2.67 ms 一块），模拟实时回调：");
     for (name, p) in cases {
+        let x = if p.inear_cm > 0.0 { &scratch } else { &x };
         let cfg = Arc::new(EngineConfig::new(p, None));
         let mut eng = Engine::new(cfg, PostMode::Realtime, 0.0);
         let (mut l, mut r) = ([0f32; 128], [0f32; 128]);

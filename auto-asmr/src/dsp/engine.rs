@@ -10,8 +10,8 @@ use super::params::{Params, Playback};
 use super::pinna::pinnas;
 use super::room::{conv_energy, Room};
 use super::tables::{tables, Hrir, Tables};
-use super::voice::{ear_eq_fir, far_shadow_fir, soft_voice_fir, BreathFx, DeEsser, Denoiser, Gate, DENOISE_DELAY, EAR_EQ_TAPS};
-use super::{db_to_lin, lin_to_db, C, CTRL, CTRL_DT, EAR_R, FS, NTAP, R_MAX, R_MIN};
+use super::voice::{ear_eq_fir, far_shadow_fir, muffle_fir, soft_voice_fir, BreathFx, CanalComb, ContactFx, DeEsser, Denoiser, Gate, DENOISE_DELAY, EAR_EQ_TAPS};
+use super::{db_to_lin, lin_to_db, smoothstep, C, CANAL_L0, CTRL, CTRL_DT, EAR_R, FS, NTAP, R_MAX, R_MIN};
 use std::sync::Arc;
 
 /// 直达声比 Python 版多出来的固定时延（样本）：分数延时插值器要"往后看"的那一半。
@@ -19,6 +19,14 @@ const ROOM_DELAY: usize = BASE_DELAY as usize - 4;
 
 /// 真实房间：贴耳时远耳听到的房间声比近耳直达声低多少 dB（KU100 实测 −24…−35 dB）。
 const REAL_ROOM_DB: f32 = -28.0;
+
+/// 入耳：伸进耳道这么深（米）就算完全"在耳道里"（近耳不再经过耳廓、共鸣和耳内低频全开）。
+const INEAR_FULL: f32 = 0.003;
+/// 入耳打开时整体压低多少 dB（给耳内低频留余量，使实时模式下未经自动响度的输出与人声预设差不多响）。
+const INEAR_TRIM_DB: f32 = 14.0;
+/// 入耳：完全伸进耳道时另一只耳朵再压低多少 dB。两段 KU100 掏耳实录里另一只耳朵只剩底噪
+/// （比近耳低 35–46 dB，受底噪限制，实际更低）。
+const INEAR_FAR_DB: f32 = 30.0;
 
 /// 由参数算出来的滤波器等"重"数据，在界面线程里算好再交给音频线程。
 pub struct Derived {
@@ -29,6 +37,11 @@ pub struct Derived {
     pub far_eq: Option<Arc<Vec<f32>>>,
     /// 贴耳轻声用的均衡（与轻声化同一种滤波器，强度按 `soft_near`）。
     pub soft_near: Option<Arc<Vec<f32>>>,
+    /// 入耳时近耳的堵耳闷感。
+    pub muffle: Option<Arc<Vec<f32>>>,
+    /// 入耳时近耳的增益：与"贴在耳道口正外面（正侧方、离耳 0.75 cm）"的直达声一样响
+    /// （含"响度随位置变化"在那个位置的补偿），所以伸进、退出耳道时响度是连着的；不随耳朵外面那一点位置的晃动变化。
+    pub inear_gain: f32,
     /// 耳廓选择：真人耳廓在 [`pinnas`] 里的序号；None = KU100 自己的耳廓。
     pub pinna: Option<usize>,
     pub room_gain: f32,
@@ -91,8 +104,21 @@ impl EngineConfig {
         } else {
             None
         };
+        let muffle = if same(&|q| q.muffle_db == params.muffle_db) { pd.unwrap().muffle.clone() } else { muffle_fir(params.muffle_db).map(Arc::new) };
+        let inear_gain = if same(&|q| q.level_follow == params.level_follow) {
+            pd.unwrap().inear_gain
+        } else {
+            // 正侧方、最近处两只近耳 HRIR 的能量取平均，再乘上那个位置的响度补偿
+            let mut h = Hrir::default();
+            tab.lookup(270.0, R_MIN, &mut h);
+            let e_r: f32 = h.h[1].iter().map(|v| v * v).sum();
+            tab.lookup(90.0, R_MIN, &mut h);
+            let e_l: f32 = h.h[0].iter().map(|v| v * v).sum();
+            let p_ear = 0.5 * (tab.lookup_power(270.0, R_MIN) + tab.lookup_power(90.0, R_MIN));
+            (0.5 * (e_r + e_l)).sqrt() * (p_ear / pref).powf(-(1.0 - params.level_follow) / 2.0)
+        };
         let pinna = pinnas().index(&params.pinna);
-        EngineConfig { params, derived: Derived { ear_eq, playback, soft, far_eq, soft_near, pinna, room_gain, pref } }
+        EngineConfig { params, derived: Derived { ear_eq, playback, soft, far_eq, soft_near, muffle, inear_gain, pinna, room_gain, pref } }
     }
 }
 
@@ -113,6 +139,9 @@ pub struct Telemetry {
     pub n_sways: u32,
     pub n_tops: u32,
     pub n_updowns: u32,
+    /// 入耳深度（厘米）和伸进耳道的次数。
+    pub depth_cm: f32,
+    pub n_strokes: u32,
 }
 
 /// 输出端怎么收尾。
@@ -194,6 +223,10 @@ pub struct Engine {
     la_pos: usize,
     warm_lp: OnePoleLp,
     breath: BreathFx,
+    contact: ContactFx,
+    comb: [CanalComb; 2],
+    comb_g: [(f32, f32); 2],
+    comb_d: (f32, f32),
     direct: DirectRenderer,
     room: Room,
     lf: [EarLf; 2],
@@ -226,8 +259,8 @@ pub struct Engine {
     /// 统计：已处理的控制块数、其中在说话的块数。
     pub n_blocks: u64,
     pub n_speech: u64,
-    /// 打开后记录每个控制块的 [时间 s, 方位角, 距离, 不含忽远忽近的距离, 说话活动, 仰角]（导出轨迹用）。
-    pub trace: Option<Vec<[f32; 6]>>,
+    /// 打开后记录每个控制块的 [时间 s, 方位角, 距离, 不含忽远忽近的距离, 说话活动, 仰角, 入耳深度 m]（导出轨迹用）。
+    pub trace: Option<Vec<[f32; 7]>>,
     /// 多音频合成"一起移动"：整个位置绕头转这么多度（几个音源按同一套走位、彼此错开）。0 = 不转。
     pub az_offset: f32,
     /// 多音频合成"一起移动"：说话时钟按这个说话活动走，几个音源共用一个时钟、步调完全一致；None = 按自己的说话活动。
@@ -261,6 +294,10 @@ impl Engine {
             la_pos: 0,
             warm_lp: OnePoleLp::new(220.0),
             breath: BreathFx::new(),
+            contact: ContactFx::new(),
+            comb: [CanalComb::new(), CanalComb::new()],
+            comb_g: [(0.0, 0.0); 2],
+            comb_d: (CanalComb::delay(CANAL_L0), CanalComb::delay(CANAL_L0)),
             direct: DirectRenderer::new(),
             room: Room::new(tables()),
             lf: [EarLf::new(), EarLf::new()],
@@ -403,7 +440,7 @@ impl Engine {
         self.pose = pose;
         if let Some(tr) = &mut self.trace {
             let t = (self.n_blocks.saturating_sub((self.la_buf.len() / CTRL) as u64)) as f32 * CTRL_DT;
-            tr.push([t, pose.az, pose.r, pose.r_base, f.act, pose.el]);
+            tr.push([t, pose.az, pose.r, pose.r_base, f.act, pose.el, pose.depth]);
         }
         let az_sofa = (360.0 - pose.az).rem_euclid(360.0); // 顺时针 -> SOFA 逆时针
         self.tab.lookup3(az_sofa, pose.el, pose.r, &mut self.hr, &mut self.hr_tmp);
@@ -446,6 +483,9 @@ impl Engine {
             talker = (p_now / p_base).powf(-(1.0 - p.sway_level) / 2.0);
             g *= talker;
         }
+        // 入耳（掏耳）打开时整体留出余量：耳内低频比摩擦声高十几分贝，不留的话实时模式的自动响度拉不回来
+        let trim = if p.inear_cm > 0.0 { db_to_lin(-INEAR_TRIM_DB) } else { 1.0 };
+        g *= trim;
         // 人头麦贴耳感：远耳额外压低，近耳加临场 / 空气感
         let rc = pose.r.clamp(R_MIN, R_MAX);
         let cl = closeness(pose.az, pose.el, rc);
@@ -486,6 +526,30 @@ impl Engine {
                 eq_blend(&mut self.hr.h[1 - ipsi], eq, cl);
             }
         }
+        // 入耳（掏耳）：声源伸进耳道后，近耳听到的不再经过耳廓，也不再随耳朵外面那一点位置的晃动变化——
+        // 换成平直的响应（与贴在耳道口正外面一样响），再加堵耳的闷感；另一只耳朵基本听不到。
+        // 耳道共鸣和耳内低频在后面逐样本处理
+        let win = if p.inear_cm > 0.0 { smoothstep(pose.depth / INEAR_FULL) } else { 0.0 };
+        if win > 0.0 {
+            let h = &mut self.hr.h[ipsi];
+            let g0 = cfg.derived.inear_gain * trim;
+            for (i, v) in h.iter_mut().enumerate() {
+                *v += win * (if i == 0 { g0 } else { 0.0 } - *v);
+            }
+            if let Some(eq) = &cfg.derived.muffle {
+                eq_blend(h, eq, win);
+            }
+            let gf = db_to_lin(-INEAR_FAR_DB * win);
+            for v in self.hr.h[1 - ipsi].iter_mut() {
+                *v *= gf;
+            }
+        }
+        let mut comb_g = [0f32; 2];
+        if win > 0.0 && p.canal_db > 0.0 {
+            comb_g[ipsi] = CanalComb::feedback(p.canal_db) * win;
+        }
+        let comb_d = CanalComb::delay(CANAL_L0 - pose.depth);
+        self.contact.begin_block(if p.rumble > 0.0 { win * p.rumble } else { 0.0 });
         let d = [rc / C * FS + self.hr.tau[0] + BASE_DELAY, rc / C * FS + self.hr.tau[1] + BASE_DELAY];
         self.direct.set_target(&self.hr.h, d);
 
@@ -502,14 +566,18 @@ impl Engine {
         if self.primed {
             self.warm = (self.warm.1, warm);
             self.softw = (self.softw.1, cl);
+            self.comb_d = (self.comb_d.1, comb_d);
             for e in 0..2 {
                 self.lfg[e] = (self.lfg[e].1, lfg[e]);
+                self.comb_g[e] = (self.comb_g[e].1, comb_g[e]);
             }
         } else {
             self.warm = (warm, warm);
             self.softw = (cl, cl);
+            self.comb_d = (comb_d, comb_d);
             for e in 0..2 {
                 self.lfg[e] = (lfg[e], lfg[e]);
+                self.comb_g[e] = (comb_g[e], comb_g[e]);
             }
             self.primed = true;
         }
@@ -529,6 +597,8 @@ impl Engine {
             n_sways: self.motion.n_sways,
             n_tops: self.motion.n_tops,
             n_updowns: self.motion.n_updowns,
+            depth_cm: pose.depth * 100.0,
+            n_strokes: self.motion.n_strokes,
         };
         self.in_pk *= 0.97;
         self.out_pk *= 0.97;
@@ -562,6 +632,7 @@ impl Engine {
         let la = self.la_buf.len();
         let dn_mix = p.denoise_mix();
         let breath_on = p.breath_db > 0.0 || p.puff > 0.0;
+        let rumble_on = p.inear_cm > 0.0 && p.rumble > 0.0;
         for i in 0..m {
             let x = input[i];
             self.in_pk = self.in_pk.max(x.abs());
@@ -606,8 +677,23 @@ impl Engine {
             } else {
                 a + gb * self.warm_lp.process(a)
             };
+            if rumble_on {
+                // 耳内低频：由输入自己的包络导出，加在直达声的输入上，由近耳的响应送到伸进去的那只耳朵
+                self.xd[i] += self.contact.process(a, wp);
+            }
         }
         self.direct.process(&self.xd[..m], ph, &mut self.dl[..m], &mut self.dr[..m]);
+        if p.inear_cm > 0.0 && p.canal_db > 0.0 {
+            // 耳道共鸣：只作用在伸进去的那只耳朵上（另一只的反馈系数为 0，原样通过）
+            for i in 0..m {
+                let wp = (ph + i) as f32 / CTRL as f32;
+                let d = self.comb_d.0 + (self.comb_d.1 - self.comb_d.0) * wp;
+                let gl = self.comb_g[0].0 + (self.comb_g[0].1 - self.comb_g[0].0) * wp;
+                let gr = self.comb_g[1].0 + (self.comb_g[1].1 - self.comb_g[1].0) * wp;
+                self.dl[i] = self.comb[0].process(self.dl[i], gl, d);
+                self.dr[i] = self.comb[1].process(self.dr[i], gr, d);
+            }
+        }
         if p.ear_warmth_db > 0.0 || p.far_lf_cut_db > 0.0 {
             for i in 0..m {
                 let wp = (ph + i) as f32 / CTRL as f32;
@@ -618,7 +704,9 @@ impl Engine {
             }
         }
         if p.room {
-            self.room.process(&self.xr[..m], ph, cfg.derived.room_gain, &mut self.dl[..m], &mut self.dr[..m]);
+            // 入耳打开时直达声整体留了余量，房间声跟着一起压低，两者的比例不变
+            let room_gain = if p.inear_cm > 0.0 { cfg.derived.room_gain * db_to_lin(-INEAR_TRIM_DB) } else { cfg.derived.room_gain };
+            self.room.process(&self.xr[..m], ph, room_gain, &mut self.dl[..m], &mut self.dr[..m]);
         }
         let speaking = self.feats.act > 0.5;
         let gain = db_to_lin(p.out_gain_db);
@@ -640,6 +728,97 @@ impl Engine {
             self.out_pk = self.out_pk.max(l.abs()).max(r.abs());
             out_l[i] = l;
             out_r[i] = r;
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::dsp::params::MotionMode;
+
+    fn render(p: Params, x: &[f32]) -> (Vec<f32>, Vec<f32>) {
+        let mut eng = Engine::new(Arc::new(EngineConfig::new(p, None)), PostMode::Offline, 0.0);
+        let (mut l, mut r) = (vec![0f32; x.len()], vec![0f32; x.len()]);
+        for (i, c) in x.chunks(480).enumerate() {
+            let o = i * 480;
+            eng.process(c, &mut l[o..o + c.len()], &mut r[o..o + c.len()]);
+        }
+        (l, r)
+    }
+
+    /// 一段信号在 lo–hi Hz 里的能量（dB）：4 阶高通 + 4 阶低通。
+    fn band_db(x: &[f32], lo: f32, hi: f32) -> f32 {
+        let (mut a, mut b) = ([Biquad::highpass(lo, BUTTER_Q); 2], [Biquad::lowpass(hi, BUTTER_Q); 2]);
+        let e: f64 = x
+            .iter()
+            .map(|&v| {
+                let mut u = v;
+                for f in a.iter_mut().chain(b.iter_mut()) {
+                    u = f.process(u);
+                }
+                (u * u) as f64
+            })
+            .sum();
+        10.0 * (e / x.len() as f64 + 1e-30).log10() as f32
+    }
+
+    /// 掏耳预设：声音只在一只耳朵里（另一只低 40 dB 以上），带很强的耳内低频；输入里并没有低频。
+    #[test]
+    fn earclean_is_one_sided_and_rumbles() {
+        let x = crate::cli::test_scratch(20.0);
+        assert!(band_db(&x, 25.0, 160.0) < band_db(&x, 300.0, 2000.0) - 25.0, "测试输入不该有低频");
+        let (l, r) = render(Params::default().style_earclean(), &x);
+        assert!(l.iter().chain(r.iter()).all(|v| v.is_finite()));
+        let e = |v: &[f32]| 10.0 * (v.iter().map(|a| (a * a) as f64).sum::<f64>() / v.len() as f64 + 1e-30).log10() as f32;
+        // 开场在左耳，20 秒内不换边
+        assert!(e(&l) - e(&r) > 40.0, "左 {} dB，右 {} dB", e(&l), e(&r));
+        let (lf, mid) = (band_db(&l, 25.0, 160.0), band_db(&l, 300.0, 2000.0));
+        assert!(lf - mid > 6.0 && lf - mid < 24.0, "耳内低频比摩擦声高 {} dB（实录 10–20 dB）", lf - mid);
+        // 关掉耳内低频：低频回到输入本来的样子（远低于摩擦声）
+        let mut p = Params::default().style_earclean();
+        p.rumble = 0.0;
+        let (l0, _) = render(p, &x);
+        assert!(band_db(&l0, 25.0, 160.0) < band_db(&l0, 300.0, 2000.0) - 8.0);
+    }
+
+    /// 耳道共鸣跟着深度走：伸到 1.2 cm 时共振在 5 kHz 附近，伸到 2.1 cm 时在 10.7 kHz 附近。
+    #[test]
+    fn canal_resonance_moves_with_depth() {
+        // 白噪声，手动摆在左耳上（没有自动进出，伸到设定的深度）
+        let mut seed = 99u32;
+        let x: Vec<f32> = (0..96000)
+            .map(|_| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                0.1 * ((seed >> 8) as f32 / (1u32 << 23) as f32 - 1.0)
+            })
+            .collect();
+        let at = |cm: f32, canal: f32| {
+            let mut p = Params::default().style_earclean();
+            p.mode = MotionMode::Manual;
+            (p.manual_az, p.manual_dist, p.manual_tilt) = (270.0, R_MIN, 0.0);
+            (p.inear_cm, p.canal_db, p.rumble) = (cm, canal, 0.0);
+            let (l, _) = render(p, &x);
+            let s = &l[48000..];
+            band_db(s, 9500.0, 12000.0) - band_db(s, 4500.0, 5600.0)
+        };
+        let (mid, deep) = (at(1.2, 10.0), at(2.1, 10.0));
+        assert!(deep - mid > 8.0, "10 kHz 带相对 5 kHz 带：1.2 cm 时 {mid} dB，2.1 cm 时 {deep} dB");
+        // 共鸣关掉后深浅不再改变音色
+        let (mid0, deep0) = (at(1.2, 0.0), at(2.1, 0.0));
+        assert!((deep0 - mid0).abs() < 0.5, "{mid0} {deep0}");
+    }
+
+    /// 入耳深度为 0 时，入耳这一组参数怎么设都不影响输出（与加入这一组之前逐样本相同）。
+    #[test]
+    fn inear_group_is_inert_at_zero_depth() {
+        let x = crate::cli::test_voice(8.0);
+        for base in [Params::default(), Params::default().style_ku100()] {
+            let mut q = base.clone();
+            (q.inear_period, q.inear_random, q.canal_db, q.rumble, q.muffle_db) = (2.0, 0.1, 16.0, 3.0, 12.0);
+            assert_eq!(q.inear_cm, 0.0);
+            let (a, b) = (render(base, &x), render(q, &x));
+            assert!(a.0 == b.0 && a.1 == b.1, "入耳深度为 0 时输出变了");
         }
     }
 }
