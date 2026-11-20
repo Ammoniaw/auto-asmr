@@ -215,6 +215,31 @@ pub unsafe extern "C" fn asmr_load_config(text: *const c_char) -> c_int {
     report(catch_unwind(|| settings::load_config(&text)))
 }
 
+/// 只检查、不导入：`text` 是不是 auto-asmr 的配置文件。返回 0 = 是（`buf` 里是给确认弹窗看的概要），
+/// 1 = 不是 auto-asmr 的配置（比如只有桌面版窗口状态的文件），2 = 读不懂（`buf` 里是原因）。不碰数据表，随时可以调。
+///
+/// # Safety
+/// `text` 是 NUL 结尾的 UTF-8 字符串；`buf` 可写 `cap` 字节。
+#[no_mangle]
+pub unsafe extern "C" fn asmr_check_config(text: *const c_char, buf: *mut c_char, cap: usize) -> c_int {
+    let text = from_c(text);
+    match catch_unwind(|| settings::describe_config(&text)) {
+        Ok(Ok(d)) => {
+            write_c(&d, buf, cap);
+            0
+        }
+        Ok(Err(auto_asmr::config::ConfigError::NotAutoAsmr)) => {
+            write_c("文件里没有 auto-asmr 的配置", buf, cap);
+            1
+        }
+        Ok(Err(auto_asmr::config::ConfigError::Parse(e))) => {
+            write_c(&e, buf, cap);
+            2
+        }
+        Err(_) => 2,
+    }
+}
+
 /// 导出配置文件（和桌面版「导出配置」同一格式），返回完整长度；出错时返回 -1。
 ///
 /// # Safety

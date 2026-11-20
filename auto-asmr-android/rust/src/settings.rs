@@ -97,6 +97,46 @@ pub fn load_config(text: &str) -> Result<(), String> {
     Ok(())
 }
 
+/// 只检查、不导入：别的 App（QQ、微信……）用「其他应用打开」传来的文件是不是 auto-asmr 的配置文件。
+/// 是的话返回给确认弹窗看的概要（风格、移动方式、贴耳距离、房间、降噪、雨声、原声），不是的话返回原因。
+/// 只解析，不碰数据表，所以引擎还没加载完时也能用。
+pub fn describe_config(text: &str) -> Result<String, ConfigError> {
+    let s = config::parse(text)?;
+    let p = &s.params;
+    // 风格按钮只改风格相关的参数：按一下没有变化，就是这个风格
+    let style = if p.clone().style_earclean() == *p {
+        "掏耳"
+    } else if p.clone().style_ku100() == *p {
+        "KU100 实录"
+    } else if p.clone().style_ear() == *p {
+        "贴耳加强"
+    } else {
+        "自定义"
+    };
+    let mode = match p.mode {
+        MotionMode::Sweep => "穿梭",
+        MotionMode::Random => "随机走位",
+        MotionMode::Orbit => "环绕",
+        MotionMode::Static => "固定",
+        MotionMode::Manual => "手动摆位",
+    };
+    let mut parts = vec![format!("风格：{style}"), format!("左右移动：{mode}"), format!("贴耳距离 {:.1} cm", p.ear_cm())];
+    if p.inear_cm > 0.0 {
+        parts.push(format!("入耳 {:.1} cm", p.inear_cm));
+    }
+    parts.push(if p.room { "真实房间" } else { "不加房间" }.to_string());
+    if p.denoise {
+        parts.push(format!("降噪 {:.0}", p.denoise_slider()));
+    }
+    if let Some(db) = p.bg_db() {
+        parts.push(format!("背景雨声（比人声低 {:.0} dB）", -db));
+    }
+    if s.dry {
+        parts.push("原声（不加效果）".to_string());
+    }
+    Ok(parts.join(" · "))
+}
+
 /// 导出配置文件（和桌面版「导出配置」同一格式）。
 pub fn export_config() -> Result<String, String> {
     with_global(|g| config::to_text(&g.saved))
@@ -329,6 +369,25 @@ mod tests {
         assert!(back.buffer == 512 && back.input.as_deref() == Some("Mic") && back.dry);
         assert_eq!((back.params.puff, back.params.presence_db), (2.5, 5.0));
         assert!(load_config("not ron").is_err());
+    }
+
+    /// 别的 App 传来的文件：桌面版 / 安卓版导出的配置能认出来并给出概要；别的文件认不出来；检查不会改当前设置。
+    #[test]
+    fn shared_files_are_recognised_without_importing() {
+        let _g = TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        provide_repo_data();
+        let before = export_config().unwrap();
+        let desk = Saved { dry: true, params: Params { bg_level: 55.0, ..Params::default().style_ku100() }, ..Saved::default() };
+        let d = describe_config(&config::to_text(&desk).unwrap()).unwrap();
+        assert!(d.contains("风格：KU100 实录") && d.contains("随机走位") && d.contains("真实房间") && d.contains("比人声低 18 dB") && d.contains("原声"), "{d}");
+        let d = describe_config(&config::to_text(&Saved { params: Params::default().style_earclean(), ..Saved::default() }).unwrap()).unwrap();
+        assert!(d.contains("风格：掏耳") && d.contains("入耳"), "{d}");
+        let d = describe_config(&config::to_text(&Saved { params: Params { presence_db: 7.0, ..Params::default() }, ..Saved::default() }).unwrap()).unwrap();
+        assert!(d.contains("风格：自定义"), "{d}");
+        // 桌面版的窗口状态文件（没有设置）、别的程序的键值文件、普通文本：都认不出来
+        assert!(matches!(describe_config("{\"egui\": \"()\", \"window\": \"()\"}"), Err(ConfigError::NotAutoAsmr)));
+        assert!(matches!(describe_config("今天天气不错"), Err(ConfigError::Parse(_))));
+        assert_eq!(export_config().unwrap(), before, "检查不该改当前设置");
     }
 
     #[test]

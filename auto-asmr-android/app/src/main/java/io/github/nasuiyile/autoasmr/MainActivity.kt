@@ -32,6 +32,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.text.KeyboardActions
 import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -90,6 +91,8 @@ class MainActivity : ComponentActivity() {
         Playback.browser = browser
         browser.newTab(intent.getStringExtra("url") ?: Browser.HOME)
         handle(intent)
+        // 从别的 App「用其他应用打开」.ron 配置文件启动的（进程被系统回收后重建时不再弹一次）
+        if (savedInstanceState == null && SharedImport.isOpenFile(intent)) SharedImport.handle(this, intent)
         setContent {
             MaterialTheme(colorScheme = if (isSystemInDarkTheme()) darkColorScheme() else lightColorScheme()) {
                 Surface(Modifier.fillMaxSize()) { Screen(browser, ::record) }
@@ -100,6 +103,7 @@ class MainActivity : ComponentActivity() {
     override fun onNewIntent(intent: Intent) {
         super.onNewIntent(intent)
         setIntent(intent)
+        if (SharedImport.isOpenFile(intent)) SharedImport.handle(this, intent)
         intent.getStringExtra("url")?.let { u -> browser.current?.let { browser.open(it, u) } }
         handle(intent)
     }
@@ -289,6 +293,28 @@ private fun Screen(b: Browser, record: (Int) -> Unit) {
             TabList(b, onPick = { showTabs = false })
         }
     }
+    // 别的 App 传来的 .ron 文件：确认后导入
+    SharedImport.pending?.let { f ->
+        if (f.ok) {
+            AlertDialog(
+                onDismissRequest = { SharedImport.pending = null },
+                title = { Text("导入 auto-asmr 配置？") },
+                text = {
+                    Text("「${f.name}」\n\n${f.info}\n\n导入后，当前的效果设置会换成这个文件里的（和菜单里的「导入配置」一样，电脑版导出的文件也行）。")
+                },
+                confirmButton = { TextButton(onClick = { SharedImport.confirm() }) { Text("导入") } },
+                dismissButton = { TextButton(onClick = { SharedImport.pending = null }) { Text("取消") } },
+            )
+        } else {
+            AlertDialog(
+                onDismissRequest = { SharedImport.pending = null },
+                title = { Text("不是 auto-asmr 的配置文件") },
+                text = { Text("「${f.name}」\n\n${f.info}") },
+                confirmButton = { TextButton(onClick = { SharedImport.pending = null }) { Text("知道了") } },
+            )
+        }
+    }
+
     // 网页里的视频全屏：盖住整个界面，隐藏系统栏
     val window = (ctx as? ComponentActivity)?.window
     val full = b.fullscreen

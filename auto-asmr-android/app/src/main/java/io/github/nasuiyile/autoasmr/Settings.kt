@@ -9,7 +9,9 @@ import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.setValue
 import org.json.JSONObject
 import java.io.File
+import java.util.concurrent.CountDownLatch
 import java.util.concurrent.Executors
+import java.util.concurrent.TimeUnit
 
 /**
  * 效果参数：真正的值在 Rust 里（和电脑版同一份 `Params`、同一个配置文件格式），这里只是界面上的镜像。
@@ -52,8 +54,19 @@ object Settings {
         private set
     private var rainSent: Boolean? = null
 
+    /** 启动时的加载做完了没有：导入要等它做完，免得导入的配置被启动时读的旧配置盖掉。 */
+    private val loaded = CountDownLatch(1)
+
     /** App 启动时在后台线程调用：数据文件交给引擎、加载引擎、读上次保存的配置。 */
     fun load(context: Context) {
+        try {
+            doLoad(context)
+        } finally {
+            loaded.countDown()
+        }
+    }
+
+    private fun doLoad(context: Context) {
         val t0 = System.nanoTime()
         val ku = context.assets.open("ku100.bin").use { it.readBytes() }
         val pi = context.assets.open("pinna.bin").use { it.readBytes() }
@@ -191,6 +204,7 @@ object Settings {
     /** 导入配置文件：整份换掉（电脑版独有的设置也留着，下次导出时原样写回）。 */
     fun importText(text: String, done: (Boolean) -> Unit) {
         worker.execute {
+            loaded.await(15, TimeUnit.SECONDS)
             val ok = NativeHook.loadConfig(text) == 0
             val err = if (ok) null else NativeHook.lastError()
             val p = NativeHook.getParamsJson()?.let { JSONObject(it) }

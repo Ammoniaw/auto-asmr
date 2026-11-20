@@ -923,6 +923,19 @@ JNIEXPORT jint JNICALL JNI_FN(loadConfig)(JNIEnv *env, jclass cls, jstring text)
     return r;
 }
 
+/// 只检查不导入（别的 App 用「其他应用打开」传来的文件）：返回 "ok\n概要" / "not\n原因" / "bad\n原因"。
+JNIEXPORT jstring JNICALL JNI_FN(checkConfig)(JNIEnv *env, jclass cls, jstring text) {
+    (void)cls;
+    const char *s = (*env)->GetStringUTFChars(env, text, NULL);
+    if (!s) return (*env)->NewStringUTF(env, "bad\n读不了这个文件");
+    char buf[1024];
+    int r = asmr_check_config(s, buf, sizeof buf - 8);
+    (*env)->ReleaseStringUTFChars(env, text, s);
+    char out[1100];
+    snprintf(out, sizeof out, "%s\n%s", r == 0 ? "ok" : r == 1 ? "not" : "bad", buf);
+    return (*env)->NewStringUTF(env, out);
+}
+
 JNIEXPORT jstring JNICALL JNI_FN(exportConfig)(JNIEnv *env, jclass cls) {
     (void)cls;
     return take_string(env, asmr_export_config);

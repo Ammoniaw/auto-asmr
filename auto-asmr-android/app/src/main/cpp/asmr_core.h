@@ -31,6 +31,8 @@ int asmr_get_params_json(char *buf, size_t cap);
 void asmr_set_dry(int dry);
 // 配置文件（和桌面版同一格式）：导入整份换掉；导出返回长度，出错 -1
 int asmr_load_config(const char *text);
+// 只检查不导入：0 = 是 auto-asmr 的配置（buf = 概要），1 = 不是，2 = 读不懂（buf = 原因）
+int asmr_check_config(const char *text, char *buf, size_t cap);
 int asmr_export_config(char *buf, size_t cap);
 // 界面用的参数表（JSON）
 int asmr_ui_spec(char *buf, size_t cap);

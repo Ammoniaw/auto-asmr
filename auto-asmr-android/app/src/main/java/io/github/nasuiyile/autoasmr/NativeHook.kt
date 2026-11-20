@@ -60,6 +60,12 @@ object NativeHook {
     /** 导入配置文件（电脑版导出 / 自动保存的文件，或本程序导出的文件），整份换掉。返回 0 = 成功。 */
     @JvmStatic external fun loadConfig(text: String): Int
 
+    /**
+     * 只检查不导入：别的 App 用「其他应用打开」传来的文件是不是 auto-asmr 的配置。
+     * 返回 "ok\n概要"（是）/ "not\n原因"（不是 auto-asmr 的配置）/ "bad\n原因"（读不懂）。不需要引擎加载完。
+     */
+    @JvmStatic external fun checkConfig(text: String): String
+
     /** 导出配置文件（和电脑版「导出配置」同一格式）；出错时 null。 */
     @JvmStatic external fun exportConfig(): String?
 
