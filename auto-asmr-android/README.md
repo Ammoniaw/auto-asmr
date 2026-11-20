@@ -1,5 +1,20 @@
 # auto-asmr-android（安卓版，开发中）
 
-安卓版 auto-asmr：内嵌浏览器，把浏览器里正在发声的网页的声音实时做成 KU100 双耳 ASMR 效果再播放。效果参数和桌面 Rust 版相同，不含麦克风实时（主播）模式。
+安卓版 auto-asmr：内嵌浏览器，把浏览器里正在发声的网页的声音实时做成 KU100 双耳 ASMR 效果再播放。效果参数、风格预设和电脑版相同，配置文件和电脑版通用，不含麦克风实时（主播）模式。
 
-目前处于方案调研阶段，还没有代码。技术方案见 [`doc/android-plan.md`](../doc/android-plan.md)。
+目前在模拟器上能用（包括后台播放、通知栏控制、背景雨声），还没有在真机上测过。发布版 APK 随 GitHub Release 发布（`auto-asmr-android.apk`）。
+
+## 构建
+
+需要 JDK 17+、Android SDK / NDK、Rust 和它的两个安卓目标（`rustup target add aarch64-linux-android armv7-linux-androideabi`），环境搭法见 [`doc/android-dev.md`](../doc/android-dev.md)：
+
+```bash
+./gradlew assembleDebug
+```
+
+生成 `app/build/outputs/apk/debug/app-debug.apk`，用 `adb install -r` 装到手机或模拟器。
+
+## 文档
+
+- [安卓版](../doc/android-dev.md)：界面和操作、后台播放、配置文件、环境、构建、发布和签名、调试、代码结构
+- [安卓版技术方案](../doc/android-plan.md)：方案对比、各步的验证结果、开发步骤

@@ -1,0 +1,47 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>auto-asmr e2e 发声页</title>
+  </head>
+  <body>
+    <p>端到端测试用：循环播放一段合成人声（&lt;audio&gt; + 页面里生成的 WAV），供插件采集。</p>
+    <audio id="a" loop controls></audio>
+    <script>
+      // 合成人声（同 wasm/src/lib.rs 的测试）：基频 140 Hz 左右的谐波，按音节开合、偶尔停顿；44.1 kHz 立体声 16 位 WAV
+      const fs = 44100;
+      const secs = 20;
+      const n = fs * secs;
+      const buf = new ArrayBuffer(44 + n * 4);
+      const v = new DataView(buf);
+      const str = (o, s) => [...s].forEach((c, i) => v.setUint8(o + i, c.charCodeAt(0)));
+      str(0, 'RIFF');
+      v.setUint32(4, 36 + n * 4, true);
+      str(8, 'WAVEfmt ');
+      v.setUint32(16, 16, true);
+      v.setUint16(20, 1, true);
+      v.setUint16(22, 2, true);
+      v.setUint32(24, fs, true);
+      v.setUint32(28, fs * 4, true);
+      v.setUint16(32, 4, true);
+      v.setUint16(34, 16, true);
+      str(36, 'data');
+      v.setUint32(40, n * 4, true);
+      const TAU = 2 * Math.PI;
+      for (let i = 0; i < n; i++) {
+        const t = i / fs;
+        const syl = Math.max(0, Math.sin(TAU * 3.3 * t)) * (Math.sin(TAU * 0.25 * t) > -0.6 ? 1 : 0);
+        const ph = TAU * (140 * t - (20 / (TAU * 0.7)) * Math.cos(TAU * 0.7 * t));
+        const s = 0.2 * syl * (Math.sin(ph) + 0.5 * Math.sin(2 * ph) + 0.3 * Math.sin(3 * ph));
+        v.setInt16(44 + i * 4, Math.round(s * 32767), true);
+        v.setInt16(46 + i * 4, Math.round(0.9 * s * 32767), true);
+      }
+      const a = document.getElementById('a');
+      a.src = URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+      window.playError = '';
+      // ?wait：先不播放，等测试脚本开始采集后再调 play()（被采集的标签页不在本地出声，测试时就不会有声音）
+      window.play = () => a.play().catch((e) => (window.playError = String(e)));
+      if (!location.search.includes('wait')) window.play();
+    </script>
+  </body>
+</html>

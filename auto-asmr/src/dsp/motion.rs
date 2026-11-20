@@ -87,6 +87,27 @@ pub fn lift_tilt(az: f32, r: f32, lift: f32, tilt: f32) -> (f32, f32, f32) {
     (px.atan2(py).to_degrees().rem_euclid(360.0), el, rr.clamp(R_MIN, R_MAX))
 }
 
+/// 高度角（度）：以"耳朵"为支点看声源在上方还是下方多少度——与运动里倾斜用的支点相同
+/// （声源在正侧方时支点是那只耳朵，在正前 / 正后方时是头中心）。同时返回水平面上的"未抬高"位置
+/// （方位角, 到头中心的距离），用来把一个三维位置换回手动模式的三个量。[`lift_tilt`] 的逆运算。
+/// 桌面版位置图和安卓版的「手动摆位」都用它。
+pub fn up_angle(az: f32, el: f32, r: f32) -> (f32, f32, f32) {
+    let (a, e) = (az.to_radians(), el.to_radians());
+    let (x, y, z) = (r * e.cos() * a.sin(), r * e.cos() * a.cos(), r * e.sin());
+    // 支点的位置取决于"未抬高"时的方位，先用当前方位估计，迭代几次就收敛
+    let mut cx = HEAD_A * x / r.max(1e-6);
+    let (mut up, mut px, mut py) = (0.0, x, y);
+    for _ in 0..6 {
+        let vh = (x - cx).hypot(y);
+        let d = vh.hypot(z);
+        up = z.atan2(vh).to_degrees();
+        px = cx + (x - cx) / vh.max(1e-6) * d;
+        py = y / vh.max(1e-6) * d;
+        cx = HEAD_A * px / px.hypot(py).max(1e-6);
+    }
+    (up, px.atan2(py).to_degrees().rem_euclid(360.0), px.hypot(py))
+}
+
 #[derive(Clone, Copy)]
 struct Seg {
     t0: f64,

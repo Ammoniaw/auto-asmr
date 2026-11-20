@@ -726,7 +726,7 @@ mod tests {
 
     #[test]
     fn aligned_mix_trims_intro_and_preview_uses_the_same_audio() {
-        use crate::dsp::align::tests::test_song;
+        use crate::dsp::testsig::test_song;
         let dir = std::env::temp_dir().join(format!("auto_asmr_align_test_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         // A：6 秒前奏 + 歌；B：同一首歌（没有前奏）+ 2 秒别的结尾
@@ -891,8 +891,8 @@ mod tests {
         let (rep, (l, r), _) = run(&night, "night.wav");
         assert!(rep.bg_note.starts_with("背景音：雨声，比人声低 18 dB"), "{}", rep.bg_note);
         let (_, (l0, r0s), _) = run(&Params::default(), "plain2.wav");
-        let tail_rain = crate::dsp::rain::tests::lufs(&l[5 * FS_USIZE..6 * FS_USIZE + FS_USIZE / 2], &r[5 * FS_USIZE..6 * FS_USIZE + FS_USIZE / 2]);
-        let voice = crate::dsp::rain::tests::lufs(&l0[FS_USIZE..4 * FS_USIZE], &r0s[FS_USIZE..4 * FS_USIZE]);
+        let tail_rain = crate::dsp::testsig::lufs(&l[5 * FS_USIZE..6 * FS_USIZE + FS_USIZE / 2], &r[5 * FS_USIZE..6 * FS_USIZE + FS_USIZE / 2]);
+        let voice = crate::dsp::testsig::lufs(&l0[FS_USIZE..4 * FS_USIZE], &r0s[FS_USIZE..4 * FS_USIZE]);
         assert!(tail_rain > voice - 26.0 && tail_rain < voice - 12.0, "人声 {voice:.1}，静音处的雨声 {tail_rain:.1} LUFS");
         let e = |a: &[f32]| a.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / a.len() as f64;
         // 开头 1 秒淡入：前 50 ms 的雨声比 0.75–0.95 s 轻得多（这两段都没有人声）

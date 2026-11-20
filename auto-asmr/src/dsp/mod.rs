@@ -17,7 +17,48 @@ pub mod resample;
 pub mod rng;
 pub mod room;
 pub mod tables;
+pub mod testsig;
 pub mod voice;
+
+/// 数据文件（`assets/ku100.bin`：KU100 HRIR 表、房间、耳机补偿；`assets/pinna.bin`：真人耳廓）。
+/// 默认编进程序里；打开 `external-data` 时改成运行时由调用方用 [`data::provide`] 提供——安卓版从 APK 资源里读，
+/// 免得每个 CPU 架构的 .so 各带一份 15.7 MB。第一次用到数据表之前必须提供，否则 panic。
+pub mod data {
+    #[cfg(not(feature = "external-data"))]
+    pub(crate) fn ku100() -> &'static [u8] {
+        include_bytes!("../../assets/ku100.bin")
+    }
+
+    #[cfg(not(feature = "external-data"))]
+    pub(crate) fn pinna() -> &'static [u8] {
+        include_bytes!("../../assets/pinna.bin")
+    }
+
+    #[cfg(feature = "external-data")]
+    static EXT: std::sync::OnceLock<(&'static [u8], &'static [u8])> = std::sync::OnceLock::new();
+
+    /// 提供两个数据文件的内容（只能提供一次；返回 false = 已经提供过）。
+    #[cfg(feature = "external-data")]
+    pub fn provide(ku100: Vec<u8>, pinna: Vec<u8>) -> bool {
+        EXT.set((Box::leak(ku100.into_boxed_slice()), Box::leak(pinna.into_boxed_slice()))).is_ok()
+    }
+
+    /// 数据文件提供了没有。
+    #[cfg(feature = "external-data")]
+    pub fn provided() -> bool {
+        EXT.get().is_some()
+    }
+
+    #[cfg(feature = "external-data")]
+    pub(crate) fn ku100() -> &'static [u8] {
+        EXT.get().expect("数据文件还没提供（先调用 dsp::data::provide）").0
+    }
+
+    #[cfg(feature = "external-data")]
+    pub(crate) fn pinna() -> &'static [u8] {
+        EXT.get().expect("数据文件还没提供（先调用 dsp::data::provide）").1
+    }
+}
 
 /// 内部处理采样率（HRIR 数据的采样率）。
 pub const FS: f32 = 48_000.0;

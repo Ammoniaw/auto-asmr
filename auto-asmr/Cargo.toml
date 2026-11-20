@@ -4,21 +4,38 @@ version = "0.1.0"
 edition = "2021"
 description = "KU100 双耳 ASMR 空间化：实时（主播用）+ 音频文件转换，纯 CPU"
 
+# 库（src/lib.rs）只有信号处理 `dsp`，安卓版也用它；程序（src/main.rs）是桌面版的界面和命令行。
+# 安卓版以 default-features = false 依赖本包，只编译库，不带音频设备、界面这些桌面依赖。
+[lib]
+name = "auto_asmr"
+path = "src/lib.rs"
+
+[[bin]]
+name = "auto-asmr"
+path = "src/main.rs"
+required-features = ["desktop"]
+
+[features]
+default = ["desktop"]
+desktop = ["dep:cpal", "dep:symphonia", "dep:hound", "dep:eframe", "dep:rfd", "dep:png"]
+# 数据文件不编进程序，运行时用 dsp::data::provide 提供（安卓版用：数据放在 APK 资源里，各 CPU 架构共用一份）
+external-data = []
+
 [dependencies]
 # DSP
 rustfft = "6.4"
 realfft = "3.5"
 nnnoiseless = { version = "0.5", default-features = false }
-# 音频输入输出
-cpal = "0.18"
-symphonia = { version = "0.5", features = ["all"] }
-hound = "3.5"
-# 界面
-eframe = { version = "0.37", features = ["persistence", "glow"] }
-rfd = "0.18"
 serde = { version = "1", features = ["derive"] }
 ron = "0.12"
-png = "0.18"
+# 音频输入输出
+cpal = { version = "0.18", optional = true }
+symphonia = { version = "0.5", features = ["all"], optional = true }
+hound = { version = "3.5", optional = true }
+# 界面
+eframe = { version = "0.37", features = ["persistence", "glow"], optional = true }
+rfd = { version = "0.18", optional = true }
+png = { version = "0.18", optional = true }
 
 [profile.release]
 opt-level = 3

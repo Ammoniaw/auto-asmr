@@ -10,7 +10,6 @@
 use super::{HEAD_A, NTAP, R_MIN};
 use std::sync::OnceLock;
 
-static DATA: &[u8] = include_bytes!("../../assets/pinna.bin");
 
 /// 修正滤波器的长度。
 pub const PINNA_TAPS: usize = 64;
@@ -33,7 +32,7 @@ pub struct PinnaSet {
 /// 打包在程序里的真人耳廓。
 pub fn pinnas() -> &'static PinnaSet {
     static P: OnceLock<PinnaSet> = OnceLock::new();
-    P.get_or_init(|| PinnaSet::parse(DATA).expect("assets/pinna.bin 损坏"))
+    P.get_or_init(|| PinnaSet::parse(super::data::pinna()).expect("assets/pinna.bin 损坏"))
 }
 
 impl PinnaSet {

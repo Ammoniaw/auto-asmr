@@ -1,0 +1,203 @@
+# 安卓版（开发中）
+
+方案和各步的验证结果见[安卓版技术方案](android-plan.md)。安卓版是一个内嵌浏览器：网页里正在出声的那个标签页的声音，实时交给和桌面版同一份的 Rust 引擎处理，再播放出来。
+
+## 界面和操作
+
+- **顶栏**：后退、前进、地址栏（网址直接打开，其它文字用必应搜索）、刷新 / 停止。
+- **底栏**：
+  - 开关：**ASMR 效果 / 原声**，就是电脑版的「输出效果 / 监听原声」，存在同一个配置项里。本身就是双耳录音的视频（很多 ASMR 视频是 KU100 录的）切到原声听。
+  - 状态：正在处理哪个网页、采样率、延迟、处理占用。点它也能打开效果面板。
+  - **标签**：标签页列表。🔊 = 这个网页正在出声；点 📍 把某个标签页固定下来，切到别的标签页浏览时它继续出声。
+  - **效果**：效果面板。
+  - **⋮**：新标签页、桌面版网站、只放一个标签页的声音、首页、测试页、导入配置、导出配置、录 20 秒处理前后的声音（调试用）。
+- **效果面板**（从上到下，和电脑版右侧的参数一致）：
+  - 风格：**贴耳加强 / KU100 实录 / 掏耳 / 恢复默认**，和电脑版的按钮是同一个函数，改的参数一样。
+  - 位置图：俯视，上 = 正前方，刻度和电脑版一样。红点是声源此刻的位置（播放中才有），右边竖条是高度。
+  - **手动摆位**：和电脑版一样，打开后自动移动全停，声源停在你摆的位置（播放中打开时停在此刻的位置）；在位置图里点 / 拖改方位和距离，在竖条上拖改高度，双击竖条回到与耳朵齐平。关掉后回到原来的移动方式。
+  - 降噪：0 = 关闭（网页里的声音一般很干净，不用开）。
+  - 各组参数：贴耳感、入耳（掏耳）、左右移动、背景音（雨声，带「雨夜」「关」按钮）、忽远忽近、上下、KU100 临场感（耳廓、回放补偿）、人声处理、输出。标签、范围、单位、说明（点标签旁的 ⓘ 展开）都和电脑版相同；只在某种移动方式下才有用的参数只在那时显示，手动摆位时忽远忽近、上下两组变灰——都和电脑版一样。
+  - 导入配置 / 导出配置。
+- **后台播放**：有声音时通知栏里有一条播放通知（第一次出声时会请求通知权限），切到后台、锁屏后网页接着放、接着处理；通知栏、锁屏和耳机按键可以**暂停 / 继续**，通知栏还能**切效果 / 原声**。没声音 30 秒后通知消失；从通知栏暂停的留 10 分钟。只有正在出声的那个标签页在后台继续，别的标签页照常暂停。
+- **背景音（雨声）**：单独一条输出流，网页暂停、换网页时也不断；切到原声或关掉时淡出。
+- **截不到声音时**：底栏上方会出现红色提示。先自动换成备用的截取方式（声音会停几秒再恢复）；还不行就提示这个 WebView 不支持——声音照常播放，只是没有效果。
+- **只放一个标签页的声音**（默认开）：其它标签页静音，引擎只处理当前标签页（或固定的那个）。关掉后所有标签页都出声、都处理；但看不见的标签页里的视频会被浏览器引擎自动暂停，只有纯音频会继续。
+- **网站兼容**：B 站的手机版网页不让在网页里播放，所以打开 B 站时自动用桌面版网页；其它网站可以在菜单里手动切「桌面版网站」。唤起 App 的链接（`bilibili://` 等）直接拦掉，留在网页里。网页视频可以全屏。
+
+## 配置文件
+
+和电脑版**通用，同一个格式**（读写代码在共用库 `auto-asmr/src/config.rs` 里，两边是同一份）：
+
+- 电脑版「导出配置」的 `.ron`、电脑版运行目录里自动保存的 `auto-asmr.ron`，都可以在安卓版「导入配置」；安卓版「导出配置」的文件也能在电脑版导入。
+- 安卓版用得上的是全部效果参数和「输出效果 / 监听原声」。电脑版独有的设置（音频设备、缓冲、文件转换、多音频合成、左右双人、语言、3D 视图）安卓版不显示、不改，但会原样保留，导出后带回电脑照样能用。
+- 安卓版自己的设置也存成这个格式（App 私有目录的 `files/auto-asmr.ron`），改动后 1 秒自动保存，下次打开时读回。
+- 文件里没有 auto-asmr 设置（比如只有窗口状态的文件）时提示「文件里没有 auto-asmr 的配置」，当前设置不变，和电脑版一样。
+
+## 环境
+
+在 macOS（Apple Silicon）上用命令行搭的，不需要 Android Studio（以后想用它打开工程也可以）。都装在用户目录：
+
+| 组件 | 位置 / 版本 |
+|---|---|
+| JDK | Temurin 21，`~/Library/Java/JavaVirtualMachines/temurin-21.jdk` |
+| Android SDK | `~/Library/Android/sdk`：platform-tools、platforms android-36 / 37.0 / 37.2（新版 Compose 要求用 37.1 以上编译，工程用 37.2）、build-tools 36.0.0、CMake 3.31.6、NDK 29.0.14206865、模拟器、系统镜像 android-36 google_apis arm64-v8a |
+| 模拟器 | AVD `asmr36`（Pixel 7，Android 16） |
+| Gradle | 9.9.2，用工程里的 `./gradlew`；Android Gradle Plugin 9.5.1；Kotlin 2.4（由 Compose 编译插件 2.4.21 带进来，AGP 自带的 2.2 读不了新版 Compose 库）；Compose BOM 2026.11.01 |
+| Rust | 和桌面版同一套工具链，另加两个安卓目标：`rustup target add aarch64-linux-android armv7-linux-androideabi` |
+
+每个终端先设好环境变量：
+
+```bash
+export JAVA_HOME="$HOME/Library/Java/JavaVirtualMachines/temurin-21.jdk/Contents/Home"
+```
+
+```bash
+export PATH="$HOME/Library/Android/sdk/platform-tools:$HOME/Library/Android/sdk/emulator:$PATH"
+```
+
+工程目录下的 `local.properties` 写着 SDK 位置（`sdk.dir=…`），不进仓库，换机器时自己建一个。
+
+## 构建
+
+```bash
+cd auto-asmr-android && ./gradlew assembleDebug
+```
+
+生成 `app/build/outputs/apk/debug/app-debug.apk`。发布版用 `./gradlew assembleRelease`（R8 精简，约 20 MB），生成 `app/build/outputs/apk/release/app-release.apk`；签名见[发布](#发布)。
+
+- CPU 架构：`arm64-v8a` 和 `armeabi-v7a`（少数 32 位低端机）。Apple Silicon 上的模拟器是 arm64；32 位只编译过，没有设备实测。
+- KU100 / 耳廓数据（`auto-asmr/assets/ku100.bin`、`pinna.bin`，共 15.7 MB）作为 APK 资源，两种架构共用一份，App 启动时读进引擎。共用库为此打开了 `external-data`（数据不编进 .so）；`libasmrhook.so` 约 3.2 MB（arm64）/ 2.2 MB（32 位）。
+- Rust 部分不用单独编：`app/src/main/cpp/CMakeLists.txt` 每次构建都会按架构调用 `cargo build --release --target …`（在 `rust/` 下，没改动时很快），把静态库链进 `libasmrhook.so`。引擎一律按 release 编译，debug 版的 App 也一样。
+
+Rust 层自己的测试在电脑上跑：
+
+```bash
+cd auto-asmr-android/rust && cargo test --release
+```
+
+共 7 个：44.1 / 48 / 32 kHz 的流在各种回调长度下不断流、确实被空间化、频率不跑偏；单独输出的雨声响度和桌面版引擎里的一样、关掉后淡出停下、网页声音的配置里没有雨声；参数表逐项对得上 `Params`（键存在、范围两端设得上去、每个选项都能设）；按字段改参数和按钮走的是和电脑版相同的逻辑，未知参数、类型不对时报错且参数不变；电脑版配置导入后再导出，电脑版独有的设置都还在；播放中打开手动摆位时换算出的位置和运动模型互逆；参数 RON 读写和风格切换。
+
+### 性能基准
+
+`rust/examples/bench.rs`：60 秒合成人声，按 Chromium 的回调长度（4360 帧）送进处理器，分别按 48 kHz 和 44.1 kHz 计时。电脑上：
+
+```bash
+cd auto-asmr-android/rust && cargo run --release --example bench
+```
+
+在手机 / 模拟器上：先用 NDK 的 clang 当链接器编译，再推上去运行。
+
+```bash
+CARGO_TARGET_AARCH64_LINUX_ANDROID_LINKER=$HOME/Library/Android/sdk/ndk/29.0.14206865/toolchains/llvm/prebuilt/darwin-x86_64/bin/aarch64-linux-android29-clang cargo build --release --example bench --target aarch64-linux-android
+```
+
+```bash
+adb push target/aarch64-linux-android/release/examples/bench /data/local/tmp/asmr_bench && adb shell /data/local/tmp/asmr_bench
+```
+
+## 发布
+
+推送 tag 时，`.github/workflows/release.yml` 的 Android 任务会装好 SDK 组件、Rust 1.95 和两个安卓目标，跑 Rust 测试，用 `assembleRelease` 打 APK（版本名 = tag 名，版本号 = Actions 的运行序号），和 Windows / Linux 版一起放进 GitHub Release（`auto-asmr-android.apk`）。
+
+**签名密钥**：安卓只允许用同一把密钥签名的新版本覆盖安装旧版本，所以要准备一把固定的密钥，放进仓库的 Secrets。只需要做一次：
+
+1. 生成密钥库（`keytool` 在 JDK 里；密码自己定，密钥库文件和密码要自己保存好，丢了就没法再发能覆盖安装的更新）：
+
+   ```bash
+   keytool -genkeypair -keystore auto-asmr-release.jks -alias auto-asmr -keyalg RSA -keysize 4096 -validity 36500 -dname "CN=auto-asmr"
+   ```
+
+2. 在 GitHub 仓库的 Settings → Secrets and variables → Actions 里加 4 个 secret：`ANDROID_KEYSTORE_BASE64`（`base64 -i auto-asmr-release.jks` 的输出）、`ANDROID_KEYSTORE_PASSWORD`、`ANDROID_KEY_ALIAS`（上面是 `auto-asmr`）、`ANDROID_KEY_PASSWORD`。
+
+没配这些 secret 时也能发布：APK 用 Actions 临时生成的调试密钥签名，装得上，但每次构建的密钥都不同，新版不能覆盖安装旧版（Actions 里会给出警告）。
+
+本机打带签名的发布版：设好 `ASMR_KEYSTORE`（密钥库路径）、`ASMR_KEYSTORE_PASSWORD`、`ASMR_KEY_ALIAS`、`ASMR_KEY_PASSWORD` 再 `./gradlew assembleRelease`；没设时用本机的调试密钥签名。`ASMR_VERSION_NAME`、`ASMR_VERSION_CODE` 可以指定版本。
+
+## 运行
+
+- **模拟器**：`emulator -avd asmr36` 打开带窗口的模拟器；只跑自动验证时可以加 `-no-window -no-audio`（没有声音设备时 AAudio 回调照常进行）。
+- **真机**：手机上打开「开发者选项 → USB 调试」，用 USB 连上，`adb devices` 能看到设备即可。
+- 安装：`adb install -r app/build/outputs/apk/debug/app-debug.apk`，桌面上的图标叫「auto-asmr」。
+
+## 调试
+
+测试页（菜单 →「测试页」，`app/src/main/assets/test.html`）有六种出声方式：Web Audio 测试音、`<audio>` 播放页面生成的 WAV（48 kHz 和 44.1 kHz 各一个）、跨域 mp4 直链、原生 HLS、hls.js（MSE）。测试音左边 0.3 × 440 Hz、右边 0.1 × 660 Hz，所以处理前应当是左 −13.5 dB、右 −23.0 dB。
+
+「录 20 秒处理前后的声音」录下一个出声的流 20 秒，处理前（网页直出）和处理后各存一个 24 位 WAV 到 `/sdcard/Android/data/io.github.nasuiyile.autoasmr/files/`（`rec_<时间>_dry.wav` / `_wet.wav`），用 `adb pull` 拉回来对比着听。
+
+也可以用 adb 驱动（都作用于当前标签页）：
+
+| 参数 | 作用 |
+|---|---|
+| `--es url <网址>` | 打开网址；测试页加 `?auto=webaudio`（或 `element`、`element44`、`mp4`、`hls`、`hlsjs`）自动开始播放 |
+| `--ei mode 0…3` | 调试模式：直通 / ASMR / 左右互换 / 静音（界面上的开关只有 ASMR / 原声） |
+| `--ei style 0…2` | 贴耳加强 / KU100 实录 / 掏耳 |
+| `--es params '<RON>'` | 整段换参数（RON 格式的 `Params`，缺的项用默认值） |
+| `--ei rec <秒>` | 录音，同菜单里的录音 |
+| `--es ua desktop` / `mobile` | 桌面版 / 手机 UA |
+| `--es mute 1` / `0` | 静音 / 取消静音这个 WebView |
+| `--es import <文件名>` / `--es export <文件名>` | 从 / 往 `/sdcard/Android/data/io.github.nasuiyile.autoasmr/files/` 导入 / 导出配置 |
+| `--es action <按钮>` | 效果面板上的按钮：`style_ear`、`style_ku100`、`style_earclean`、`reset`、`bg_rain_night`、`bg_off` |
+
+```bash
+adb shell am start -n io.github.nasuiyile.autoasmr/.MainActivity --es url "'https://appassets.androidplatform.net/assets/test.html?auto=hls'" --ei style 1
+```
+
+日志标签：`AsmrHook`（hook 层、雨声流和 App）、`AsmrCore`（Rust 引擎）、`AsmrSettings`（设置）、`AsmrBrowser`（标签页、发声检测）、`AsmrPlayback`（前台服务、自检）、`AsmrPage`（网页的 console）。
+
+```bash
+adb logcat -s AsmrHook:V AsmrCore:V AsmrSettings:V AsmrBrowser:V AsmrPlayback:V AsmrPage:V
+```
+
+**测截取方式**：App 私有目录里的 `files/hook_mode` 决定启动时装哪种 hook——没有这个文件 = PLT hook（ByteHook，默认）；`inline` = 只用备用的 inline hook（ShadowHook）；`both` = 两种都装；`none` = 都不装（用来测自检：网页出声 4 秒后自检会自动换成 inline hook）。只有调试版能写（`run-as`），改完重启 App：
+
+```bash
+adb shell run-as io.github.nasuiyile.autoasmr sh -c "'echo inline > files/hook_mode'"
+```
+
+```bash
+adb shell run-as io.github.nasuiyile.autoasmr rm files/hook_mode
+```
+
+**测后台播放**：放着声音时按 Home（`adb shell input keyevent 3`）、关屏（`keyevent 223`），看日志里每秒的回调还在不在；媒体按键：`adb shell cmd media_session dispatch pause` / `play`。
+
+### 自动验证
+
+`tools/hook_test.sh` 依次跑测试页的出声方式：每种重启 App、自动播放，先用左右互换核对 hook，再切直通、静音，最后切到 ASMR 看引擎状态；日志存到 `hook-test-out/`（不进仓库），并打印每种的流格式、左右互换和 ASMR 时的电平与引擎状态。WebView 升级、换手机之后跑一遍，就知道 hook 和引擎还正不正常。
+
+```bash
+cd auto-asmr-android && tools/hook_test.sh
+```
+
+- 只跑其中几种：`CASES="webaudio hls" tools/hook_test.sh`
+- 同时录音并拉回 `hook-test-out/`：`REC=20 CASES=hls tools/hook_test.sh`
+- 打开任意网页：`URL=https://www.bilibili.com/video/BV… WAIT=25 tools/hook_test.sh`
+
+## 代码结构
+
+| 路径 | 内容 |
+|---|---|
+| `app/src/main/java/…/MainActivity.kt` | 主界面（Compose）：顶栏、WebView、底栏、标签页列表、菜单、视频全屏、文件选择器导入导出；adb 参数 |
+| `app/src/main/java/…/Browser.kt` | 标签页和 WebView：UA、拦截唤起 App 的跳转、B 站用桌面版、发声检测和暂停 / 继续的脚本（文档开始时注入，经 WebMessageListener 收发）、只放一个标签页的声音（`setAudioMuted`）、固定标签页、正在出声的标签页在后台仍对 Chromium 报告可见、重开音频流 |
+| `app/src/main/java/…/EffectPanel.kt` | 效果面板：按参数表生成分组、滑条、勾选、选项、种子 |
+| `app/src/main/java/…/PositionMap.kt` | 位置图和高度竖条（刻度和电脑版相同），手动摆位时点 / 拖 |
+| `app/src/main/java/…/Settings.kt` | 设置：后台线程里调用 Rust 改参数（同一个参数连续改只送最新值）、读回全部参数、1 秒后自动保存、导入导出、手动摆位开关的逻辑 |
+| `app/src/main/java/…/SpecUi.kt` | 参数表的小工具：数值显示格式、显示 / 可用条件、对数滑条 |
+| `app/src/main/java/…/Playback.kt` | 播放的总控（每秒一次，不依赖界面）：什么时候开 / 关前台服务、暂停 / 继续、截取自检和换备用 hook |
+| `app/src/main/java/…/PlaybackService.kt` | 媒体播放类型的前台服务：通知（暂停 / 继续、效果 / 原声）、MediaSession（锁屏、耳机按键） |
+| `app/src/main/java/…/AsmrApp.kt` | App 启动时初始化 ByteHook、登记 hook（必须在第一个 WebView 之前），后台读数据文件、加载引擎和上次的配置 |
+| `app/src/main/java/…/NativeHook.kt` | JNI 接口 |
+| `app/src/main/assets/home.html`、`test.html` | 首页、测试页 |
+| `app/src/main/cpp/aaudio_hook.c` | hook 层：换掉 `AAudioStreamBuilder_setDataCallback` / `AAudioStreamBuilder_openStream` / `AAudioStream_close`——默认用 ByteHook 的 PLT hook（只截 WebView 等调用方），备用 ShadowHook 的 inline hook（改 libaaudio 本身），两种共用一套逻辑、防重入、不截自己的流；流打开时给立体声 float 流建 Rust 处理器，在 Chromium 的数据回调之后原地处理；背景雨声的输出流（开、淡出后停、断开重开）；给界面的实时状态；调试录音；JNI 接口。回调里不分配内存、不加锁、不打日志 |
+| `app/src/main/cpp/asmr_core.h` | Rust 层导出的 C 接口 |
+| `app/src/main/cpp/CMakeLists.txt` | 按架构调用 cargo 编 Rust 静态库，和 hook 层一起编成 `libasmrhook.so`，链接 ByteHook、ShadowHook（prefab）、libaaudio；16 KB 页对齐 |
+| `app/proguard-rules.pro` | 发布版 R8 的保留规则（JNI 类名、方法名不能改） |
+| `app/src/main/res/` | 图标（启动图标、通知栏小图标） |
+| `rust/src/lib.rs` | Rust 层的 C 接口和每个流的处理器（下混 → 必要时重采样到 48 kHz → `Engine::process` → 转回原采样率）；导出函数都 `catch_unwind`，出错的流改成直通 |
+| `rust/src/settings.rs` | 全局设置：整份桌面版格式的配置（`Saved`）、两份引擎配置（完整的给雨声，去掉背景音的给网页声音）、按字段读写参数（含界面换算的虚拟字段）、按钮、导入导出、参数表 |
+| `rust/src/rain.rs` | 背景雨声单独输出：和桌面版引擎同样的 `sync_rain` + `Rain::render` + 限制器，关掉时淡出 |
+| `rust/src/ui_spec.json` | 参数表：分组、标签、说明、范围、单位，取自桌面版界面；耳廓和耳机型号的选项运行时填 |
+| `rust/examples/bench.rs` | 性能基准 |
+| `tools/hook_test.sh` | 自动验证 |
+
+引擎和设置文件格式在 `auto-asmr/src/`（桌面版的库：`dsp/`、`config.rs`，见[构建、发布与开发](development.md#代码结构)）。参数表里的标签和说明是从桌面版 `gui.rs` 抄过来的：改了桌面版的参数界面时，同步改 `ui_spec.json`（`cargo test` 会查出参数表里不存在的参数）。

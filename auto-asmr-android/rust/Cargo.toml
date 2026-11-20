@@ -1,0 +1,24 @@
+[package]
+name = "asmr-android"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "auto-asmr 安卓版的 Rust 层：把桌面版的引擎包成 C 接口，给 hook 层调用"
+
+# 编成静态库，由 app/src/main/cpp/CMakeLists.txt 调用 cargo 并链进 libasmrhook.so；rlib 给 examples/bench.rs 用
+[lib]
+name = "asmr_android"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+# external-data：KU100 / 耳廓数据不编进 .so，启动时从 APK 资源读入（各 CPU 架构共用一份）
+auto-asmr = { path = "../../auto-asmr", default-features = false, features = ["external-data"] }
+ron = "0.12"
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+# 出错时展开而不是直接终止：导出函数都 catch_unwind，出错的流改成直通，不把浏览器带崩
+panic = "unwind"

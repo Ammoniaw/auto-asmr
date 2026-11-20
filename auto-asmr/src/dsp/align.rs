@@ -518,42 +518,7 @@ fn energy(x: &[f32]) -> f64 {
 pub mod tests {
     use super::*;
 
-    /// 一段像歌的测试信号：随机的音符（基频 110–440 Hz，带泛音）、随机时长（0.15–0.6 s），
-    /// 加上随机间隔的打击声；不同的种子得到不同的"歌"。没有周期性，不会有多个一样好的偏移。
-    pub fn test_song(seconds: f32, seed: u32) -> Vec<f32> {
-        let n = (seconds * FS) as usize;
-        let mut x = vec![0f32; n];
-        let mut s = seed.wrapping_mul(2654435761).wrapping_add(12345);
-        let mut rnd = move || {
-            s = s.wrapping_mul(1664525).wrapping_add(1013904223);
-            (s >> 8) as f32 / (1u32 << 24) as f32
-        };
-        let mut i = 0;
-        while i < n {
-            let dur = ((0.15 + 0.45 * rnd()) * FS) as usize;
-            let f0 = 110.0 * 2f32.powf((rnd() * 24.0).floor() / 12.0);
-            let amp = 0.05 + 0.1 * rnd();
-            for j in 0..dur.min(n - i) {
-                let t = j as f32 / FS;
-                let env = (1.0 - j as f32 / dur as f32).powf(0.7) * (t / 0.01).min(1.0);
-                let mut v = 0.0;
-                for h in 1..6 {
-                    v += (std::f32::consts::TAU * f0 * h as f32 * t).sin() / h as f32;
-                }
-                x[i + j] += amp * env * v;
-            }
-            i += dur;
-        }
-        let mut t = 0usize;
-        while t < n {
-            t += ((0.2 + 0.5 * rnd()) * FS) as usize;
-            let a = 0.3 * rnd();
-            for j in 0..((0.03 * FS) as usize).min(n.saturating_sub(t)) {
-                x[t + j] += a * (rnd() - 0.5) * (-(j as f32) / (0.005 * FS)).exp();
-            }
-        }
-        x
-    }
+    pub use crate::dsp::testsig::test_song;
 
     /// 简单的一阶低通 + 增益（模拟转码 / 不同的母带处理）。
     fn color(x: &[f32], k: f32, g: f32) -> Vec<f32> {

@@ -1,0 +1,3 @@
+# 打开 wasm SIMD（Chrome 91 起支持）：rustfft 和编译器的自动向量化都会用上
+[target.wasm32-unknown-unknown]
+rustflags = ["-C", "target-feature=+simd128"]

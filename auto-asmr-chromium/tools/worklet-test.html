@@ -1,0 +1,28 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>auto-asmr worklet 测试</title>
+    <style>
+      body {
+        font: 13px/1.5 ui-monospace, Menlo, monospace;
+        margin: 16px;
+        background: #fff;
+        color: #111;
+      }
+      .pass {
+        color: #1f8a4c;
+      }
+      .fail {
+        color: #c2392b;
+        font-weight: bold;
+      }
+    </style>
+  </head>
+  <body>
+    <h3>auto-asmr：wasm 引擎 + AudioWorklet 离线渲染测试</h3>
+    <p>用 OfflineAudioContext 跑 extension/worklet.js 和 extension/asmr.wasm（先运行 ./build.sh），和插件里的接法相同，只是输入换成合成的人声。</p>
+    <pre id="log"></pre>
+    <script type="module" src="worklet-test.js"></script>
+  </body>
+</html>

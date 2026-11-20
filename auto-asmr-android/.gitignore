@@ -1,0 +1,10 @@
+.gradle/
+.kotlin/
+build/
+.cxx/
+local.properties
+*.iml
+.idea/
+captures/
+hook-test-out/
+rust/target/

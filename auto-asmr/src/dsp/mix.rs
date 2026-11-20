@@ -502,7 +502,7 @@ impl Mixer {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::test_voice;
+    use crate::dsp::testsig::test_voice;
 
     fn setup(voices: &[Voice], gains: Vec<f32>) -> MixSetup {
         let base = EngineConfig::new(Params::default(), None);

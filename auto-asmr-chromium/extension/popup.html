@@ -1,0 +1,123 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <title>auto-asmr</title>
+    <link rel="stylesheet" href="style.css" />
+    <style>
+      body {
+        width: 340px;
+        padding: 12px 14px 12px;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        margin-bottom: 6px;
+      }
+      h1 {
+        font-size: 15px;
+        margin: 0;
+      }
+      a {
+        color: var(--accent);
+        cursor: pointer;
+        text-decoration: none;
+      }
+      #tab {
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+        margin-bottom: 8px;
+      }
+      #toggle {
+        width: 100%;
+        padding: 8px;
+      }
+      .live {
+        display: flex;
+        gap: 12px;
+        align-items: center;
+        margin: 10px 0 4px;
+      }
+      canvas {
+        flex: none;
+        width: 92px;
+        height: 92px;
+      }
+      #status {
+        min-height: 3em;
+      }
+      .grid {
+        display: grid;
+        grid-template-columns: 52px 1fr;
+        gap: 8px 8px;
+        align-items: center;
+        border-top: 1px solid var(--line);
+        padding-top: 10px;
+        margin-top: 8px;
+      }
+      .grid > span {
+        color: var(--muted);
+      }
+      .seg button {
+        padding: 4px 8px;
+      }
+      .rain {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+      }
+      .rain input {
+        flex: 1;
+        min-width: 0;
+      }
+      footer {
+        margin-top: 10px;
+        font-size: 12px;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <h1>auto-asmr</h1>
+      <a id="options">全部参数 / 导入配置</a>
+    </header>
+    <div id="tab" class="muted"></div>
+    <button id="toggle" class="primary" disabled>开始处理这个标签页的声音</button>
+
+    <div class="live">
+      <canvas id="radar" width="184" height="184"></canvas>
+      <div id="status" class="muted"></div>
+    </div>
+
+    <div class="grid">
+      <span>输出</span>
+      <div class="seg" id="dry">
+        <button data-dry="false">效果</button>
+        <button data-dry="true">原声</button>
+      </div>
+      <span>风格</span>
+      <div class="seg">
+        <button data-style="0" title="贴耳的左右穿梭，近耳独占感强">贴耳加强</button>
+        <button data-style="1" title="像真实 KU100 录音：真实房间、随机走位">KU100 实录</button>
+        <button data-style="2" title="贴着一只耳朵伸进耳道">掏耳</button>
+      </div>
+      <span>移动</span>
+      <div class="seg" id="mode">
+        <button data-mode="Sweep">穿梭</button>
+        <button data-mode="Random">随机</button>
+        <button data-mode="Orbit">环绕</button>
+        <button data-mode="Static">固定</button>
+      </div>
+      <span>雨声</span>
+      <div class="rain">
+        <button id="rain-on" title="关着窗在屋里听外面的小到中雨">雨夜</button>
+        <input id="rain" type="range" min="0" max="100" step="1" title="音量：0 = 关闭" />
+      </div>
+    </div>
+
+    <footer class="muted">快捷键 <span id="key">Alt+Shift+A</span> 开始 / 停止当前标签页。</footer>
+    <script type="module" src="popup.js"></script>
+  </body>
+</html>

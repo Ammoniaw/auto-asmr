@@ -1,0 +1,149 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>auto-asmr 设置</title>
+    <link rel="stylesheet" href="style.css" />
+    <style>
+      body {
+        padding: 20px 16px 40px;
+      }
+      main {
+        max-width: 980px;
+        margin: 0 auto;
+      }
+      header {
+        display: flex;
+        flex-wrap: wrap;
+        align-items: center;
+        gap: 8px 16px;
+        margin-bottom: 14px;
+      }
+      h1 {
+        font-size: 20px;
+        margin: 0;
+      }
+      .bar {
+        display: flex;
+        flex-wrap: wrap;
+        gap: 6px;
+        align-items: center;
+      }
+      .top {
+        display: grid;
+        grid-template-columns: auto 1fr;
+        gap: 8px 14px;
+        align-items: center;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 12px 14px;
+        margin-bottom: 14px;
+      }
+      #groups {
+        columns: 2 440px;
+        column-gap: 14px;
+      }
+      details {
+        break-inside: avoid;
+        background: var(--panel);
+        border: 1px solid var(--line);
+        border-radius: 10px;
+        padding: 8px 14px 10px;
+        margin-bottom: 14px;
+      }
+      summary {
+        font-weight: 600;
+        cursor: pointer;
+        padding: 2px 0 6px;
+      }
+      .row {
+        display: grid;
+        grid-template-columns: 120px 1fr 132px;
+        gap: 8px;
+        align-items: center;
+        padding: 3px 0;
+      }
+      .row.wide {
+        grid-template-columns: 120px 1fr;
+      }
+      .row.off {
+        opacity: 0.45;
+      }
+      .row label {
+        overflow: hidden;
+        text-overflow: ellipsis;
+        white-space: nowrap;
+      }
+      .val {
+        display: flex;
+        gap: 4px;
+        align-items: center;
+        min-width: 0;
+      }
+      .val input {
+        width: 64px;
+      }
+      .val span {
+        color: var(--muted);
+        font-size: 12px;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+      .check {
+        display: flex;
+        gap: 6px;
+        align-items: center;
+        padding: 4px 0;
+      }
+      #msg {
+        min-height: 1.4em;
+      }
+      @media (max-width: 520px) {
+        .row {
+          grid-template-columns: 96px 1fr;
+        }
+        .row .val {
+          grid-column: 2;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <h1>auto-asmr 设置</h1>
+        <div class="bar">
+          <button id="import">导入配置…</button>
+          <button id="export">导出配置</button>
+          <button id="reset">参数恢复默认</button>
+          <input id="file" type="file" accept=".ron,.txt,text/plain" hidden />
+        </div>
+        <div id="msg" class="muted"></div>
+      </header>
+
+      <section class="top">
+        <span>输出</span>
+        <div class="seg" id="dry">
+          <button data-dry="false">输出效果</button>
+          <button data-dry="true">监听原声</button>
+        </div>
+        <span>风格</span>
+        <div class="seg">
+          <button data-style="0" title="贴耳的左右穿梭，近耳独占感强">贴耳加强</button>
+          <button data-style="1" title="像真实 KU100 录音：真实房间、随机走位、两耳都听得到">KU100 实录</button>
+          <button data-style="2" title="棉签 / 挖耳勺这类触发音：贴着一只耳朵伸进耳道">掏耳</button>
+        </div>
+      </section>
+
+      <p class="muted">
+        配置文件与桌面版通用：可以导入桌面版「导出配置」得到的 .ron 文件，也可以把这里导出的文件导入桌面版。桌面版专用的设置（音频设备、文件转换等）原样保留。改动立即对正在处理的标签页生效。
+      </p>
+
+      <div id="groups"></div>
+    </main>
+    <script type="module" src="options.js"></script>
+  </body>
+</html>

@@ -1,0 +1,84 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <!-- offscreen.js 里的相对路径（worklet.js、asmr.wasm）按插件目录解析 -->
+    <base href="/extension/" />
+    <title>auto-asmr offscreen 测试</title>
+    <style>
+      body {
+        font: 13px/1.5 ui-monospace, Menlo, monospace;
+        margin: 16px;
+        background: #fff;
+        color: #111;
+      }
+      .pass {
+        color: #1f8a4c;
+      }
+      .fail {
+        color: #c2392b;
+        font-weight: bold;
+      }
+    </style>
+  </head>
+  <body>
+    <h3>auto-asmr：offscreen.js 实时测试</h3>
+    <p>
+      把 extension/offscreen.js 原样放进普通网页：chrome.runtime 和 getUserMedia 换成假的（"标签页的声音"是一段合成人声），
+      按插件里的顺序发 start → status → config → stop，检查实时 AudioContext 里的处理器真的在处理。
+      勾上「出声」才接到声卡，否则照常实时处理但不出声。
+    </p>
+    <label><input id="audible" type="checkbox" /> 出声</label>
+    <button id="run">开始测试</button>
+    <pre id="log"></pre>
+    <script>
+      // 默认不出声：AudioContext 改用"无输出设备"（Chrome 110 起），照常按实时速度处理
+      const RealAC = window.AudioContext;
+      window.AudioContext = class extends RealAC {
+        constructor(o = {}) {
+          super(document.getElementById('audible').checked ? o : { ...o, sinkId: { type: 'none' } });
+        }
+      };
+    </script>
+    <script>
+      // 假的 chrome.runtime：记下 offscreen.js 注册的消息处理函数和它发出的通知
+      window.__listeners = [];
+      window.__notes = [];
+      window.chrome = {
+        runtime: {
+          onMessage: { addListener: (f) => window.__listeners.push(f) },
+          sendMessage: async (m) => {
+            window.__notes.push(m);
+          },
+        },
+      };
+      // 假的标签页采集：另一个 AudioContext 播放合成人声，输出成 MediaStream
+      navigator.mediaDevices.getUserMedia = async (c) => {
+        if (!c.audio || !c.audio.mandatory || c.audio.mandatory.chromeMediaSource !== 'tab') throw new Error('不是标签页采集的参数');
+        const ctx = new AudioContext({ sampleRate: 44100 });
+        const secs = 30;
+        const buf = ctx.createBuffer(2, secs * ctx.sampleRate, ctx.sampleRate);
+        const l = buf.getChannelData(0);
+        const r = buf.getChannelData(1);
+        const TAU = 2 * Math.PI;
+        for (let i = 0; i < l.length; i++) {
+          const t = i / ctx.sampleRate;
+          const syl = Math.max(0, Math.sin(TAU * 3.3 * t)) * (Math.sin(TAU * 0.25 * t) > -0.6 ? 1 : 0);
+          const ph = TAU * (140 * t - (20 / (TAU * 0.7)) * Math.cos(TAU * 0.7 * t));
+          l[i] = 0.2 * syl * (Math.sin(ph) + 0.5 * Math.sin(2 * ph) + 0.3 * Math.sin(3 * ph));
+          r[i] = 0.9 * l[i];
+        }
+        const src = ctx.createBufferSource();
+        src.buffer = buf;
+        src.loop = true;
+        const dst = ctx.createMediaStreamDestination();
+        src.connect(dst);
+        src.start();
+        window.__fakeTab = ctx;
+        return dst.stream;
+      };
+    </script>
+    <script type="module" src="offscreen.js"></script>
+    <script type="module" src="/tools/offscreen-test.js"></script>
+  </body>
+</html>

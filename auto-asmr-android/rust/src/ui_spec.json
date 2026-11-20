@@ -1,0 +1,1180 @@
+{
+ "version": 1,
+ "styles": [
+  {
+   "action": "style_ear",
+   "label": "贴耳加强",
+   "label_en": "Close to ear",
+   "tip": "嘴离耳约 1.7 cm，另一只耳朵几乎听不到，不加房间，左右耳慢慢穿梭",
+   "tip_en": "Mouth ≈1.7 cm from the ear, far ear almost silent, no room, slow sweeps between the ears"
+  },
+  {
+   "action": "style_ku100",
+   "label": "KU100 实录",
+   "label_en": "KU100 natural",
+   "tip": "按真实 KU100 轻语录音标定：远耳听得到、真实房间、KU100 原机音色；像真人一样随机走位，约三分之一的停留在正面，贴耳时离耳约 2–4 cm；贴耳与正面的响度差更小，气流更明显，齿音和 5 kHz 附近更柔",
+   "tip_en": "Calibrated to real KU100 whisper recordings: far ear audible, real room, native KU100 tone; moves like a person"
+  },
+  {
+   "action": "style_earclean",
+   "label": "掏耳",
+   "label_en": "Ear cleaning",
+   "tip": "给棉签、挖耳勺、刮擦这类触发音用（不是给人声用的）：声源伸进耳道进进出出，带耳道共鸣、耳内低频和堵耳的闷感，另一只耳朵基本听不到，每只耳朵约 40 秒才换边。降噪会把这类声音当噪声压掉，请把降噪关掉或调低",
+   "tip_en": "For trigger sounds such as cotton swabs and scratching (not for voice). Turn denoise off or down"
+  },
+  {
+   "action": "reset",
+   "label": "恢复默认",
+   "label_en": "Reset",
+   "tip": "所有参数恢复默认值",
+   "tip_en": "Reset all parameters"
+  }
+ ],
+ "denoise": {
+  "type": "slider",
+  "key": "denoise_slider",
+  "label": "降噪",
+  "label_en": "Denoise",
+  "min": 0.0,
+  "max": 100.0,
+  "decimals": 0,
+  "step": 1.0,
+  "fmt": "denoise",
+  "tip": "输入降噪（RNNoise，纯 CPU）：在空间化之前去掉底噪。数值 = 底噪最多压低多少分贝，0 = 关闭，100 = 不设上限；60 以上基本没有区别。人声的音量不变；开启后延迟增加 20 ms。网页里的声音一般很干净，不用开",
+  "tip_en": "Input denoise (RNNoise): removes background noise before spatialization. The value is how many dB the noise is lowered by at most; 0 = off, 100 = no limit. Adds 20 ms of latency"
+ },
+ "manual": {
+  "label": "手动摆位：关闭自动移动，拖动位置图里的声源",
+  "label_en": "Manual: stop automatic motion and drag the source on the map",
+  "tip": "打开后，穿梭、忽远忽近、自动上下、自然晃动全部停掉，声源停在你摆的位置：在位置图里点或拖改方位和距离，在右侧竖条上拖改高度（双击竖条回到与耳朵齐平）。播放中打开时，声源就停在此刻所在的位置",
+  "tip_en": "When on, all automatic motion stops and the source stays where you put it: tap or drag on the map for direction and distance, drag the bar at the right for height (double-tap it for ear level)"
+ },
+ "groups": [
+  {
+   "id": "closeness",
+   "title": "贴耳感",
+   "title_en": "Closeness",
+   "open": true,
+   "items": [
+    {
+     "type": "slider",
+     "key": "ear_cm",
+     "label": "贴耳距离",
+     "label_en": "Distance from ear",
+     "tip": "嘴离耳朵多远。1.7 cm = 贴着耳朵",
+     "tip_en": "How far the mouth is from the ear. 1.7 cm = touching",
+     "min": 0.8,
+     "max": 25.0,
+     "decimals": 1,
+     "log": true,
+     "unit": "cm",
+     "unit_en": "cm"
+    },
+    {
+     "type": "slider",
+     "key": "isolation_db",
+     "label": "远耳压低",
+     "label_en": "Far-ear cut",
+     "tip": "贴耳时另一只耳朵额外压低多少（0 = 纯物理，像真实 KU100）",
+     "tip_en": "Extra attenuation of the far ear when close (0 = pure physics)",
+     "min": 0.0,
+     "max": 40.0,
+     "decimals": 0,
+     "unit": "dB",
+     "unit_en": "dB"
+    },
+    {
+     "type": "slider",
+     "key": "presence_db",
+     "label": "临场感",
+     "label_en": "Presence",
+     "tip": "贴耳时近耳 3.5 kHz 和空气感",
+     "tip_en": "Near-ear 3.5 kHz presence and air",
+     "min": 0.0,
+     "max": 8.0,
+     "decimals": 1,
+     "unit": "dB",
+     "unit_en": "dB"
+    },
+    {
+     "type": "slider",
+     "key": "dark_db",
+     "label": "暗度",
+     "label_en": "Darkness",
+     "tip": "贴耳时近耳 5 kHz 附近压低，音色更暗、更柔",
+     "tip_en": "Dip around 5 kHz at the near ear: darker, softer",
+     "min": 0.0,
+     "max": 8.0,
+     "decimals": 1,
+     "unit": "dB",
+     "unit_en": "dB"
+    },
+    {
+     "type": "slider",
+     "key": "warmth_db",
+     "label": "温暖感",
+     "label_en": "Warmth",
+     "tip": "凑近时两耳共同的低频",
+     "tip_en": "Low-frequency warmth in both ears when close",
+     "min": 0.0,
+     "max": 12.0,
+     "decimals": 1,
+     "unit": "dB",
+     "unit_en": "dB"
+    },
+    {
+     "type": "slider",
+     "key": "ear_warmth_db",
+     "label": "近耳低频",
+     "label_en": "Near-ear bass",
+     "tip": "贴耳时只给近耳加的低频",
+     "tip_en": "Bass added only to the near ear",
+     "min": 0.0,
+     "max": 10.0,
+     "decimals": 1,
+     "unit": "dB",
+     "unit_en": "dB"
+    },
+    {
+     "type": "slider",
+     "key": "far_lf_cut_db",
+     "label": "远耳低频削减",
+     "label_en": "Far-ear bass cut",
+     "tip": "贴耳时远耳 320 Hz 以下再压低",
+     "tip_en": "Extra cut below 320 Hz at the far ear",
+     "min": 0.0,
+     "max": 18.0,
+     "decimals": 0,
+     "unit": "dB",
+     "unit_en": "dB"
+    },
+    {
+     "type": "slider",
+     "key": "breath_db",
+     "label": "气声增强",
+     "label_en": "Breath lift",
+     "tip": "贴耳时把嗓音里轻的送气声 / 气息提上来（最多这么多），响的齿音不提；只用嗓音自己的气声，不加噪声。0 = 关闭",
+     "tip_en": "Lifts the soft breathy part of the voice when close (by at most this much); loud sibilants are left alone. No noise is added. 0 = off",
+     "min": 0.0,
+     "max": 12.0,
+     "decimals": 1,
+     "unit": "dB",
+     "unit_en": "dB"
+    },
+    {
+     "type": "slider",
+     "key": "puff",
+     "label": "气流扑耳",
+     "label_en": "Breath puff",
+     "tip": "送气时气流扑到耳朵上的低频脉冲（耳朵痒的感觉），由嗓音自己的送气声导出。0 = 关闭，1 倍 = 标准；滑块到 8 倍，手输可更高",
+     "tip_en": "Low-frequency pulses of breath hitting the ear, derived from the voice's own aspiration. 0 = off, 1x = standard; slider up to 8x, type for higher values",
+     "min": 0.0,
+     "max": 8.0,
+     "decimals": 2,
+     "unit": "倍",
+     "unit_en": "x"
+    },
+    {
+     "type": "slider",
+     "key": "concha_db",
+     "label": "耳甲共鸣",
+     "label_en": "Concha resonance",
+     "tip": "贴耳时近耳 4.3 kHz 的耳甲腔共振（KU100 贴耳实录的共有特征）。0 = 关闭",
+     "tip_en": "4.3 kHz concha resonance at the near ear when close. 0 = off",
+     "min": 0.0,
+     "max": 8.0,
+     "decimals": 1,
+     "unit": "dB",
+     "unit_en": "dB"
+    },
+    {
+     "type": "slider",
+     "key": "soft_near",
+     "label": "贴耳轻声",
+     "label_en": "Soft when close",
+     "tip": "凑到耳边时把嗓音均衡成「放轻声音」，退开时恢复（只做均衡）。0 = 关闭",
+     "tip_en": "EQ towards a lowered voice when at the ear, back to normal when away (EQ only). 0 = off",
+     "min": 0.0,
+     "max": 1.5,
+     "decimals": 2
+    },
+    {
+     "type": "slider",
+     "key": "mouth_cm",
+     "label": "嘴的大小",
+     "label_en": "Mouth size",
+     "tip": "嘴是一个开口而不是一个点：贴耳时耳廓的窄谷被平均变浅，离远了没有区别。0 = 点声源",
+     "tip_en": "The mouth is an opening, not a point: narrow pinna notches smooth out when close. 0 = point source",
+     "min": 0.0,
+     "max": 5.0,
+     "decimals": 1,
+     "unit": "cm",
+     "unit_en": "cm"
+    },
+    {
+     "type": "slider",
+     "key": "far_shadow_db",
+     "label": "远耳高频遮挡",
+     "label_en": "Far-ear shadow",
+     "tip": "贴耳时另一只耳朵 6 kHz 以上再压低（近处声源的头影更深）。0 = 关闭",
+     "tip_en": "Extra cut above 6 kHz at the far ear when close (deeper head shadow for near sources). 0 = off",
+     "min": 0.0,
+     "max": 12.0,
+     "decimals": 1,
+     "unit": "dB",
+     "unit_en": "dB"
+    },
+    {
+     "type": "check",
+     "key": "ku100_eq",
+     "label": "近耳用 KU100 实测校正曲线（高频更收）",
+     "label_en": "KU100-calibrated near-ear EQ (softer highs)",
+     "tip": "",
+     "tip_en": ""
+    }
+   ]
+  },
+  {
+   "id": "inear",
+   "title": "入耳（掏耳）",
+   "title_en": "In the ear (ear cleaning)",
+   "open_if": {
+    "key": "inear_cm",
+    "gt": 0
+   },
+   "items": [
+    {
+     "type": "slider",
+     "key": "inear_cm",
+     "label": "入耳深度",
+     "label_en": "Depth in ear",
+     "tip": "声源贴到耳朵上之后，最深伸进耳道多少。0 = 不进耳道，这一组都不起作用。给棉签、挖耳勺、刮擦这类触发音用；只有贴在耳朵上时才会伸进去，换边前先退出来",
+     "tip_en": "How far the source goes into the ear canal once it is at the ear. 0 = never enters, and this whole group is off. Meant for trigger sounds (cotton swab, ear pick, scratching); it only goes in while at the ear and comes out before changing ears",
+     "min": 0.0,
+     "max": 2.3,
+     "decimals": 1,
+     "unit": "cm",
+     "unit_en": "cm"
+    },
+    {
+     "type": "slider",
+     "key": "inear_period",
+     "label": "进出节奏",
+     "label_en": "In / out period",
+     "tip": "有声音时，一次「伸进去—退出来」大约几秒（KU100 掏耳实录 2–6 秒）",
+     "tip_en": "Seconds of sound per in-and-out stroke (KU100 ear-cleaning recordings: 2–6 s)",
+     "min": 1.5,
+     "max": 12.0,
+     "decimals": 1,
+     "unit": "s",
+     "unit_en": "s",
+     "enable_if": {
+      "key": "inear_cm",
+      "gt": 0
+     }
+    },
+    {
+     "type": "slider",
+     "key": "inear_random",
+     "label": "随机程度",
+     "label_en": "Randomness",
+     "tip": "0 = 进出的节奏和深浅固定，1 = 都随机，偶尔只伸到一半、偶尔整个拿出来",
+     "tip_en": "0 = fixed rhythm and depth, 1 = random, sometimes only halfway in, sometimes fully out",
+     "min": 0.0,
+     "max": 1.0,
+     "decimals": 2,
+     "enable_if": {
+      "key": "inear_cm",
+      "gt": 0
+     }
+    },
+    {
+     "type": "slider",
+     "key": "canal_db",
+     "label": "耳道共鸣",
+     "label_en": "Canal resonance",
+     "tip": "伸进耳道后，物体与话筒（鼓膜）之间那段耳道的共振峰：伸得越深共振越高（约 3 → 11 kHz），听得出进出的深浅。0 = 关闭",
+     "tip_en": "Resonance of the part of the canal left between the object and the microphone (eardrum): the deeper, the higher (≈3 → 11 kHz), which is what makes the depth audible. 0 = off",
+     "min": 0.0,
+     "max": 16.0,
+     "decimals": 1,
+     "unit": "dB",
+     "unit_en": "dB",
+     "enable_if": {
+      "key": "inear_cm",
+      "gt": 0
+     }
+    },
+    {
+     "type": "slider",
+     "key": "rumble",
+     "label": "耳内低频",
+     "label_en": "In-ear rumble",
+     "tip": "摩擦 / 触碰在耳道里形成的低频压力（隆隆声），由输入自己的包络导出，不加噪声。0 = 关闭，1 倍 = 标准（比摩擦声高约 15 dB，实录 10–20 dB）。输入本身低频就重（直接摩擦话筒录的）时调低",
+     "tip_en": "Low-frequency pressure (rumble) that rubbing and touching build up inside the canal, derived from the input's own envelope, no noise added. 0 = off, 1x = standard (≈15 dB above the friction sound; recordings: 10–20 dB). Turn it down if the input is already bass-heavy (recorded by rubbing the microphone itself)",
+     "min": 0.0,
+     "max": 3.0,
+     "decimals": 2,
+     "unit": "倍",
+     "unit_en": "x",
+     "enable_if": {
+      "key": "inear_cm",
+      "gt": 0
+     }
+    },
+    {
+     "type": "slider",
+     "key": "muffle_db",
+     "label": "堵耳闷感",
+     "label_en": "Occluded tone",
+     "tip": "伸进耳道时近耳 2.5 kHz 以上压低多少：物体堵住了耳道口，声音更闷。0 = 关闭",
+     "tip_en": "Cut above 2.5 kHz at the near ear while inside the canal: the object blocks the entrance, so it sounds more muffled. 0 = off",
+     "min": 0.0,
+     "max": 12.0,
+     "decimals": 1,
+     "unit": "dB",
+     "unit_en": "dB",
+     "enable_if": {
+      "key": "inear_cm",
+      "gt": 0
+     }
+    },
+    {
+     "type": "note",
+     "text": "入耳深度为 0 时这一组不起作用。人声用的气声增强、气流扑耳、忽远忽近等，掏耳时建议关掉（点上面的「掏耳」一键设置）",
+     "text_en": "This group is inactive while the depth is 0. For ear cleaning, use the Ear cleaning style button"
+    }
+   ]
+  },
+  {
+   "id": "motion",
+   "title": "左右移动",
+   "title_en": "Left / right motion",
+   "open": true,
+   "items": [
+    {
+     "type": "choice",
+     "key": "mode",
+     "style": "chips",
+     "label": "方式",
+     "label_en": "Mode",
+     "options": [
+      {
+       "value": "Sweep",
+       "label": "穿梭",
+       "label_en": "Sweep"
+      },
+      {
+       "value": "Random",
+       "label": "随机走位",
+       "label_en": "Random"
+      },
+      {
+       "value": "Orbit",
+       "label": "环绕",
+       "label_en": "Orbit"
+      },
+      {
+       "value": "Static",
+       "label": "固定",
+       "label_en": "Static"
+      },
+      {
+       "value": "Manual",
+       "label": "手动",
+       "label_en": "Manual"
+      }
+     ]
+    },
+    {
+     "type": "slider",
+     "key": "moves_per_min",
+     "label": "移动频率",
+     "label_en": "Moves per minute",
+     "tip": "说话时每分钟换几次耳朵（同时缩放停留和移动时间）",
+     "tip_en": "Ear switches per minute of speech (scales hold and move time)",
+     "min": 2.0,
+     "max": 40.0,
+     "decimals": 0,
+     "unit": "次/分",
+     "unit_en": "/min",
+     "show_if": {
+      "key": "mode",
+      "in": [
+       "Sweep",
+       "Random"
+      ]
+     }
+    },
+    {
+     "type": "slider",
+     "key": "hold_s",
+     "label": "停留时间",
+     "label_en": "Hold time",
+     "tip": "每只耳朵边停留多久（掏耳时一般几十秒）",
+     "tip_en": "How long it stays at each ear (tens of seconds for ear cleaning)",
+     "min": 0.3,
+     "max": 60.0,
+     "decimals": 1,
+     "log": true,
+     "unit": "s",
+     "unit_en": "s",
+     "show_if": {
+      "key": "mode",
+      "in": [
+       "Sweep",
+       "Random"
+      ]
+     }
+    },
+    {
+     "type": "slider",
+     "key": "move_s",
+     "label": "移动时间",
+     "label_en": "Move time",
+     "tip": "从一只耳朵移到另一只耳朵用多久",
+     "tip_en": "How long a crossing takes",
+     "min": 0.3,
+     "max": 12.0,
+     "decimals": 1,
+     "unit": "s",
+     "unit_en": "s",
+     "show_if": {
+      "key": "mode",
+      "in": [
+       "Sweep",
+       "Random"
+      ]
+     }
+    },
+    {
+     "type": "slider",
+     "key": "randomness",
+     "label": "随机程度",
+     "label_en": "Randomness",
+     "tip": "时长和落点的随机程度：0 = 完全规律",
+     "tip_en": "Randomness of timing and landing spots: 0 = strictly regular",
+     "min": 0.0,
+     "max": 1.0,
+     "decimals": 2,
+     "show_if": {
+      "key": "mode",
+      "in": [
+       "Sweep",
+       "Random"
+      ]
+     }
+    },
+    {
+     "type": "slider",
+     "key": "front",
+     "label": "正面比例",
+     "label_en": "Stops in front",
+     "tip": "每次停下来，有多大比例停在正前方（两只耳朵听到的差不多），其余停在耳边、侧前、侧后。KU100 轻语实录里约三成的时间两耳差不多",
+     "tip_en": "Share of the stops that land in front (both ears about equal); the rest land at an ear, front-side or back-side. In KU100 whisper recordings both ears are about equal for roughly 30% of the time",
+     "min": 0.0,
+     "max": 0.7,
+     "decimals": 2,
+     "show_if": {
+      "key": "mode",
+      "in": [
+       "Random"
+      ]
+     }
+    },
+    {
+     "type": "slider",
+     "key": "approach",
+     "label": "从远处凑近",
+     "label_en": "Approach",
+     "tip": "换边时先退到约 0.5 m 再慢慢凑近的概率",
+     "tip_en": "Chance that a switch backs off to ≈0.5 m and then looms in",
+     "min": 0.0,
+     "max": 1.0,
+     "decimals": 2,
+     "show_if": {
+      "key": "mode",
+      "in": [
+       "Sweep"
+      ]
+     }
+    },
+    {
+     "type": "slider",
+     "key": "ear_angle",
+     "label": "贴耳角度",
+     "label_en": "Ear angle",
+     "tip": "90 = 正侧方，100 = 略靠后",
+     "tip_en": "90 = straight to the side, 100 = slightly behind",
+     "min": 60.0,
+     "max": 140.0,
+     "decimals": 0,
+     "unit": "°",
+     "unit_en": "°",
+     "show_if": {
+      "key": "mode",
+      "in": [
+       "Sweep"
+      ]
+     }
+    },
+    {
+     "type": "slider",
+     "key": "pass_dist",
+     "label": "穿过时的距离",
+     "label_en": "Pass distance",
+     "tip": "经过脸前 / 脑后时离头中心多远",
+     "tip_en": "Distance from the head centre while crossing",
+     "min": 0.12,
+     "max": 0.6,
+     "decimals": 2,
+     "unit": "m",
+     "unit_en": "m",
+     "show_if": {
+      "key": "mode",
+      "in": [
+       "Sweep"
+      ]
+     }
+    },
+    {
+     "type": "choice",
+     "key": "via",
+     "style": "chips",
+     "label": "换边时从哪里绕",
+     "label_en": "Cross via",
+     "show_if": {
+      "key": "mode",
+      "in": [
+       "Sweep"
+      ]
+     },
+     "options": [
+      {
+       "value": "Front",
+       "label": "脸前",
+       "label_en": "Front"
+      },
+      {
+       "value": "Back",
+       "label": "脑后",
+       "label_en": "Back"
+      },
+      {
+       "value": "Alternate",
+       "label": "交替",
+       "label_en": "Alternate"
+      },
+      {
+       "value": "Random",
+       "label": "随机",
+       "label_en": "Random"
+      }
+     ]
+    },
+    {
+     "type": "slider",
+     "key": "orbit_period",
+     "label": "一圈用时",
+     "label_en": "Period",
+     "tip": "",
+     "tip_en": "",
+     "min": 3.0,
+     "max": 60.0,
+     "decimals": 0,
+     "unit": "s",
+     "unit_en": "s",
+     "show_if": {
+      "key": "mode",
+      "in": [
+       "Orbit"
+      ]
+     }
+    },
+    {
+     "type": "slider",
+     "key": "orbit_radius",
+     "label": "半径",
+     "label_en": "Radius",
+     "tip": "",
+     "tip_en": "",
+     "min": 0.1,
+     "max": 1.5,
+     "decimals": 2,
+     "log": true,
+     "unit": "m",
+     "unit_en": "m",
+     "show_if": {
+      "key": "mode",
+      "in": [
+       "Orbit"
+      ]
+     }
+    },
+    {
+     "type": "slider",
+     "key": "static_az",
+     "label": "方位角",
+     "label_en": "Azimuth",
+     "tip": "0 前，90 右，180 后，270 左",
+     "tip_en": "0 front, 90 right, 180 back, 270 left",
+     "min": 0.0,
+     "max": 359.0,
+     "decimals": 0,
+     "unit": "°",
+     "unit_en": "°",
+     "show_if": {
+      "key": "mode",
+      "in": [
+       "Static"
+      ]
+     }
+    },
+    {
+     "type": "slider",
+     "key": "manual_az",
+     "label": "方位角",
+     "label_en": "Azimuth",
+     "tip": "0 前，90 右，180 后，270 左。也可以直接在左边的位置图上拖",
+     "tip_en": "0 front, 90 right, 180 back, 270 left. Or drag on the map at the left",
+     "min": 0.0,
+     "max": 359.9,
+     "decimals": 0,
+     "unit": "°",
+     "unit_en": "°",
+     "show_if": {
+      "key": "mode",
+      "in": [
+       "Manual"
+      ]
+     }
+    },
+    {
+     "type": "slider",
+     "key": "manual_cm",
+     "label": "离头距离",
+     "label_en": "Distance from head",
+     "tip": "声源离头表面多远；在耳朵正侧方时就是离耳朵多远",
+     "tip_en": "Distance from the head surface; at the side this is the distance from the ear",
+     "min": 0.8,
+     "max": 71.0,
+     "decimals": 1,
+     "log": true,
+     "unit": "cm",
+     "unit_en": "cm",
+     "show_if": {
+      "key": "mode",
+      "in": [
+       "Manual"
+      ]
+     }
+    },
+    {
+     "type": "slider",
+     "key": "manual_tilt",
+     "label": "高度",
+     "label_en": "Height",
+     "tip": "以耳朵为支点向上（正）/ 向下（负）偏多少度。也可以拖位置图右侧的竖条",
+     "tip_en": "Above (+) / below (−) the ear, in degrees. Or drag the bar at the right of the map",
+     "min": -80.0,
+     "max": 85.0,
+     "decimals": 0,
+     "unit": "°",
+     "unit_en": "°",
+     "show_if": {
+      "key": "mode",
+      "in": [
+       "Manual"
+      ]
+     }
+    },
+    {
+     "type": "slider",
+     "key": "level_follow",
+     "label": "响度随位置变化",
+     "label_en": "Level follows position",
+     "tip": "1 = 物理真实（贴耳很响、到脸前会弱很多），0 = 处处一样响",
+     "tip_en": "1 = physical (loud at the ear, much quieter in front), 0 = constant",
+     "min": 0.0,
+     "max": 1.0,
+     "decimals": 2
+    },
+    {
+     "type": "note",
+     "text": "手动：声源停在你摆的位置，在上面的位置图上拖动。忽远忽近、上下、自然晃动此时不起作用",
+     "text_en": "Manual: the source stays where you put it; drag it on the map. Near / far sway, up / down and micro motion are inactive",
+     "show_if": {
+      "key": "mode",
+      "in": [
+       "Manual"
+      ]
+     }
+    }
+   ]
+  },
+  {
+   "id": "bg",
+   "title": "背景音（雨声）",
+   "title_en": "Background (rain)",
+   "title_fmt": "bg_title",
+   "open_if": {
+    "key": "bg_level",
+    "gt": 0
+   },
+   "actions": [
+    {
+     "action": "bg_rain_night",
+     "label": "雨夜",
+     "label_en": "Rainy night",
+     "tip": "关着窗在屋里听外面的小到中雨（约 2 mm/h），雨主要从窗户那边来；窗玻璃上偶尔落一滴，屋檐在滴水；雨声比人声低约 18 dB。只改背景音这几项",
+     "tip_en": "Light-to-moderate rain heard indoors through a closed window; 18 dB below the voice. Only changes the background settings"
+    },
+    {
+     "action": "bg_off",
+     "label": "关",
+     "label_en": "Off",
+     "show_if": {
+      "key": "bg_level",
+      "gt": 0
+     }
+    }
+   ],
+   "items": [
+    {
+     "type": "note",
+     "text": "实时生成，不是录音；人声不受影响",
+     "text_en": "Generated live, not a recording; the voice is untouched"
+    },
+    {
+     "type": "slider",
+     "key": "bg_level",
+     "label": "音量",
+     "label_en": "Volume",
+     "tip": "雨声比人声的目标响度低多少：1 = 低 40 dB，100 = 一样响；0 = 关闭。整片雨声按这个定响度，近处雨滴和滴水在它之上",
+     "tip_en": "How far below the voice's target loudness the rain sits: 1 = 40 dB below, 100 = as loud; 0 = off",
+     "min": 0.0,
+     "max": 100.0,
+     "decimals": 0,
+     "step": 1.0,
+     "fmt": "bg_level"
+    },
+    {
+     "type": "slider",
+     "key": "rain",
+     "label": "雨量",
+     "label_en": "Rain",
+     "tip": "毛毛雨（0.3 mm/h）… 暴雨（60 mm/h）。雨越大，大雨滴越多、越密、越低沉，水洼里的「叮」也越多；也会响一点（±5 dB）",
+     "tip_en": "Drizzle (0.3 mm/h) … downpour (60 mm/h)",
+     "min": 0.0,
+     "max": 100.0,
+     "decimals": 0,
+     "step": 1.0,
+     "fmt": "rain_mmh"
+    },
+    {
+     "type": "slider",
+     "key": "bg_pan",
+     "label": "左右",
+     "label_en": "Left / right",
+     "tip": "雨从哪边来：−100 = 都在左边，0 = 四周均匀，100 = 都在右边（比如窗户在右边）",
+     "tip_en": "Where the rain comes from: −100 = all on the left, 0 = evenly around, 100 = all on the right",
+     "min": -100.0,
+     "max": 100.0,
+     "decimals": 0,
+     "step": 1.0,
+     "fmt": "pan"
+    },
+    {
+     "type": "slider",
+     "key": "bg_width",
+     "label": "包围感",
+     "label_en": "Surround",
+     "tip": "0 = 只从一个方向来（「左右」定的那个方向），100 = 从四面八方来",
+     "tip_en": "0 = from a single direction, 100 = from all around",
+     "min": 0.0,
+     "max": 100.0,
+     "decimals": 0,
+     "step": 1.0,
+     "fmt": "plain"
+    },
+    {
+     "type": "slider",
+     "key": "bg_indoor",
+     "label": "隔窗",
+     "label_en": "Window",
+     "tip": "0 = 站在雨里，100 = 关着窗在屋里听：墙和玻璃挡掉高频，只剩闷闷的雨声；窗玻璃上的雨点不闷，越隔窗越突出；屋檐滴水挡一半",
+     "tip_en": "0 = standing in the rain, 100 = indoors with the window shut",
+     "min": 0.0,
+     "max": 100.0,
+     "decimals": 0,
+     "step": 1.0,
+     "fmt": "plain"
+    },
+    {
+     "type": "slider",
+     "key": "rain_near",
+     "label": "近处雨滴",
+     "label_en": "Near drops",
+     "tip": "身边听得清的一滴一滴：隔窗时多是落在窗玻璃和窗台上，在外面时多是树叶和水洼；100 ≈ 每秒 12 滴。0 = 没有",
+     "tip_en": "Single drops you can pick out nearby; 100 ≈ 12 per second. 0 = none",
+     "min": 0.0,
+     "max": 100.0,
+     "decimals": 0,
+     "step": 1.0,
+     "fmt": "near"
+    },
+    {
+     "type": "slider",
+     "key": "rain_drip",
+     "label": "屋檐滴水",
+     "label_en": "Eave drips",
+     "tip": "屋檐 / 水管往水洼里滴的「滴答」：1–3 处固定的位置，各有各的节奏和音高。越大滴得越快、地方越多；0 = 没有",
+     "tip_en": "Drips from the eaves into a puddle: 1–3 fixed spots. 0 = none",
+     "min": 0.0,
+     "max": 100.0,
+     "decimals": 0,
+     "step": 1.0,
+     "fmt": "drip"
+    }
+   ]
+  },
+  {
+   "id": "sway",
+   "title": "忽远忽近",
+   "title_en": "Near / far sway",
+   "open": true,
+   "enable_if": {
+    "key": "mode",
+    "not_in": [
+     "Manual"
+    ]
+   },
+   "items": [
+    {
+     "type": "slider",
+     "key": "sway",
+     "label": "幅度",
+     "label_en": "Amount",
+     "tip": "随机地凑近、往后让的幅度（0 = 关闭）",
+     "tip_en": "How far it leans in and out (0 = off)",
+     "min": 0.0,
+     "max": 2.0,
+     "decimals": 2
+    },
+    {
+     "type": "slider",
+     "key": "sway_period",
+     "label": "节奏",
+     "label_en": "Period",
+     "tip": "说话时一次凑近—退开大约几秒",
+     "tip_en": "Seconds of speech per lean-out / lean-in cycle",
+     "min": 2.0,
+     "max": 14.0,
+     "decimals": 1,
+     "unit": "s",
+     "unit_en": "s"
+    },
+    {
+     "type": "slider",
+     "key": "sway_random",
+     "label": "随机程度",
+     "label_en": "Randomness",
+     "tip": "0 = 固定节奏和深浅，1 = 时长和深浅都随机",
+     "tip_en": "0 = fixed rhythm and depth, 1 = random timing and depth",
+     "min": 0.0,
+     "max": 1.0,
+     "decimals": 2
+    },
+    {
+     "type": "slider",
+     "key": "sway_follow",
+     "label": "跟随音量",
+     "label_en": "Follow loudness",
+     "tip": "声音大时往后让、轻声时更贴近，听着更舒服",
+     "tip_en": "Louder → leans back, softer → comes closer; more comfortable",
+     "min": 0.0,
+     "max": 2.0,
+     "decimals": 2
+    },
+    {
+     "type": "slider",
+     "key": "sway_level",
+     "label": "退开时的音量",
+     "label_en": "Level when back",
+     "tip": "退开时耳边音量保留物理衰减的比例（真人退开会说大声一点；KU100 实录 0.4–0.56）",
+     "tip_en": "Share of the physical level drop kept when leaning back (talkers raise their voice; KU100 recordings 0.4–0.56)",
+     "min": 0.0,
+     "max": 1.0,
+     "decimals": 2
+    },
+    {
+     "type": "slider",
+     "key": "pause_motion",
+     "label": "停顿时的动作",
+     "label_en": "Motion in pauses",
+     "tip": "停顿时动作的速度：0.13 = 几乎不动，下一句从原位置接着说；1 = 一直在动",
+     "tip_en": "Motion speed during pauses: 0.13 = almost still, 1 = always moving",
+     "min": 0.0,
+     "max": 1.0,
+     "decimals": 2
+    },
+    {
+     "type": "slider",
+     "key": "micro",
+     "label": "自然晃动",
+     "label_en": "Micro motion",
+     "tip": "人体自然的微小晃动（1 约 1.2 cm）",
+     "tip_en": "Natural small body sway (1 ≈ 1.2 cm)",
+     "min": 0.0,
+     "max": 2.0,
+     "decimals": 2
+    }
+   ]
+  },
+  {
+   "id": "updown",
+   "title": "上下",
+   "title_en": "Up / down",
+   "open": true,
+   "enable_if": {
+    "key": "mode",
+    "not_in": [
+     "Manual"
+    ]
+   },
+   "items": [
+    {
+     "type": "slider",
+     "key": "height",
+     "label": "高度",
+     "label_en": "Height",
+     "tip": "嘴相对耳朵向上（正）/ 向下（负）偏多少度，离耳朵的距离不变；0 = 与耳朵齐平",
+     "tip_en": "Mouth above (+) / below (−) the ear, in degrees, at the same distance from the ear; 0 = level with the ear",
+     "min": -60.0,
+     "max": 75.0,
+     "decimals": 0,
+     "unit": "°",
+     "unit_en": "°"
+    },
+    {
+     "type": "slider",
+     "key": "updown",
+     "label": "自动上下",
+     "label_en": "Auto up / down",
+     "tip": "嘴在耳朵上方 / 下方之间慢慢换位置的幅度（0 = 关闭）",
+     "tip_en": "How far the mouth drifts above / below the ear on its own (0 = off)",
+     "min": 0.0,
+     "max": 60.0,
+     "decimals": 0,
+     "unit": "°",
+     "unit_en": "°"
+    },
+    {
+     "type": "slider",
+     "key": "updown_period",
+     "label": "节奏",
+     "label_en": "Period",
+     "tip": "说话时上下一个来回大约几秒",
+     "tip_en": "Seconds of speech per up / down cycle",
+     "min": 3.0,
+     "max": 30.0,
+     "decimals": 1,
+     "unit": "s",
+     "unit_en": "s"
+    },
+    {
+     "type": "slider",
+     "key": "updown_random",
+     "label": "随机程度",
+     "label_en": "Randomness",
+     "tip": "0 = 节奏和高低固定，1 = 时长和高低都随机",
+     "tip_en": "0 = fixed rhythm and height, 1 = random timing and height",
+     "min": 0.0,
+     "max": 1.0,
+     "decimals": 2
+    },
+    {
+     "type": "slider",
+     "key": "over_top",
+     "label": "从头顶绕",
+     "label_en": "Over the head",
+     "tip": "换耳时改成从头顶绕过去的概率（穿梭 / 随机走位）：0 = 只从脸前 / 脑后绕，1 = 每次都从头顶绕",
+     "tip_en": "Chance that an ear switch goes over the top of the head (sweep / random): 0 = front / back only, 1 = always over the top",
+     "min": 0.0,
+     "max": 1.0,
+     "decimals": 2
+    },
+    {
+     "type": "note",
+     "text": "上下比左右、远近弱，因人而异；气声、轻语更明显",
+     "text_en": "Height is a weaker cue than left / right or distance and varies between listeners"
+    }
+   ]
+  },
+  {
+   "id": "presence",
+   "title": "KU100 临场感",
+   "title_en": "KU100 presence",
+   "open": true,
+   "items": [
+    {
+     "type": "check",
+     "key": "room",
+     "label": "真实房间（KU100 实测，远耳听到的是房间声而不是寂静）",
+     "label_en": "Real room (measured with a KU100: the far ear hears the room, not silence)",
+     "tip": "",
+     "tip_en": ""
+    },
+    {
+     "type": "slider",
+     "key": "wet_db",
+     "label": "房间声大小",
+     "label_en": "Room level",
+     "tip": "",
+     "tip_en": "",
+     "min": -12.0,
+     "max": 9.0,
+     "decimals": 0,
+     "unit": "dB",
+     "unit_en": "dB",
+     "enable_if": {
+      "key": "room",
+      "eq": true
+     }
+    },
+    {
+     "type": "choice",
+     "key": "pinna",
+     "style": "menu",
+     "label": "耳廓",
+     "label_en": "Pinna",
+     "options_from": "pinnas",
+     "tip": "KU100：人工头自己的耳廓（按平均人耳做的，给别人听选这个最稳）；真人 A–G：HUTUBS 实测的真人耳廓，自己听时挑前后、上下最分得清的那只",
+     "tip_en": "KU100: the dummy head's own ear (safest for an audience). Human A–G: measured human ears; pick the one with the clearest front/back and up/down"
+    },
+    {
+     "type": "choice",
+     "key": "playback",
+     "style": "menu",
+     "label": "回放补偿",
+     "label_en": "Playback EQ",
+     "options_from": "playback",
+     "tip": "扩散场：通用；KU100 原机：和真实 KU100 录音一样（高频略暗）；或按你的耳机型号补偿",
+     "tip_en": "Diffuse: generic; Native: like a real KU100 recording; or pick your headphone model"
+    }
+   ]
+  },
+  {
+   "id": "voice",
+   "title": "人声处理",
+   "title_en": "Voice",
+   "open": true,
+   "items": [
+    {
+     "type": "slider",
+     "key": "gate_db",
+     "label": "响应阈值",
+     "label_en": "Gate threshold",
+     "tip": "输入低于这个电平时当作静音（−90 = 关闭）",
+     "tip_en": "Input below this level is muted (−90 = off)",
+     "min": -90.0,
+     "max": -20.0,
+     "decimals": 0,
+     "unit": "dB",
+     "unit_en": "dB"
+    },
+    {
+     "type": "slider",
+     "key": "deess_db",
+     "label": "去齿音",
+     "label_en": "De-ess",
+     "tip": "只在 s / sh / x 出现时压低 4.5 kHz 以上，最多压这么多",
+     "tip_en": "Ducks >4.5 kHz only on sibilants, by at most this much",
+     "min": 0.0,
+     "max": 10.0,
+     "decimals": 1,
+     "unit": "dB",
+     "unit_en": "dB"
+    },
+    {
+     "type": "slider",
+     "key": "soft_voice",
+     "label": "轻声化",
+     "label_en": "Soft voice",
+     "tip": "把嗓音均衡成「压低声音说话」（只做均衡，不改嗓音）",
+     "tip_en": "EQ towards a lowered-voice spectrum (EQ only)",
+     "min": 0.0,
+     "max": 1.5,
+     "decimals": 2
+    }
+   ]
+  },
+  {
+   "id": "output",
+   "title": "输出",
+   "title_en": "Output",
+   "open": true,
+   "items": [
+    {
+     "type": "check",
+     "key": "auto_level",
+     "label": "自动响度（实时 / 试听：慢慢把音量拉到目标）",
+     "label_en": "Auto level (real-time / preview: slowly rides to the target)",
+     "tip": "",
+     "tip_en": ""
+    },
+    {
+     "type": "slider",
+     "key": "target_lufs",
+     "label": "目标响度",
+     "label_en": "Target",
+     "tip": "",
+     "tip_en": "",
+     "min": -30.0,
+     "max": -10.0,
+     "decimals": 0,
+     "unit": "LUFS",
+     "unit_en": "LUFS",
+     "enable_if": {
+      "key": "auto_level",
+      "eq": true
+     }
+    },
+    {
+     "type": "slider",
+     "key": "out_gain_db",
+     "label": "输出增益",
+     "label_en": "Output gain",
+     "tip": "",
+     "tip_en": "",
+     "min": -60.0,
+     "max": 12.0,
+     "decimals": 1,
+     "unit": "dB",
+     "unit_en": "dB"
+    },
+    {
+     "type": "slider",
+     "key": "ceiling_db",
+     "label": "峰值上限",
+     "label_en": "Ceiling",
+     "tip": "限制器的真峰值上限",
+     "tip_en": "True-peak ceiling of the limiter",
+     "min": -6.0,
+     "max": -0.1,
+     "decimals": 1,
+     "unit": "dBTP",
+     "unit_en": "dBTP"
+    },
+    {
+     "type": "int",
+     "key": "seed",
+     "label": "随机种子",
+     "label_en": "Seed",
+     "tip": "换一个数字就换一套走位（下次开始播放时生效）",
+     "tip_en": "A different number gives a different path (applies when playback restarts)"
+    }
+   ]
+  }
+ ]
+}

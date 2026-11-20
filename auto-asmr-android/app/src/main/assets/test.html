@@ -1,0 +1,122 @@
+<!doctype html>
+<html lang="zh">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>声音截获测试</title>
+<style>
+  body { font: 15px sans-serif; margin: 10px; }
+  button { display: block; width: 100%; margin: 5px 0; padding: 9px; font-size: 15px; text-align: left; }
+  video { width: 100%; max-height: 180px; background: #000; }
+  #st { color: #06c; min-height: 1.4em; }
+</style>
+</head>
+<body>
+<p id="st">未开始。每种都用不同的方式出声，看上面的 hook 状态有没有对应的流、改写前后左右电平对不对。</p>
+<button onclick="run('webaudio')">1. Web Audio：左 440 Hz（响）/ 右 660 Hz（轻）</button>
+<button onclick="run('element')">2. &lt;audio&gt;：本页生成的 WAV（左响右轻）</button>
+<button onclick="run('element44')">2b. &lt;audio&gt;：同上，44.1 kHz（检查重采样）</button>
+<button onclick="run('mp4')">3. &lt;video&gt;：跨域 mp4 直链（没有 CORS 头，5.1 声道）</button>
+<button onclick="run('hls')">4. &lt;video src=.m3u8&gt;：原生 HLS</button>
+<button onclick="run('hlsjs')">5. hls.js：同一个 HLS 流走 MSE</button>
+<button onclick="stopAll(); log('已停止')">停止</button>
+<video id="v" controls playsinline></video>
+<script>
+const MP4 = 'https://archive.org/download/BigBuckBunny_124/Content/big_buck_bunny_720p_surround.mp4';
+const HLS = 'https://test-streams.mux.dev/x36xhzz/x36xhzz.m3u8';
+const HLSJS = 'https://cdn.jsdelivr.net/npm/hls.js@1.5.20/dist/hls.min.js';
+const v = document.getElementById('v');
+let ctx = null, el = null, hls = null;
+
+function log(s) {
+  document.getElementById('st').textContent = s;
+  console.log('[test] ' + s);
+}
+
+function stopAll() {
+  if (ctx) { ctx.close(); ctx = null; }
+  if (el) { el.pause(); el = null; }
+  if (hls) { hls.destroy(); hls = null; }
+  v.pause(); v.removeAttribute('src'); v.load();
+}
+
+// 双声道 WAV：左 0.3 × 440 Hz，右 0.1 × 660 Hz，2 秒，循环播放
+function wavUrl(sr = 48000) {
+  const n = sr * 2, buf = new ArrayBuffer(44 + n * 4), d = new DataView(buf);
+  const str = (o, s) => { for (let i = 0; i < s.length; i++) d.setUint8(o + i, s.charCodeAt(i)); };
+  str(0, 'RIFF'); d.setUint32(4, 36 + n * 4, true); str(8, 'WAVE'); str(12, 'fmt ');
+  d.setUint32(16, 16, true); d.setUint16(20, 1, true); d.setUint16(22, 2, true);
+  d.setUint32(24, sr, true); d.setUint32(28, sr * 4, true); d.setUint16(32, 4, true); d.setUint16(34, 16, true);
+  str(36, 'data'); d.setUint32(40, n * 4, true);
+  for (let i = 0; i < n; i++) {
+    const t = i / sr;
+    d.setInt16(44 + i * 4, Math.round(32767 * 0.3 * Math.sin(2 * Math.PI * 440 * t)), true);
+    d.setInt16(46 + i * 4, Math.round(32767 * 0.1 * Math.sin(2 * Math.PI * 660 * t)), true);
+  }
+  return URL.createObjectURL(new Blob([buf], { type: 'audio/wav' }));
+}
+
+function loadScript(src) {
+  return new Promise((ok, fail) => {
+    if (window.Hls) return ok();
+    const s = document.createElement('script');
+    s.src = src; s.onload = ok; s.onerror = () => fail(new Error('加载失败 ' + src));
+    document.head.appendChild(s);
+  });
+}
+
+const cases = {
+  async webaudio() {
+    ctx = new AudioContext();
+    const m = ctx.createChannelMerger(2);
+    const tone = (f, g, ch) => {
+      const o = ctx.createOscillator(), gn = ctx.createGain();
+      o.frequency.value = f; gn.gain.value = g;
+      o.connect(gn).connect(m, 0, ch); o.start();
+    };
+    tone(440, 0.3, 0); tone(660, 0.1, 1);
+    m.connect(ctx.destination);
+    await ctx.resume();
+    log('webaudio 播放中，state=' + ctx.state + '，采样率 ' + ctx.sampleRate);
+  },
+  async element() {
+    el = new Audio(wavUrl()); el.loop = true;
+    await el.play();
+    log('element 播放中');
+  },
+  async element44() {
+    el = new Audio(wavUrl(44100)); el.loop = true;
+    await el.play();
+    log('element44 播放中');
+  },
+  async mp4() {
+    v.src = MP4; await v.play();
+    log('mp4 播放中');
+  },
+  async hls() {
+    log('canPlayType(m3u8) = "' + v.canPlayType('application/vnd.apple.mpegurl') + '"');
+    v.src = HLS; await v.play();
+    log('原生 HLS 播放中');
+  },
+  async hlsjs() {
+    await loadScript(HLSJS);
+    if (!Hls.isSupported()) throw new Error('不支持 MSE');
+    hls = new Hls(); hls.loadSource(HLS); hls.attachMedia(v);
+    await new Promise(ok => hls.on(Hls.Events.MANIFEST_PARSED, ok));
+    await v.play();
+    log('hls.js（MSE）播放中');
+  },
+};
+
+async function run(kind) {
+  stopAll();
+  log(kind + ' 开始');
+  try { await cases[kind](); } catch (e) { log(kind + ' 失败：' + e); }
+}
+
+setInterval(() => { if (!v.paused) console.log('[test] video t=' + v.currentTime.toFixed(1)); }, 3000);
+const auto = new URLSearchParams(location.search).get('auto');
+if (auto) run(auto);
+</script>
+</body>
+</html>

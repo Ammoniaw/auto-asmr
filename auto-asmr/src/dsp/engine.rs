@@ -839,7 +839,7 @@ mod tests {
     /// 掏耳预设：声音只在一只耳朵里（另一只低 40 dB 以上），带很强的耳内低频；输入里并没有低频。
     #[test]
     fn earclean_is_one_sided_and_rumbles() {
-        let x = crate::cli::test_scratch(20.0);
+        let x = crate::dsp::testsig::test_scratch(20.0);
         assert!(band_db(&x, 25.0, 160.0) < band_db(&x, 300.0, 2000.0) - 25.0, "测试输入不该有低频");
         let (l, r) = render(Params::default().style_earclean(), &x);
         assert!(l.iter().chain(r.iter()).all(|v| v.is_finite()));
@@ -885,7 +885,7 @@ mod tests {
     /// 入耳深度为 0 时，入耳这一组参数怎么设都不影响输出（与加入这一组之前逐样本相同）。
     #[test]
     fn inear_group_is_inert_at_zero_depth() {
-        let x = crate::cli::test_voice(8.0);
+        let x = crate::dsp::testsig::test_voice(8.0);
         for base in [Params::default(), Params::default().style_ku100()] {
             let mut q = base.clone();
             (q.inear_period, q.inear_random, q.canal_db, q.rumble, q.muffle_db) = (2.0, 0.1, 16.0, 3.0, 12.0);

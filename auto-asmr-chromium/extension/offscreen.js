@@ -1,0 +1,132 @@
+// 看不见的页面（offscreen document）：拿标签页的声音、交给 AudioWorklet 里的引擎处理、再播出去。
+//
+// 标签页被采集后，Chrome 不再直接播放它的声音；这里把处理后的声音接到 AudioContext 的输出，听到的就只有处理后的那一份。
+// 一个 AudioContext（固定 48 kHz，和引擎内部一致）里可以同时处理几个标签页，每个标签页一个 AudioWorkletNode。
+// offscreen 页面只能用 chrome.runtime，配置由 background.js 发过来。
+
+const tabs = new Map(); // tabId → { stream, src, node, tele, error, started }
+let ctx = null;
+let wasmModule = null;
+let ready = null;
+let configBytes = new Uint8Array(0);
+let gen = 0;
+
+const dec = new TextDecoder();
+
+async function init() {
+  ctx = new AudioContext({ sampleRate: 48000, latencyHint: 'interactive' });
+  await ctx.audioWorklet.addModule('worklet.js');
+  try {
+    wasmModule = await WebAssembly.compileStreaming(fetch('asmr.wasm'));
+  } catch {
+    wasmModule = await WebAssembly.compile(await (await fetch('asmr.wasm')).arrayBuffer());
+  }
+}
+
+function setConfig(text) {
+  if (typeof text !== 'string') return;
+  configBytes = new TextEncoder().encode(text);
+  gen += 1;
+  for (const t of tabs.values()) t.node.port.postMessage({ type: 'config', config: configBytes, gen });
+}
+
+function notify(msg) {
+  chrome.runtime.sendMessage({ to: 'bg', ...msg }).catch(() => {});
+}
+
+async function start(tabId, streamId, config) {
+  ready ??= init();
+  await ready;
+  if (tabs.has(tabId)) return { ok: true };
+  setConfig(config);
+  const stream = await navigator.mediaDevices.getUserMedia({
+    audio: { mandatory: { chromeMediaSource: 'tab', chromeMediaSourceId: streamId } },
+    video: false,
+  });
+  const src = ctx.createMediaStreamSource(stream);
+  const node = new AudioWorkletNode(ctx, 'auto-asmr', {
+    numberOfInputs: 1,
+    numberOfOutputs: 1,
+    outputChannelCount: [2],
+    channelCount: 2,
+    channelCountMode: 'explicit',
+    channelInterpretation: 'speakers',
+    processorOptions: { module: wasmModule, config: configBytes, gen },
+  });
+  const t = { stream, src, node, tele: null, error: '', started: Date.now() };
+  node.port.onmessage = (e) => onWorklet(tabId, t, e.data);
+  node.onprocessorerror = () => {
+    t.error = '音频处理器出错，已停止';
+  };
+  src.connect(node);
+  node.connect(ctx.destination);
+  for (const track of stream.getAudioTracks()) track.addEventListener('ended', () => stop(tabId));
+  tabs.set(tabId, t);
+  if (ctx.state !== 'running') await ctx.resume();
+  notify({ type: 'started', tabId });
+  return { ok: true };
+}
+
+function stop(tabId) {
+  const t = tabs.get(tabId);
+  if (!t) return;
+  tabs.delete(tabId);
+  for (const track of t.stream.getTracks()) track.stop();
+  t.src.disconnect();
+  t.node.disconnect();
+  t.node.port.postMessage({ type: 'free' });
+  notify({ type: 'stopped', tabId });
+  if (!tabs.size) notify({ type: 'idle' });
+}
+
+function onWorklet(tabId, t, m) {
+  if (m.type === 'tele') {
+    t.tele = m.t;
+  } else if (m.type === 'error') {
+    const detail = m.detail ? dec.decode(m.detail) : '';
+    t.error = `处理出错，已改成直通：${detail || m.message}`;
+    console.error('[auto-asmr]', tabId, m.message, detail);
+  } else if (m.type === 'config-error') {
+    const detail = m.detail ? dec.decode(m.detail) : '';
+    console.warn('[auto-asmr] 配置没换成：', detail);
+  }
+}
+
+function status() {
+  const out = {};
+  for (const [id, t] of tabs) {
+    const tl = t.tele;
+    out[id] = {
+      error: t.error,
+      seconds: (Date.now() - t.started) / 1000,
+      tele: tl && { az: tl[0], el: tl[1], r: tl[2], act: tl[3], inDb: tl[4], outDb: tl[5], depthCm: tl[6], engineMs: tl[7] },
+    };
+  }
+  return {
+    tabs: out,
+    // 输出端的延时：AudioContext 的缓冲 + 声卡（标签页采集本身的延时 Chrome 不报告，不在这里）
+    outputMs: ctx ? ((ctx.baseLatency || 0) + (ctx.outputLatency || 0)) * 1000 : 0,
+    state: ctx ? ctx.state : 'none',
+  };
+}
+
+chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
+  if (msg.to !== 'offscreen') return false;
+  (async () => {
+    switch (msg.type) {
+      case 'start':
+        return start(msg.tabId, msg.streamId, msg.config);
+      case 'stop':
+        stop(msg.tabId);
+        return { ok: true };
+      case 'config':
+        setConfig(msg.config);
+        return { ok: true };
+      case 'status':
+        return status();
+      default:
+        return { ok: false, error: `不认识的消息：${msg.type}` };
+    }
+  })().then(sendResponse, (e) => sendResponse({ ok: false, error: String((e && e.message) || e) }));
+  return true;
+});

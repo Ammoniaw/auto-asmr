@@ -1,0 +1,23 @@
+[package]
+name = "asmr-chromium"
+version = "0.1.0"
+edition = "2021"
+publish = false
+description = "auto-asmr 浏览器插件的 Rust 层：把桌面版的引擎和配置文件格式编成 wasm，给 AudioWorklet 和插件页面调用"
+
+# cdylib = 编成 wasm（../build.sh）；rlib 给电脑上跑的测试用
+[lib]
+name = "asmr_chromium"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+auto-asmr = { path = "../../auto-asmr", default-features = false }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true
+# wasm 里 panic 只能中止：先由 panic hook 记下原因，JS 那边接住异常后把流改成直通
+panic = "abort"

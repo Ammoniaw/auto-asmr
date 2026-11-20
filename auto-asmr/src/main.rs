@@ -3,11 +3,13 @@
 
 mod batch;
 mod cli;
-mod dsp;
 mod gui;
 mod offline;
 mod realtime;
 mod spsc;
+
+// 信号处理和设置文件格式在库里（src/lib.rs），这里引进来，其余模块照旧用 `crate::dsp::…` / `crate::config::…`
+use auto_asmr::{config, dsp};
 
 /// Windows 图形程序默认没有控制台：从命令行带参数启动时，接到父进程的控制台上才能看到输出。
 #[cfg(windows)]

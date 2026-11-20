@@ -1,6 +1,6 @@
 //! 所有可调参数。实时模式和文件模式共用；界面上每个滑块对应这里的一个字段。
 
-use super::{db_to_lin, EAR_R, R_MIN};
+use super::{db_to_lin, EAR_R, HEAD_A, R_MAX, R_MIN};
 use serde::{Deserialize, Serialize};
 
 /// 降噪强度的最大值：取这个值（或更大）表示不设上限，降到最干净。
@@ -386,6 +386,64 @@ impl Params {
         }
     }
 
+    // ---- 界面上的换算（桌面版和安卓版的界面都用这几个，保证两边操作一致）
+
+    /// 「贴耳距离」：嘴离耳朵（头表面）多少厘米。
+    pub fn ear_cm(&self) -> f32 {
+        (self.ear_dist - HEAD_A) * 100.0
+    }
+
+    pub fn set_ear_cm(&mut self, cm: f32) {
+        self.ear_dist = (HEAD_A + cm / 100.0).clamp(R_MIN, R_MAX);
+    }
+
+    /// 手动摆位的「离头距离」：声源离头表面多少厘米（在正侧方时就是离耳朵多远）。
+    pub fn manual_cm(&self) -> f32 {
+        (self.manual_dist - HEAD_A) * 100.0
+    }
+
+    pub fn set_manual_cm(&mut self, cm: f32) {
+        self.manual_dist = (HEAD_A + cm / 100.0).clamp(R_MIN, R_MAX);
+    }
+
+    /// 「移动频率」：说话时每分钟换几次耳朵。
+    pub fn moves_per_min(&self) -> f32 {
+        60.0 / (self.hold_s + self.move_s).max(0.2)
+    }
+
+    /// 改移动频率：停留时间和移动时间按同一比例缩放。
+    pub fn set_moves_per_min(&mut self, freq: f32) {
+        if freq > 0.0 && freq.is_finite() {
+            let k = self.moves_per_min() / freq;
+            self.hold_s = (self.hold_s * k).max(0.001);
+            self.move_s = (self.move_s * k).max(0.001);
+        }
+    }
+
+    /// 换左右移动的方式：「响度随位置变化」跟着换成这个方式的默认值。
+    pub fn set_mode(&mut self, mode: MotionMode) {
+        if mode != self.mode {
+            self.mode = mode;
+            self.level_follow = Self::default_level_follow(mode);
+        }
+    }
+
+    /// 降噪滑条（0–100）：0 = 关闭，其余 = 底噪最多压低多少 dB，100 = 不设上限。
+    pub fn denoise_slider(&self) -> f32 {
+        if self.denoise {
+            self.denoise_db.clamp(0.0, DENOISE_MAX_DB)
+        } else {
+            0.0
+        }
+    }
+
+    pub fn set_denoise_slider(&mut self, v: f32) {
+        self.denoise = v >= 0.5;
+        if self.denoise {
+            self.denoise_db = v.round();
+        }
+    }
+
     /// 各运动模式默认的"响度随位置变化"程度（与 Python 版相同）。
     pub fn default_level_follow(mode: MotionMode) -> f32 {
         match mode {
@@ -437,5 +495,31 @@ mod tests {
         assert!(p.room && p.ear_dist == 0.15);
         let e = Params::default().style_earclean();
         assert_eq!(ron::from_str::<Params>(&ron::to_string(&e).unwrap()).unwrap(), e);
+    }
+    #[test]
+    fn ui_conversions_round_trip() {
+        let mut p = Params::default();
+        assert!((p.ear_cm() - 1.75).abs() < 1e-4);
+        p.set_ear_cm(4.0);
+        assert!((p.ear_cm() - 4.0).abs() < 1e-4);
+        p.set_ear_cm(-50.0);
+        assert_eq!(p.ear_dist, R_MIN);
+        p.set_manual_cm(10.0);
+        assert!((p.manual_cm() - 10.0).abs() < 1e-4);
+        // 移动频率：停留和移动按同一比例缩放
+        let ratio = p.hold_s / p.move_s;
+        p.set_moves_per_min(24.0);
+        assert!((p.moves_per_min() - 24.0).abs() < 1e-3 && (p.hold_s / p.move_s - ratio).abs() < 1e-4);
+        // 换方式时响度随位置变化跟着换；同一个方式不动
+        p.level_follow = 0.9;
+        p.set_mode(MotionMode::Sweep);
+        assert_eq!(p.level_follow, 0.9);
+        p.set_mode(MotionMode::Static);
+        assert_eq!(p.level_follow, 1.0);
+        // 降噪滑条：0 关，其余是分贝数
+        p.set_denoise_slider(0.2);
+        assert!(!p.denoise && p.denoise_slider() == 0.0);
+        p.set_denoise_slider(12.4);
+        assert!(p.denoise && p.denoise_db == 12.0 && p.denoise_slider() == 12.0);
     }
 }

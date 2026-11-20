@@ -1,11 +1,12 @@
 //! 图形界面（egui）：实时页 + 文件转换页，右侧是两种模式共用的效果参数。
 
+use crate::config::{ConfigError, Saved, Tab};
 use crate::dsp::engine::{EngineConfig, Telemetry};
 use crate::dsp::mix::{self, MixSetup, Voice, DUO_MAX_MS, MAX_VOICES, PRESETS};
 use crate::dsp::params::{MotionMode, Params, Playback, Via, DENOISE_MAX_DB};
 use crate::dsp::tables::tables;
-use crate::dsp::motion::lift_tilt;
-use crate::dsp::{FS, HEAD_A, R_MIN, R_MAX};
+use crate::dsp::motion::{lift_tilt, up_angle};
+use crate::dsp::{FS, HEAD_A, R_MIN};
 mod view3d;
 
 use crate::batch;
@@ -15,7 +16,6 @@ use crate::offline::{align_tracks, balance_data, convert_mix, default_mix_output
 use crate::realtime::{self, DeviceInfo, DeviceList, Realtime, RtOptions};
 use eframe::egui;
 use egui::{Color32, RichText};
-use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -74,26 +74,6 @@ fn radar_pick(d: egui::Vec2, rmax: f32) -> (f32, f32) {
 /// 位置图边缘对应的距离（米）。
 const RADAR_MAX_R: f32 = 0.8;
 
-/// 高度角（度）：以"耳朵"为支点看声源在上方还是下方多少度——与运动里倾斜用的支点相同
-/// （声源在正侧方时支点是那只耳朵，在正前 / 正后方时是头中心）。同时返回水平面上的"未抬高"位置
-/// （方位角, 到头中心的距离），用来把一个三维位置换回手动模式的三个量。
-fn up_angle(az: f32, el: f32, r: f32) -> (f32, f32, f32) {
-    let (a, e) = (az.to_radians(), el.to_radians());
-    let (x, y, z) = (r * e.cos() * a.sin(), r * e.cos() * a.cos(), r * e.sin());
-    // 支点的位置取决于"未抬高"时的方位，先用当前方位估计，迭代几次就收敛
-    let mut cx = HEAD_A * x / r.max(1e-6);
-    let (mut up, mut px, mut py) = (0.0, x, y);
-    for _ in 0..6 {
-        let vh = (x - cx).hypot(y);
-        let d = vh.hypot(z);
-        up = z.atan2(vh).to_degrees();
-        px = cx + (x - cx) / vh.max(1e-6) * d;
-        py = y / vh.max(1e-6) * d;
-        cx = HEAD_A * px / px.hypot(py).max(1e-6);
-    }
-    (up, px.atan2(py).to_degrees().rem_euclid(360.0), px.hypot(py))
-}
-
 /// 参数表的一行：滑轨用常用范围，手输或拖动数值可以超出该范围。
 fn row(ui: &mut egui::Ui, label: &str, tip: &str, w: egui::Slider<'_>) -> bool {
     let l = ui.label(label);
@@ -113,52 +93,6 @@ fn t(zh: &'static str, en: &'static str) -> &'static str {
         en
     } else {
         zh
-    }
-}
-
-#[derive(Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-enum Tab {
-    Realtime,
-    File,
-}
-
-/// 关闭程序时保存、下次打开时恢复的内容。
-#[derive(Clone, Serialize, Deserialize)]
-#[serde(default)]
-struct Saved {
-    params: Params,
-    english: bool,
-    tab: Tab,
-    host: String,
-    input: Option<String>,
-    output: Option<String>,
-    buffer: u32,
-    in_channel: usize,
-    dry: bool,
-    bits: u16,
-    file_lufs: f32,
-    file_channel: u8,
-    /// 批量转换同时处理几个文件；0 = 自动（CPU 逻辑核数）。
-    jobs: usize,
-    /// 批量转换的输出文件夹；None = 放在各自源文件旁边。
-    out_dir: Option<PathBuf>,
-    /// 是否显示 3D 观察窗（默认隐藏；隐藏时不绘制）。
-    view3d: bool,
-    /// 多音频合成：列表里的前几个音频（最多 [`MAX_VOICES`] 个）各放一个位置，同时播放、合成一个文件。
-    mix: bool,
-    /// 合成的排布：false = 各自固定在自己的位置；true = 一起移动（按"左右移动"的方式走，彼此错开 360°/N）。
-    mix_follow: bool,
-    /// 合成前自动对齐：同一首歌的几个版本，从一起开始唱的地方叠加，对不上的开头和结尾裁掉。
-    mix_align: bool,
-    /// 合成的自动平衡强度（0–100 %，0 = 关）：按短时响度让几段每一段时间都差不多一样响。
-    mix_balance: f32,
-    /// 左右双人（0 = 关）：一个音频当成两个人，同一个声音一左一右，第 2 个晚这么多毫秒。排布、自动平衡与多音频合成共用。
-    duo_ms: f32,
-}
-
-impl Default for Saved {
-    fn default() -> Self {
-        Saved { params: Params::default(), english: false, tab: Tab::Realtime, host: String::new(), input: None, output: None, buffer: 256, in_channel: 0, dry: false, bits: 24, file_lufs: -16.0, file_channel: 0, jobs: 0, out_dir: None, view3d: false, mix: false, mix_follow: false, mix_align: false, mix_balance: 0.0, duo_ms: 0.0 }
     }
 }
 
@@ -322,13 +256,8 @@ impl App {
             .add_filter(t("配置文件", "Configuration"), &["ron"])
             .set_file_name("auto-asmr-export.ron")
             .save_file() else { return };
-        // 和自动保存使用相同的 eframe 键值格式，可直接替换运行目录中的配置文件。
-        let result = (|| -> Result<(), String> {
-            let saved = ron::ser::to_string_pretty(&self.s, Default::default()).map_err(|e| e.to_string())?;
-            let values = std::collections::BTreeMap::from([(eframe::APP_KEY, saved)]);
-            let text = ron::ser::to_string_pretty(&values, Default::default()).map_err(|e| e.to_string())?;
-            std::fs::write(&path, text).map_err(|e| e.to_string())
-        })();
+        // 和自动保存使用相同的 eframe 键值格式，可直接替换运行目录中的配置文件；安卓版也能导入。
+        let result = crate::config::to_text(&self.s).and_then(|text| std::fs::write(&path, text).map_err(|e| e.to_string()));
         self.status = match result {
             Ok(()) => format!("{}：{}", t("配置已导出", "Configuration exported"), path.display()),
             Err(e) => format!("{}：{e}", t("配置导出失败", "Configuration export failed")),
@@ -2122,7 +2051,7 @@ impl App {
     /// 左下角：输入降噪。一个 0–100 的滑条：数值 = 底噪最多压低多少分贝，0 = 关闭，100 = 不设上限。
     fn ui_denoise(ui: &mut egui::Ui, p: &mut Params) {
         ui.add_space(5.0);
-        let mut v = if p.denoise { p.denoise_db.clamp(0.0, DENOISE_MAX_DB) } else { 0.0 };
+        let mut v = p.denoise_slider();
         ui.horizontal(|ui| {
             ui.label(RichText::new(t("降噪", "Denoise")).strong()).on_hover_text(t(
                 "输入降噪（RNNoise，纯 CPU）：在空间化之前去掉麦克风 / 录音里的底噪。数值 = 底噪最多压低多少分贝，0 = 关闭，100 = 不设上限；60 以上基本没有区别。人声的音量不变",
@@ -2143,10 +2072,7 @@ impl App {
                 })
                 .custom_parser(|s| s.trim().split(|c: char| !(c.is_ascii_digit() || c == '.')).find(|w| !w.is_empty()).and_then(|w| w.parse::<f64>().ok()));
             if ui.add(slider).changed() {
-                p.denoise = v >= 0.5;
-                if p.denoise {
-                    p.denoise_db = v.round();
-                }
+                p.set_denoise_slider(v);
             }
         });
         let note = if !p.denoise {
@@ -2189,9 +2115,9 @@ impl App {
         });
         egui::CollapsingHeader::new(RichText::new(t("贴耳感", "Closeness")).strong()).default_open(true).show(ui, |ui| {
             egui::Grid::new("g1").num_columns(2).min_col_width(COL).spacing([10.0, 6.0]).show(ui, |ui| {
-                let mut cm = (p.ear_dist - HEAD_A) * 100.0;
+                let mut cm = p.ear_cm();
                 if row(ui, t("贴耳距离", "Distance from ear"), t("嘴离耳朵多远。1.7 cm = 贴着耳朵", "How far the mouth is from the ear. 1.7 cm = touching"), egui::Slider::new(&mut cm, 0.8..=25.0).logarithmic(true).suffix(" cm").fixed_decimals(1)) {
-                    p.ear_dist = (HEAD_A + cm / 100.0).clamp(R_MIN, R_MAX);
+                    p.set_ear_cm(cm);
                 }
                 row(ui, t("远耳压低", "Far-ear cut"), t("贴耳时另一只耳朵额外压低多少（0 = 纯物理，像真实 KU100）", "Extra attenuation of the far ear when close (0 = pure physics)"), egui::Slider::new(&mut p.isolation_db, 0.0..=40.0).suffix(" dB").fixed_decimals(0));
                 row(ui, t("临场感", "Presence"), t("贴耳时近耳 3.5 kHz 和空气感", "Near-ear 3.5 kHz presence and air"), egui::Slider::new(&mut p.presence_db, 0.0..=8.0).suffix(" dB").fixed_decimals(1));
@@ -2262,12 +2188,9 @@ impl App {
             egui::Grid::new("g2").num_columns(2).min_col_width(COL).spacing([10.0, 6.0]).show(ui, |ui| {
                 match p.mode {
                     MotionMode::Sweep | MotionMode::Random => {
-                        let mut freq = 60.0 / (p.hold_s + p.move_s).max(0.2);
-                        let f0 = freq;
-                        if row(ui, t("移动频率", "Moves per minute"), t("说话时每分钟换几次耳朵（同时缩放停留和移动时间）", "Ear switches per minute of speech (scales hold and move time)"), egui::Slider::new(&mut freq, 2.0..=40.0).suffix(t(" 次/分", " /min")).fixed_decimals(0)) && freq > 0.0 && freq.is_finite() {
-                            let k = f0 / freq;
-                            p.hold_s = (p.hold_s * k).max(0.001);
-                            p.move_s = (p.move_s * k).max(0.001);
+                        let mut freq = p.moves_per_min();
+                        if row(ui, t("移动频率", "Moves per minute"), t("说话时每分钟换几次耳朵（同时缩放停留和移动时间）", "Ear switches per minute of speech (scales hold and move time)"), egui::Slider::new(&mut freq, 2.0..=40.0).suffix(t(" 次/分", " /min")).fixed_decimals(0)) {
+                            p.set_moves_per_min(freq);
                         }
                         row(ui, t("停留时间", "Hold time"), t("每只耳朵边停留多久（掏耳时一般几十秒）", "How long it stays at each ear (tens of seconds for ear cleaning)"), egui::Slider::new(&mut p.hold_s, 0.3..=60.0).logarithmic(true).suffix(" s").fixed_decimals(1));
                         row(ui, t("移动时间", "Move time"), t("从一只耳朵移到另一只耳朵用多久", "How long a crossing takes"), egui::Slider::new(&mut p.move_s, 0.3..=12.0).suffix(" s").fixed_decimals(1));
@@ -2290,9 +2213,9 @@ impl App {
                     }
                     MotionMode::Manual => {
                         row(ui, t("方位角", "Azimuth"), t("0 前，90 右，180 后，270 左。也可以直接在左边的位置图上拖", "0 front, 90 right, 180 back, 270 left. Or drag on the map at the left"), egui::Slider::new(&mut p.manual_az, 0.0..=359.9).suffix("°").fixed_decimals(0));
-                        let mut cm = (p.manual_dist - HEAD_A) * 100.0;
+                        let mut cm = p.manual_cm();
                         if row(ui, t("离头距离", "Distance from head"), t("声源离头表面多远；在耳朵正侧方时就是离耳朵多远", "Distance from the head surface; at the side this is the distance from the ear"), egui::Slider::new(&mut cm, 0.8..=71.0).logarithmic(true).suffix(" cm").fixed_decimals(1)) {
-                            p.manual_dist = (HEAD_A + cm / 100.0).clamp(R_MIN, R_MAX);
+                            p.set_manual_cm(cm);
                         }
                         row(ui, t("高度", "Height"), t("以耳朵为支点向上（正）/ 向下（负）偏多少度。也可以拖位置图右侧的竖条", "Above (+) / below (−) the ear, in degrees. Or drag the bar at the right of the map"), egui::Slider::new(&mut p.manual_tilt, -80.0..=85.0).suffix("°").fixed_decimals(0));
                     }
@@ -2819,14 +2742,12 @@ impl eframe::App for App {
     }
 }
 
-/// 读取配置文件：既接受"导出配置"/自动保存的 eframe 键值格式（`{"app": "<Saved>"}`），
-/// 也接受直接写的 `Saved`（RON）。缺的项用默认值。
+/// 读取配置文件（格式见 [`crate::config`]，安卓版也用同一个格式）。缺的项用默认值。
 fn parse_config(text: &str) -> Result<Saved, String> {
-    if let Ok(map) = ron::from_str::<std::collections::BTreeMap<String, String>>(text) {
-        let inner = map.get(eframe::APP_KEY).ok_or_else(|| t("文件里没有 auto-asmr 的配置", "No auto-asmr configuration in this file").to_string())?;
-        return ron::from_str::<Saved>(inner).map_err(|e| e.to_string());
-    }
-    ron::from_str::<Saved>(text).map_err(|e| e.to_string())
+    crate::config::parse(text).map_err(|e| match e {
+        ConfigError::NotAutoAsmr => t("文件里没有 auto-asmr 的配置", "No auto-asmr configuration in this file").to_string(),
+        ConfigError::Parse(e) => e,
+    })
 }
 
 /// 总进度（按估计时长加权，0–1）、已结束的文件数、正在转换的文件数。
@@ -2984,9 +2905,10 @@ mod tests {
     #[test]
     fn exported_config_can_be_imported() {
         let saved = Saved { english: true, mix: true, buffer: 512, params: Params { puff: 2.5, ..Params::default() }, ..Saved::default() };
+        // 库里的键就是 eframe 自动保存用的键：自动保存的文件、导出的文件、安卓版的文件是同一个格式
+        assert_eq!(crate::config::APP_KEY, eframe::APP_KEY);
         // 和 export_config 一样的写法
-        let inner = ron::ser::to_string_pretty(&saved, Default::default()).unwrap();
-        let text = ron::ser::to_string_pretty(&std::collections::BTreeMap::from([(eframe::APP_KEY, inner)]), Default::default()).unwrap();
+        let text = crate::config::to_text(&saved).unwrap();
         let back = parse_config(&text).unwrap();
         assert!(back.english && back.mix && back.buffer == 512);
         assert_eq!(back.params, saved.params);

@@ -831,7 +831,7 @@ mod tests {
     fn denoiser_keeps_the_voice_and_stays_aligned() {
         // 合成的"人声"（带谐波的浊音 + 一点噪声）：降噪后音量基本不变；
         // 原声那一路和降噪后那一路严格对齐（差一个样本，按比例混合时就会出梳状滤波）
-        let v = crate::cli::test_voice(6.0);
+        let v = crate::dsp::testsig::test_voice(6.0);
         let p = crate::dsp::params::Params { denoise_db: 12.0, ..Default::default() };
         for mix in [p.denoise_mix(), 1.0] {
             let y = run_denoiser(&v, mix);

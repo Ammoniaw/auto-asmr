@@ -1313,7 +1313,6 @@ fn ring_add(ring: &mut [f32], t: u64, src: &[f32], g: f32) {
 #[cfg(test)]
 pub mod tests {
     use super::*;
-    use crate::dsp::dynamics::LoudnessMeter;
 
     /// 只生成雨声：`secs` 秒，每次给 `chunk` 个样本；人声目标响度 −16 LUFS。没有雨量的慢起伏（按期望值核对）。
     pub fn render(p: &Params, secs: f32, chunk: usize) -> (Vec<f32>, Vec<f32>) {
@@ -1339,13 +1338,7 @@ pub mod tests {
         (l, r)
     }
 
-    pub fn lufs(l: &[f32], r: &[f32]) -> f32 {
-        let mut m = LoudnessMeter::new();
-        for (&a, &b) in l.iter().zip(r) {
-            m.push(a, b);
-        }
-        m.integrated()
-    }
+    pub use crate::dsp::testsig::lufs;
 
     fn energy(x: &[f32]) -> f64 {
         x.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() + 1e-30

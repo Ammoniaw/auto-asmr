@@ -238,7 +238,7 @@ pub fn describe(strength: f32, stats: Option<((f32, f32), (f32, f32))>, english:
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::cli::test_voice;
+    use crate::dsp::testsig::test_voice;
 
     fn shaped(x: &[f32], segs: &[(f32, f32)]) -> Vec<f32> {
         let mut out = x.to_vec();

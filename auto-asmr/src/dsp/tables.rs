@@ -4,7 +4,6 @@
 use super::{HEAD_A, NTAP, R_MIN};
 use std::sync::OnceLock;
 
-static DATA: &[u8] = include_bytes!("../../assets/ku100.bin");
 
 pub struct Tables {
     pub n_r: usize,
@@ -99,7 +98,7 @@ pub fn tables() -> &'static Tables {
 
 impl Tables {
     fn load() -> Tables {
-        let mut c = Cur { d: DATA, p: 0 };
+        let mut c = Cur { d: super::data::ku100(), p: 0 };
         assert_eq!(c.bytes(8), b"ASMRKU03", "assets/ku100.bin 格式不对（用 tools/export_assets.py 重新导出）");
         let fs = c.u32();
         assert_eq!(fs, 48_000);
