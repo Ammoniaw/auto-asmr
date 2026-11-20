@@ -9,7 +9,9 @@ use crate::dsp::{FS, HEAD_A, R_MIN, R_MAX};
 mod view3d;
 
 use crate::batch;
-use crate::offline::{convert_mix, default_mix_output, default_output, load_mono, Channel, ConvertOptions, ConvertReport, MixInput};
+use crate::dsp::align::Alignment;
+use crate::dsp::balance::{self, BalanceData};
+use crate::offline::{align_tracks, balance_data, convert_mix, default_mix_output, default_output, load_mono, Channel, ConvertOptions, ConvertReport, MixInput, MixOptions};
 use crate::realtime::{self, DeviceInfo, DeviceList, Realtime, RtOptions};
 use eframe::egui;
 use egui::{Color32, RichText};
@@ -146,11 +148,15 @@ struct Saved {
     mix: bool,
     /// 合成的排布：false = 各自固定在自己的位置；true = 一起移动（按"左右移动"的方式走，彼此错开 360°/N）。
     mix_follow: bool,
+    /// 合成前自动对齐：同一首歌的几个版本，从一起开始唱的地方叠加，对不上的开头和结尾裁掉。
+    mix_align: bool,
+    /// 合成的自动平衡强度（0–100 %，0 = 关）：按短时响度让几段每一段时间都差不多一样响。
+    mix_balance: f32,
 }
 
 impl Default for Saved {
     fn default() -> Self {
-        Saved { params: Params::default(), english: false, tab: Tab::Realtime, host: String::new(), input: None, output: None, buffer: 256, in_channel: 0, dry: false, bits: 24, file_lufs: -16.0, file_channel: 0, jobs: 0, out_dir: None, view3d: false, mix: false, mix_follow: false }
+        Saved { params: Params::default(), english: false, tab: Tab::Realtime, host: String::new(), input: None, output: None, buffer: 256, in_channel: 0, dry: false, bits: 24, file_lufs: -16.0, file_channel: 0, jobs: 0, out_dir: None, view3d: false, mix: false, mix_follow: false, mix_align: false, mix_balance: 0.0 }
     }
 }
 
@@ -179,18 +185,57 @@ struct Job {
 
 type Decoded = Result<(PathBuf, u8, Arc<Vec<f32>>), String>;
 
-/// 合成试听用的解码结果：参与合成的文件、取的声道、各段 48 kHz 单声道、各段的响度（对齐用）。
+/// 合成试听用的解码结果：参与合成的文件、取的声道、各段 48 kHz 单声道、各段的响度（对齐用），
+/// 以及自动对齐的结果（打开"自动对齐"后才算；对不上时是错误说明，按没对齐的原样播放）。
 struct MixAudio {
     paths: Vec<PathBuf>,
     ch: u8,
     data: Vec<Arc<Vec<f32>>>,
     lufs: Vec<Option<f32>>,
+    /// 各段每 10 ms 的 K 加权均方（自动平衡用）。
+    levels: Vec<Arc<Vec<f32>>>,
+    aligned: Option<Result<AlignedMix, String>>,
+}
+
+/// 自动对齐、裁剪之后的各段（和"合成并保存"用的是同一个函数算的），及其响度。
+struct AlignedMix {
+    al: Alignment,
+    data: Vec<Arc<Vec<f32>>>,
+    lufs: Vec<Option<f32>>,
+    levels: Vec<Arc<Vec<f32>>>,
+}
+
+/// 试听用的一组音频：各段、响度、10 ms 均方（都是共享的，复制很便宜）。
+struct MixTracks {
+    data: Vec<Arc<Vec<f32>>>,
+    lufs: Vec<Option<f32>>,
+    levels: Vec<Arc<Vec<f32>>>,
+}
+
+impl AlignedMix {
+    fn new(paths: &[PathBuf], data: &[Arc<Vec<f32>>]) -> Result<Self, String> {
+        let refs: Vec<&[f32]> = data.iter().map(|d| d.as_slice()).collect();
+        let names: Vec<String> = paths.iter().map(|p| file_name(p)).collect();
+        let (out, al) = align_tracks(&refs, &names)?;
+        let lufs = out.iter().map(|m| mix::loudness(m)).collect();
+        let levels = out.iter().map(|m| Arc::new(balance::levels(m))).collect();
+        Ok(AlignedMix { al, data: out.into_iter().map(Arc::new).collect(), lufs, levels })
+    }
 }
 
 impl MixAudio {
-    /// 最长那段的样本数（试听的总长）。
-    fn len(&self) -> usize {
-        self.data.iter().map(|d| d.len()).max().unwrap_or(0)
+    /// 试听用的各段和响度：`align` 时用对齐后的（还没算好时为 None；对不上时用原样的），否则用原样的。
+    fn tracks(&self, align: bool) -> Option<MixTracks> {
+        match (&self.aligned, align) {
+            (None, true) => None,
+            (Some(Ok(a)), true) => Some(MixTracks { data: a.data.clone(), lufs: a.lufs.clone(), levels: a.levels.clone() }),
+            _ => Some(MixTracks { data: self.data.clone(), lufs: self.lufs.clone(), levels: self.levels.clone() }),
+        }
+    }
+
+    /// 试听的总长（样本）：最长那段，对齐后是共同部分的长度。
+    fn len(&self, align: bool) -> Option<usize> {
+        self.tracks(align).map(|t| t.data.iter().map(|x| x.len()).max().unwrap_or(0))
     }
 }
 
@@ -240,6 +285,10 @@ pub struct App {
     /// 每个音频的位置和音量（按文件记：删掉别的文件、列表顺序变了都不影响）。
     voices: HashMap<PathBuf, Voice>,
     mix_audio: Option<MixAudio>,
+    /// 勾上自动对齐时对齐还没算好：算好后把播放位置换到对齐后的时间线（停在同一处音乐）。
+    mix_shift: bool,
+    /// 自动平衡的输入响度数据，以及它是按哪一组音频（第 1 段数据的地址）算的。
+    mix_bal: Option<(usize, Arc<BalanceData>)>,
     mix_decoding: Option<Receiver<MixDecoded>>,
     /// 解码失败过的那一组（文件, 声道）：不自动重试，点"试听"时再试。
     mix_failed: Option<(Vec<PathBuf>, u8)>,
@@ -380,6 +429,8 @@ impl App {
             shot_wait: std::env::var("AUTO_ASMR_SHOT_WAIT").ok().and_then(|v| v.trim().parse().ok()),
             voices: HashMap::new(),
             mix_audio: None,
+            mix_shift: false,
+            mix_bal: None,
             mix_decoding: None,
             mix_failed: None,
             mix_out: None,
@@ -398,6 +449,14 @@ impl App {
             // AUTO_ASMR_SHOT_FOLLOW=1：合成用"一起移动"
             if std::env::var("AUTO_ASMR_SHOT_FOLLOW").is_ok() {
                 app.s.mix_follow = true;
+            }
+            // AUTO_ASMR_SHOT_ALIGN=1：合成前自动对齐
+            if std::env::var("AUTO_ASMR_SHOT_ALIGN").is_ok() {
+                app.s.mix_align = true;
+            }
+            // AUTO_ASMR_SHOT_BALANCE=<0–100>：合成的自动平衡强度
+            if let Some(v) = std::env::var("AUTO_ASMR_SHOT_BALANCE").ok().and_then(|v| v.trim().parse::<f32>().ok()) {
+                app.s.mix_balance = v.clamp(0.0, 100.0);
             }
             if std::env::var("AUTO_ASMR_SHOT_EN").is_ok() {
                 app.s.english = true;
@@ -505,8 +564,33 @@ impl App {
     fn mix_setup(&self, lufs: &[Option<f32>]) -> (Vec<Voice>, Arc<MixSetup>) {
         let voices = self.mix_voices();
         let prev = self.mix_sent.as_ref().map(|(_, s)| s.as_ref());
-        let setup = MixSetup::new(&self.cfg, &voices, lufs, self.s.mix_follow, prev);
+        let setup = MixSetup::new(&self.cfg, &voices, lufs, self.s.mix_follow, prev).with_balance(self.cur_balance(), self.s.mix_balance / 100.0);
         (voices, Arc::new(setup))
+    }
+
+    /// 当前合成用的自动平衡数据（强度为 0、或音频还没准备好时没有）。
+    fn cur_balance(&self) -> Option<Arc<BalanceData>> {
+        if self.s.mix_balance <= 0.0 {
+            return None;
+        }
+        let t = self.mix_audio.as_ref().filter(|m| m.paths == self.mix_paths() && m.ch == self.s.file_channel)?.tracks(self.s.mix_align)?;
+        let key = Arc::as_ptr(t.data.first()?) as usize;
+        self.mix_bal.as_ref().filter(|(k, _)| *k == key).map(|(_, b)| b.clone())
+    }
+
+    /// 每帧：自动平衡的输入响度数据跟当前这组音频（对齐与否）不符时重算（由 10 ms 均方算，很快）。强度不影响它。
+    fn sync_balance(&mut self) {
+        if !self.mixing() || self.s.mix_balance <= 0.0 {
+            return;
+        }
+        let Some(t) = self.mix_audio.as_ref().filter(|m| m.paths == self.mix_paths() && m.ch == self.s.file_channel).and_then(|m| m.tracks(self.s.mix_align)) else { return };
+        let Some(first) = t.data.first() else { return };
+        let key = Arc::as_ptr(first) as usize;
+        if self.mix_bal.as_ref().map_or(false, |(k, _)| *k == key) {
+            return;
+        }
+        let lv: Vec<&[f32]> = t.levels.iter().map(|l| l.as_slice()).collect();
+        self.mix_bal = Some((key, balance_data(&lv, &t.lufs)));
     }
 
     /// 合成时各音源此刻的位置 [方位角, 仰角, 距离, 说话活动]：试听中用引擎报告的；没在试听时，各自固定是各自摆好的
@@ -559,9 +643,10 @@ impl App {
         let paths = self.mix_paths();
         let ch = self.s.file_channel;
         let chan = self.file_channel();
+        let align = self.s.mix_align;
         let (tx, rx) = channel();
         std::thread::spawn(move || {
-            let res: Vec<Result<(Arc<Vec<f32>>, Option<f32>), String>> = std::thread::scope(|s| {
+            let res: Vec<Result<(Arc<Vec<f32>>, Option<f32>, Arc<Vec<f32>>), String>> = std::thread::scope(|s| {
                 let hs: Vec<_> = paths
                     .iter()
                     .map(|p| {
@@ -570,7 +655,8 @@ impl App {
                             o.channel = chan;
                             let (m, _) = load_mono(&o, &AtomicBool::new(false)).map_err(|e| format!("{}：{e}", file_name(p)))?;
                             let l = mix::loudness(&m);
-                            Ok((Arc::new(m), l))
+                            let lv = Arc::new(balance::levels(&m));
+                            Ok((Arc::new(m), l, lv))
                         })
                     })
                     .collect();
@@ -578,15 +664,63 @@ impl App {
             });
             let r: MixDecoded = match res.into_iter().collect::<Result<Vec<_>, String>>() {
                 Ok(v) => {
-                    let (data, lufs) = v.into_iter().unzip();
-                    Ok(MixAudio { paths, ch, data, lufs })
+                    let mut data = Vec::new();
+                    let mut lufs = Vec::new();
+                    let mut levels = Vec::new();
+                    for (d, l, lv) in v {
+                        data.push(d);
+                        lufs.push(l);
+                        levels.push(lv);
+                    }
+                    let aligned = align.then(|| AlignedMix::new(&paths, &data));
+                    Ok(MixAudio { paths, ch, data, lufs, levels, aligned })
                 }
                 Err(e) => Err((paths, ch, e)),
             };
             let _ = tx.send(r);
         });
         self.mix_decoding = Some(rx);
-        self.status = t("正在解码要合成的音频…", "Decoding the files to mix…").to_string();
+        self.status = if align { t("正在解码要合成的音频并自动对齐…", "Decoding and aligning the files to mix…") } else { t("正在解码要合成的音频…", "Decoding the files to mix…") }.to_string();
+    }
+
+    /// 已经解码好、还没对齐过：在后台对齐（不用重新解码），结果和解码结果走同一个通道。
+    fn align_mix(&mut self) {
+        let Some(m) = &self.mix_audio else { return };
+        let (paths, ch, data, lufs, levels) = (m.paths.clone(), m.ch, m.data.clone(), m.lufs.clone(), m.levels.clone());
+        let (tx, rx) = channel();
+        std::thread::spawn(move || {
+            let aligned = Some(AlignedMix::new(&paths, &data));
+            let _ = tx.send(Ok(MixAudio { paths, ch, data, lufs, levels, aligned }));
+        });
+        self.mix_decoding = Some(rx);
+        self.status = t("正在自动对齐…", "Aligning…").to_string();
+    }
+
+    /// 打开 / 关闭合成前的自动对齐。合成试听中切换时按新的时间线重新开始（对齐要算的话算完接着播）。
+    fn set_mix_align(&mut self, on: bool) {
+        if on == self.s.mix_align {
+            return;
+        }
+        self.s.mix_align = on;
+        self.mix_trails.clear();
+        // 播放条换成另一条时间线：按第 1 段停在同一处音乐（对齐后的时间 = 原来的时间 − 第 1 段裁掉的开头）
+        if self.rt_mix && self.rt.is_some() {
+            if let Some(rt) = &self.rt {
+                self.preview_s = rt.shared.play_pos.load(Ordering::Relaxed) as f64 / FS as f64;
+            }
+        }
+        self.mix_shift = false;
+        match self.mix_audio.as_ref().map(|m| &m.aligned) {
+            Some(Some(Ok(a))) => {
+                let cut = a.al.starts[0] as f64 / FS as f64;
+                self.preview_s = if on { (self.preview_s - cut).max(0.0) } else { self.preview_s + cut };
+            }
+            Some(None) if on => self.mix_shift = true,
+            _ => {}
+        }
+        if self.rt_mix && self.rt.is_some() {
+            self.start_mix_preview();
+        }
     }
 
     /// 每帧检查：合成的文件组或声道变了就停掉旧的合成试听、重新解码（之前在播的话解码完接着播）；
@@ -605,6 +739,10 @@ impl App {
         let paths = self.mix_paths();
         let ch = self.s.file_channel;
         if self.mix_audio.as_ref().map_or(false, |m| m.paths == paths && m.ch == ch) {
+            // 打开了自动对齐但还没对齐过：在后台先算好（列表下面马上能看到从哪里裁）
+            if self.s.mix_align && self.mix_decoding.is_none() && self.mix_audio.as_ref().map_or(false, |m| m.aligned.is_none()) {
+                self.align_mix();
+            }
             return;
         }
         let resume = self.rt_mix || self.preview_pending;
@@ -626,7 +764,13 @@ impl App {
         self.sync_params();
         let paths = self.mix_paths();
         let ch = self.s.file_channel;
-        let ready = self.mix_audio.as_ref().filter(|m| m.paths == paths && m.ch == ch).map(|m| (m.data.clone(), m.lufs.clone(), m.len()));
+        let decoded = self.mix_audio.as_ref().filter(|m| m.paths == paths && m.ch == ch);
+        let have = decoded.is_some();
+        let ready = decoded.and_then(|m| m.tracks(self.s.mix_align)).map(|t| {
+            let len = t.data.iter().map(|x| x.len()).max().unwrap_or(0);
+            (t.data, t.lufs, len)
+        });
+        self.sync_balance();
         if let Some((data, lufs, len)) = ready {
             let start = ((self.preview_s.max(0.0) * FS as f64) as usize).min(len);
             let (voices, setup) = self.mix_setup(&lufs);
@@ -644,8 +788,12 @@ impl App {
         }
         self.preview_pending = true;
         if self.mix_decoding.is_none() {
-            self.mix_failed = None; // 点了试听：解码失败过的也再试一次
-            self.decode_mix();
+            if have {
+                self.align_mix(); // 解码过了，只差对齐
+            } else {
+                self.mix_failed = None; // 点了试听：解码失败过的也再试一次
+                self.decode_mix();
+            }
         }
     }
 
@@ -659,6 +807,8 @@ impl App {
         let voices = self.mix_voices();
         let inputs: Vec<MixInput> = paths.iter().cloned().zip(voices.iter().copied()).map(|(path, voice)| MixInput { path, voice }).collect();
         let follow = self.s.mix_follow;
+        let align = self.s.mix_align;
+        let mo = MixOptions { follow, align, balance: self.s.mix_balance / 100.0 };
         let offsets = mix::follow_offsets(inputs.len(), follow);
         let list = inputs
             .iter()
@@ -671,6 +821,8 @@ impl App {
             .collect::<Vec<_>>()
             .join("  ");
         let desc = if follow { format!("{}（{}）  {list}", t("一起移动", "moving together"), motion_name(self.s.params.mode)) } else { list };
+        let desc = if align { format!("{}  {desc}", t("自动对齐", "auto-aligned")) } else { desc };
+        let desc = if mo.balance > 0.0 { format!("{} {:.0}%  {desc}", t("自动平衡", "auto-balance"), self.s.mix_balance) } else { desc };
         let opts = self.convert_options(paths[0].clone(), out.clone());
         let job = Job {
             paths: vec![out.clone()],
@@ -684,7 +836,7 @@ impl App {
         };
         let (st, ca, fin, params) = (job.status.clone(), job.cancel.clone(), job.finished.clone(), self.s.params.clone());
         std::thread::spawn(move || {
-            let r = convert_mix(&opts, &inputs, &params, follow, ca, |f, stage| {
+            let r = convert_mix(&opts, &inputs, &params, mo, ca, |f, stage| {
                 if let Ok(mut g) = st[0].lock() {
                     *g = ItemStatus::Running(f, stage.to_string());
                 }
@@ -1481,9 +1633,56 @@ impl App {
                 if follow != self.s.mix_follow {
                     self.set_mix_follow(follow);
                 }
-                let note = if self.s.mix_follow { t("按右侧「左右移动」走，彼此相对", "follows Left / right motion, opposite") } else { t("位置在列表里选或在图上拖", "set in the list or on the map") };
-                ui.label(RichText::new(note).small().weak());
+                // 自动平衡（0 = 关）：和排布放在一行，不多占高度
+                ui.add_space(8.0);
+                ui.label(t("自动平衡", "Balance")).on_hover_text(t(
+                    "让几个声音每一段时间听起来都差不多一样响（比如一左一右时左右两边差不多大）。合成本来就按整段平均响度对齐，但两个声音各自忽远忽近，常常一个退开了另一个正贴着耳朵，内容本身也有响有轻。这里按每个声音此刻听起来多响（空间化之后：输入的 3 秒短时响度 + 它此刻位置带来的增益）往平均拉，最多 ±15 dB，0.25 秒平滑；停顿里的声音不往上拉。数值 = 强度：100% = 一样响，50% = 差距减半，0 = 关闭。一个声音单独退开时也会被补回一部分，所以忽远忽近的响度变化会变小（方向、远耳、音色这些远近线索照常）。试听时实时生效，合成完成后的说明里有平衡前后的响度差",
+                    "Keeps the voices about equally loud at every moment (e.g. left and right sides about the same). The mix already matches their overall loudness, but each voice sways near and far on its own, so often one has pulled back while the other is at the ear, and the content itself gets louder and softer. This pulls each voice toward the average of how loud they sound right now (after spatialization: 3-second input loudness plus the gain of its current position), at most ±15 dB, smoothed over 0.25 s; voices in a pause are not lifted. Value = strength: 100% = equal, 50% = half the gap, 0 = off. A voice that pulls back on its own is partly made up for, so near / far loudness changes get smaller (direction, far-ear and tone cues remain). Works live in Preview; the report after Mix & save shows the gap before and after",
+                ));
+                ui.spacing_mut().slider_width = 90.0;
+                let slider = egui::Slider::new(&mut self.s.mix_balance, 0.0..=100.0)
+                    .step_by(1.0)
+                    .fixed_decimals(0)
+                    .custom_formatter(|x, _| if x < 0.5 { t("0 关", "0 off").to_string() } else { format!("{x:.0}%") })
+                    .custom_parser(|s| s.trim().split(|c: char| !(c.is_ascii_digit() || c == '.')).find(|w| !w.is_empty()).and_then(|w| w.parse::<f64>().ok()));
+                ui.add_enabled(!busy, slider);
             });
+        }
+        // 合成前自动对齐：同一首歌的几个版本（前奏长短不同、编曲不同），从一起开始唱的地方叠加
+        if self.s.mix {
+            ui.horizontal(|ui| {
+                let mut on = self.s.mix_align;
+                let tip = t(
+                    "同一首歌的几个版本（比如一段前奏长、一段前奏短，或者不同的编曲）：按旋律、和弦和节奏自动找到它们一起开始唱的地方，从那里叠加；对不上的开头和结尾裁掉（裁开的地方淡入淡出），下面会写出每段从哪里开始用、裁掉多少。试听和合成并保存用的是同一份对齐结果；「从第几秒 / 处理多少秒」和播放条都按对齐之后的时间算。几段对不上（不像同一首歌）时不裁剪，按原样合成",
+                    "Versions of the same song (one with a long intro and one with a short one, or different arrangements): finds where they sing together from melody, chords and rhythm, mixes them from there and cuts the parts that don't match at the start and end (with short fades). Below it shows where each file starts and how much is cut. Preview and Mix & save use the same alignment; Start, Duration and the timeline count from the aligned start. If the files don't match (not the same song), nothing is cut",
+                );
+                if ui.add_enabled(!busy, egui::Checkbox::new(&mut on, t("自动对齐：同一首歌的几个版本，从一起开始唱的地方叠加", "Auto-align: versions of one song, mixed from where they sing together"))).on_hover_text(tip).changed() {
+                    self.set_mix_align(on);
+                }
+            });
+            if self.s.mix_align && self.mixing() {
+                let paths = self.mix_paths();
+                let ch = self.s.file_channel;
+                let warn = ui.visuals().warn_fg_color;
+                let info = self.mix_audio.as_ref().filter(|m| m.paths == paths && m.ch == ch).and_then(|m| m.aligned.as_ref());
+                match info {
+                    Some(Ok(a)) => {
+                        let names: Vec<String> = paths.iter().map(|p| file_name(p)).collect();
+                        for line in a.al.describe(&names, ENGLISH.load(Ordering::Relaxed)).lines() {
+                            let text = RichText::new(line.trim_start()).small();
+                            let text = if line.contains('!') || line.contains('！') { text.color(warn) } else { text };
+                            ui.add(egui::Label::new(text).wrap());
+                        }
+                    }
+                    Some(Err(e)) => {
+                        ui.add(egui::Label::new(RichText::new(e.as_str()).small().color(warn)).wrap());
+                    }
+                    None => {
+                        let note = if self.mix_decoding.is_some() { t("正在对齐…", "Aligning…") } else { t("解码后自动对齐", "Aligned after decoding") };
+                        ui.label(RichText::new(note).small().weak());
+                    }
+                }
+            }
         }
         // 输出位置：合成时是一个文件；一个文件时可以指定文件名；多个文件时指定文件夹
         if self.mixing() {
@@ -1702,7 +1901,11 @@ impl App {
             };
             let mut r = ui.add_enabled(n_files > 0 && !busy, egui::Button::new(RichText::new(label).strong()).min_size(egui::vec2(120.0, 30.0)));
             if mixing {
-                r = r.on_hover_text(t("把参与合成的音频合成一个双耳 WAV（长度按最长的那个）", "Mixes the files into one binaural WAV (as long as the longest file)"));
+                r = r.on_hover_text(if self.s.mix_align {
+                    t("先自动对齐，再把参与合成的音频合成一个双耳 WAV（长度是对齐后的共同部分；起点和时长按对齐之后的时间算）", "Aligns the files, then mixes them into one binaural WAV (as long as their common part; Start and Duration count from the aligned start)")
+                } else {
+                    t("把参与合成的音频合成一个双耳 WAV（长度按最长的那个）", "Mixes the files into one binaural WAV (as long as the longest file)")
+                });
             }
             if r.clicked() {
                 self.start_convert();
@@ -1713,11 +1916,13 @@ impl App {
                 }
             }
         });
-        let preview_len = if mixing { self.mix_audio.as_ref().map(|m| m.len()) } else { self.decoded.as_ref().map(|(_, _, a)| a.len()) };
+        let preview_len = if mixing { self.mix_audio.as_ref().and_then(|m| m.len(self.s.mix_align)) } else { self.decoded.as_ref().map(|(_, _, a)| a.len()) };
         if let Some(len) = preview_len {
             let duration = len as f64 / FS as f64;
             self.preview_s = self.preview_s.clamp(0.0, duration);
-            ui.label(format!("{}  {} / {}", t("试听位置", "Preview position"), playback_time(self.preview_s), playback_time(duration)));
+            let aligned = mixing && self.s.mix_align && self.mix_audio.as_ref().map_or(false, |m| matches!(m.aligned, Some(Ok(_))));
+            let label = if aligned { t("试听位置（对齐后）", "Preview position (aligned)") } else { t("试听位置", "Preview position") };
+            ui.label(format!("{label}  {} / {}", playback_time(self.preview_s), playback_time(duration)));
             let response = ui.scope(|ui| {
                 ui.spacing_mut().slider_width = ui.available_width().max(1.0);
                 ui.add_enabled(duration > 0.0, egui::Slider::new(&mut self.preview_s, 0.0..=duration).show_value(false))
@@ -2042,9 +2247,17 @@ impl App {
         }
         // 合成试听：参数、位置或音量变了，重新算各音源的配置交给音频线程（文件组变了时 sync_mix 会停掉重来）
         if self.rt_mix && self.rt.is_some() {
-            let lufs = self.mix_audio.as_ref().filter(|m| m.paths == self.mix_paths()).map(|m| m.lufs.clone());
+            let lufs = self.mix_audio.as_ref().filter(|m| m.paths == self.mix_paths()).and_then(|m| m.tracks(self.s.mix_align)).map(|t| t.lufs);
+            self.sync_balance();
+            let bal = self.cur_balance();
             if let Some(lufs) = lufs {
-                if changed || self.mix_sent.as_ref().map_or(true, |(v, _)| *v != self.mix_voices()) {
+                let strength = self.s.mix_balance / 100.0;
+                let bal_changed = self.mix_sent.as_ref().map_or(true, |(_, st)| match (&st.balance, &bal) {
+                    (None, None) => false,
+                    (Some(a), Some(b)) => !Arc::ptr_eq(a, b) || st.balance_strength != strength,
+                    _ => true,
+                });
+                if changed || bal_changed || self.mix_sent.as_ref().map_or(true, |(v, _)| *v != self.mix_voices()) {
                     let (voices, setup) = self.mix_setup(&lufs);
                     if let Some(rt) = &self.rt {
                         rt.set_mix(setup.clone());
@@ -2064,11 +2277,23 @@ impl App {
                 match r {
                     Ok(m) => {
                         if self.mixing() && m.paths == self.mix_paths() && m.ch == self.s.file_channel {
+                            if std::mem::take(&mut self.mix_shift) {
+                                if let Some(Ok(a)) = &m.aligned {
+                                    self.preview_s = (self.preview_s - a.al.starts[0] as f64 / FS as f64).max(0.0);
+                                }
+                            }
+                            let align_err = match &m.aligned {
+                                Some(Err(e)) if self.s.mix_align => Some(e.clone()),
+                                _ => None,
+                            };
                             self.mix_audio = Some(m);
                             if self.preview_pending {
                                 self.start_preview();
                             } else {
                                 self.status = t("要合成的音频已就绪：点「试听」或拖动播放条，几个音频会同时播放", "Files ready to mix: press Preview or drag the timeline to hear them together").to_string();
+                            }
+                            if let Some(e) = align_err {
+                                self.status = format!("{}：{e}", t("自动对齐", "Auto-align"));
                             }
                         }
                         // 否则解码期间文件组或声道变了：丢掉，sync_mix 会按新的重新解码
@@ -2182,7 +2407,7 @@ impl eframe::App for App {
     fn raw_input_hook(&mut self, _ctx: &egui::Context, raw: &mut egui::RawInput) {
         if let (Some((_, frame)), Some([x0, y0, x1, y1])) = (&self.shot, self.shot_drag) {
             let frame = if self.file_in.is_some() {
-                let ready = if self.mixing() { self.mix_audio.is_some() } else { self.decoded.is_some() };
+                let ready = if self.mixing() { self.mix_audio.as_ref().map_or(false, |m| m.tracks(self.s.mix_align).is_some()) } else { self.decoded.is_some() };
                 if !ready {
                     return;
                 }
@@ -2235,6 +2460,7 @@ impl eframe::App for App {
         });
         if self.s.tab == Tab::File {
             self.sync_mix();
+        self.sync_balance();
         }
         egui::Panel::bottom("bottom").show(ui, |ui| {
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -2441,7 +2667,8 @@ fn mix_report_text(rep: &ConvertReport, out: &Path, desc: &str) -> String {
         t("合成", "Mixed"),
         desc,
         if rep.channel_note.is_empty() { String::new() } else { format!("\n{}", rep.channel_note) }
-    )
+    ) + &if rep.align_note.is_empty() { String::new() } else { format!("\n{}", rep.align_note) }
+        + &if rep.balance_note.is_empty() { String::new() } else { format!("\n{}", rep.balance_note) }
 }
 
 fn playback_time(seconds: f64) -> String {

@@ -1,7 +1,10 @@
 //! 文件模式：解码任意常见格式 → 取一个声道 → 48 kHz → 引擎（带约 1 秒预读）→ 精确响度归一化和真峰值限制 → WAV。
-//! 多音频合成（[`convert_mix`]）：几个文件各过一个引擎、各在一个位置，相加之后同样两遍处理。
+//! 多音频合成（[`convert_mix`]）：几个文件各过一个引擎、各在一个位置，相加之后同样两遍处理；
+//! 可以先自动对齐（[`align_tracks`]：同一首歌的几个版本，从一起开始唱的地方叠加）。
 
+use crate::dsp::align::{self, Alignment};
 use crate::dsp::analysis::prescan;
+use crate::dsp::balance::{self, BalanceData};
 use crate::dsp::dynamics::{Limiter, LoudnessMeter, TruePeak};
 use crate::dsp::engine::{Engine, EngineConfig, PostMode};
 use crate::dsp::mix::{self, MixSetup, Mixer, Voice, MAX_VOICES};
@@ -65,6 +68,22 @@ pub fn default_mix_output(first: &Path) -> PathBuf {
     first.with_file_name(format!("{stem}_mix_asmr.wav"))
 }
 
+/// 多音频合成的选项（位置和音量在 [`MixInput`] 里）。
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub struct MixOptions {
+    /// 一起移动（按移动方式一起走、彼此错开 360°/N）；否则各自固定。
+    pub follow: bool,
+    /// 合成前自动对齐（同一首歌的几个版本，从一起开始唱的地方叠加）。
+    pub align: bool,
+    /// 自动平衡的强度（0–1，0 = 关）：按短时响度让几段每一段时间都差不多一样响。
+    pub balance: f32,
+}
+
+/// 由各段的 10 ms 均方和整段响度算出自动平衡要用的输入响度数据（与强度无关）。合成试听和保存共用。
+pub fn balance_data(levels: &[&[f32]], lufs: &[Option<f32>]) -> Arc<BalanceData> {
+    Arc::new(BalanceData::new(levels, &mix::align_db(lufs)))
+}
+
 /// 多音频合成的一个音源：哪个文件、放在哪里、音量增减。
 #[derive(Clone, Debug)]
 pub struct MixInput {
@@ -79,6 +98,10 @@ pub struct ConvertReport {
     pub true_peak_db: f32,
     pub max_gr_db: f32,
     pub channel_note: String,
+    /// 多音频合成·自动对齐的说明：每段从哪里开始用、裁掉多少（没对齐时为空）。
+    pub align_note: String,
+    /// 多音频合成·自动平衡的说明：平衡前后两边的短时响度差（没平衡时为空）。
+    pub balance_note: String,
     pub n_moves: u32,
     pub n_sways: u32,
     /// 从头顶绕的次数、上下换位的次数。
@@ -416,6 +439,8 @@ pub fn convert(opts: &ConvertOptions, params: &Params, cancel: Arc<AtomicBool>, 
         true_peak_db: fin.true_peak_db,
         max_gr_db: fin.max_gr_db,
         channel_note: note,
+        align_note: String::new(),
+        balance_note: String::new(),
         n_moves: eng.tele.n_moves,
         n_sways: eng.tele.n_sways,
         n_tops: eng.tele.n_tops,
@@ -426,11 +451,30 @@ pub fn convert(opts: &ConvertOptions, params: &Params, cancel: Arc<AtomicBool>, 
     })
 }
 
+/// 自动对齐几段整段解码好的单声道音频（见 [`crate::dsp::align`]）：返回对齐、裁剪（裁开处淡入淡出）之后的各段和对齐结果。
+/// 合成试听和"合成并保存"都用它，所以两边听到的是同一份音频。
+/// 有一段和第 1 段对不上（不像同一首歌）时不裁剪，返回错误说明——两边都按没对齐的原样合成，免得错裁掉一大段。
+pub fn align_tracks(monos: &[&[f32]], names: &[String]) -> Result<(Vec<Vec<f32>>, Alignment), String> {
+    let al = align::align(monos)?;
+    if let Some(k) = al.pairs.iter().position(|p| !p.reliable) {
+        let name = |i: usize| names.get(i).cloned().unwrap_or_else(|| format!("第 {} 段", i + 1));
+        return Err(format!("「{}」和「{}」没有明显对得上的地方（可能不是同一首歌），没有对齐、没有裁剪", name(0), name(k + 1)));
+    }
+    let out = monos.iter().enumerate().map(|(k, x)| al.apply(k, x)).collect();
+    Ok((out, al))
+}
+
 /// 多音频合成：`inputs` 里的 2–[`MAX_VOICES`] 个文件各放一个位置（见 [`crate::dsp::mix`]），同时播放，合成一个
 /// 双耳 WAV 写到 `opts.output`。`opts.input` 不用；起点、时长、取哪个声道、位深、目标响度、峰值上限对每个音源都一样。
 /// 输出的长度按最长的那个音源；各音源先按响度对齐，再加各自的音量增减，相加之后与单个文件一样两遍处理。
 /// `follow`：一起移动（按 `params` 的移动方式一起走、彼此错开 360°/N）；否则各自固定在 `inputs` 给的位置。
-pub fn convert_mix(opts: &ConvertOptions, inputs: &[MixInput], params: &Params, follow: bool, cancel: Arc<AtomicBool>, mut progress: impl FnMut(f32, &str)) -> Result<ConvertReport, String> {
+/// `mo.align`：先自动对齐（整段解码后对齐、裁掉对不上的开头和结尾），起点和时长按对齐之后的时间算；
+/// 对齐的说明（每段从哪里开始用、裁掉多少）放在报告的 `align_note` 里。
+/// `mo.balance`：自动平衡（整段算增益曲线，再截起点和时长），说明放在 `balance_note` 里。
+/// 对齐或平衡时整段解码、按整段测响度，和合成试听完全一样；两者都关时和以前一样只解码要处理的那一段。
+pub fn convert_mix(opts: &ConvertOptions, inputs: &[MixInput], params: &Params, mo: MixOptions, cancel: Arc<AtomicBool>, mut progress: impl FnMut(f32, &str)) -> Result<ConvertReport, String> {
+    let (follow, align) = (mo.follow, mo.align);
+    let full = mo.align || mo.balance > 0.0;
     let n = inputs.len();
     if n < 2 {
         return Err("多音频合成至少需要两个音频".into());
@@ -450,6 +494,11 @@ pub fn convert_mix(opts: &ConvertOptions, inputs: &[MixInput], params: &Params, 
         progress(0.05 * k as f32 / n as f32, "读取音频");
         let mut o = opts.clone();
         o.input = inp.path.clone();
+        if full {
+            // 对齐、平衡要看整段（和合成试听解码的一样），起点和时长在之后再截
+            o.start = 0.0;
+            o.duration = None;
+        }
         let name = inp.path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let (m, note) = load_mono(&o, &cancel).map_err(|e| format!("{name}：{e}"))?;
         if !note.is_empty() {
@@ -460,11 +509,54 @@ pub fn convert_mix(opts: &ConvertOptions, inputs: &[MixInput], params: &Params, 
             return Err("已取消".into());
         }
     }
+    let (mut align_note, mut balance_note) = (String::new(), String::new());
+    let lufs: Vec<Option<f32>>;
+    let mut bal: Option<Arc<BalanceData>> = None;
+    let mut s0 = 0usize;
+    if full {
+        let names: Vec<String> = inputs.iter().map(|i| i.path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()).collect();
+        if align {
+            progress(0.05, "自动对齐");
+            let refs: Vec<&[f32]> = monos.iter().map(|m| m.as_slice()).collect();
+            match align_tracks(&refs, &names) {
+                Ok((aligned, al)) => {
+                    align_note = al.describe(&names, false);
+                    monos = aligned;
+                }
+                // 对不上：和合成试听一样，按没对齐的原样合成
+                Err(e) => align_note = format!("自动对齐：{e}"),
+            }
+        }
+        // 响度和平衡曲线按整段算（和合成试听一样），之后再截起点和时长
+        lufs = monos.iter().map(|m| mix::loudness(m)).collect();
+        if mo.balance > 0.0 {
+            progress(0.05, "自动平衡");
+            let lv: Vec<Vec<f32>> = monos.iter().map(|m| balance::levels(m)).collect();
+            let refs: Vec<&[f32]> = lv.iter().map(|l| l.as_slice()).collect();
+            bal = Some(balance_data(&refs, &lufs));
+        }
+        // 起点和时长按对齐之后的时间算（没对齐时就是原来的时间）
+        let len = monos.iter().map(|m| m.len()).max().unwrap_or(0);
+        s0 = (opts.start.max(0.0) * FS as f64) as usize;
+        if s0 >= len {
+            return Err(format!("起点 {:.1} s 超出了长度 {:.1} s", opts.start, len as f64 / FS as f64));
+        }
+        let s1 = opts.duration.map_or(len, |d| (s0 + (d * FS as f64) as usize).min(len));
+        for m in monos.iter_mut() {
+            let e = s1.min(m.len());
+            *m = m[s0.min(e)..e].to_vec();
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err("已取消".into());
+        }
+    } else {
+        lufs = monos.iter().map(|m| mix::loudness(m)).collect();
+    }
     let voices: Vec<Voice> = inputs.iter().map(|i| i.voice).collect();
-    let lufs: Vec<Option<f32>> = monos.iter().map(|m| mix::loudness(m)).collect();
     let base = Arc::new(EngineConfig::new(params.clone(), None));
-    let setup = MixSetup::new(&base, &voices, &lufs, follow, None);
+    let setup = MixSetup::new(&base, &voices, &lufs, follow, None).with_balance(bal, mo.balance);
     let mut mixer = Mixer::new(&setup, PostMode::Offline, 1.0);
+    mixer.seek(s0); // 平衡曲线按整段的位置取
     for (k, m) in monos.iter().enumerate() {
         if let Some((thr, med)) = prescan(m) {
             mixer.engine_mut(k).set_fixed_analysis(thr, med);
@@ -486,6 +578,9 @@ pub fn convert_mix(opts: &ConvertOptions, inputs: &[MixInput], params: &Params, 
         mixer.process_parallel(&ins, ol, or);
     })?;
     let fin = finish(opts, rendered, n_sig, &cancel, &mut progress)?;
+    if mo.balance > 0.0 {
+        balance_note = balance::describe(mo.balance, mixer.balance_stats(), false);
+    }
     let speech = (0..n).map(|k| 100.0 * mixer.engine(k).n_speech as f32 / mixer.engine(k).n_blocks.max(1) as f32).sum::<f32>() / n as f32;
     // 各自固定：各音源的往后让、上下换位次数加起来；一起移动：大家走同一套，报告一份
     let t = if follow { mixer.engine(0).tele } else { mixer.tele };
@@ -495,6 +590,8 @@ pub fn convert_mix(opts: &ConvertOptions, inputs: &[MixInput], params: &Params, 
         true_peak_db: fin.true_peak_db,
         max_gr_db: fin.max_gr_db,
         channel_note: notes.join("\n"),
+        align_note,
+        balance_note,
         n_moves: t.n_moves,
         n_sways: t.n_sways,
         n_tops: t.n_tops,
@@ -509,6 +606,81 @@ pub fn convert_mix(opts: &ConvertOptions, inputs: &[MixInput], params: &Params, 
 mod tests {
     use super::*;
     use crate::cli::test_voice;
+
+    #[test]
+    fn aligned_mix_trims_intro_and_preview_uses_the_same_audio() {
+        use crate::dsp::align::tests::test_song;
+        let dir = std::env::temp_dir().join(format!("auto_asmr_align_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A：6 秒前奏 + 歌；B：同一首歌（没有前奏）+ 2 秒别的结尾
+        let song = test_song(20.0, 21);
+        let a: Vec<f32> = test_song(6.0, 22).into_iter().chain(song.iter().copied()).collect();
+        let b: Vec<f32> = song.iter().copied().chain(test_song(2.0, 23)).collect();
+        let (pa, pb) = (dir.join("a.wav"), dir.join("b.wav"));
+        write_wav(&pa, &a);
+        write_wav(&pb, &b);
+        let inputs = [MixInput { path: pa.clone(), voice: Voice::preset(0) }, MixInput { path: pb.clone(), voice: Voice::preset(1) }];
+        let mut opts = ConvertOptions::new(pa.clone());
+        opts.output = dir.join("mix.wav");
+        let run = |o: &ConvertOptions| convert_mix(o, &inputs, &Params::default(), MixOptions { align: true, ..Default::default() }, Arc::new(AtomicBool::new(false)), |_, _| {}).unwrap();
+        // 长度 = 共同部分（20 秒）；说明里写出 A 从 6 秒开始、B 的结尾裁掉 2 秒
+        let rep = run(&opts);
+        assert!((rep.seconds - 20.0).abs() < 0.02, "{}", rep.seconds);
+        assert!(rep.align_note.contains("a.wav：从 0:06.00 开始（裁掉开头 6.00 s）"), "{}", rep.align_note);
+        assert!(rep.align_note.contains("b.wav：开头不裁，用到 0:20.00（裁掉结尾 2.00 s）"), "{}", rep.align_note);
+        // 起点和时长按对齐之后的时间算
+        let mut part = opts.clone();
+        part.start = 2.0;
+        part.duration = Some(5.0);
+        assert!((run(&part).seconds - 5.0).abs() < 0.02);
+        // 试听：整段解码（和界面的 decode_mix 一样）再用同一个函数对齐，结果与合成时用的一致
+        let ma = load_mono(&ConvertOptions::new(pa.clone()), &AtomicBool::new(false)).unwrap().0;
+        let mb = load_mono(&ConvertOptions::new(pb.clone()), &AtomicBool::new(false)).unwrap().0;
+        let (tr, al) = align_tracks(&[&ma, &mb], &["a.wav".into(), "b.wav".into()]).unwrap();
+        assert_eq!(al.starts, vec![6 * FS_USIZE, 0]);
+        assert_eq!((tr[0].len(), tr[1].len()), (20 * FS_USIZE, 20 * FS_USIZE));
+        assert_eq!(al.describe(&["a.wav".into(), "b.wav".into()], false), rep.align_note);
+        // 对不上的两段：不裁剪，按原样合成（长度按最长的），说明里写出原因
+        let pc = dir.join("c.wav");
+        write_wav(&pc, &test_song(15.0, 99));
+        let other = [inputs[0].clone(), MixInput { path: pc.clone(), voice: Voice::preset(1) }];
+        let r2 = convert_mix(&opts, &other, &Params::default(), MixOptions { align: true, ..Default::default() }, Arc::new(AtomicBool::new(false)), |_, _| {}).unwrap();
+        assert!((r2.seconds - 26.0).abs() < 0.02 && r2.align_note.contains("没有对齐"), "{} {}", r2.seconds, r2.align_note);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn balanced_mix_keeps_left_and_right_about_equal() {
+        let dir = std::env::temp_dir().join(format!("auto_asmr_balance_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // A（左耳）一直正常；B（右耳）同样在说，但后一半轻 12 dB：整段对齐只能各补一半，每一半里还是一边响一边轻
+        let v = test_voice(24.0);
+        let half = v.len() / 2;
+        let b: Vec<f32> = v.iter().enumerate().map(|(i, &x)| if i < half { x } else { 0.25 * x }).collect();
+        let (pa, pb) = (dir.join("a.wav"), dir.join("b.wav"));
+        write_wav(&pa, &v);
+        write_wav(&pb, &b);
+        let inputs = [MixInput { path: pa.clone(), voice: Voice::preset(0) }, MixInput { path: pb.clone(), voice: Voice::preset(1) }];
+        let gap = |strength: f32| {
+            let mut opts = ConvertOptions::new(pa.clone());
+            opts.output = dir.join(format!("mix_{strength}.wav"));
+            let rep = convert_mix(&opts, &inputs, &Params::default(), MixOptions { balance: strength, ..Default::default() }, Arc::new(AtomicBool::new(false)), |_, _| {}).unwrap();
+            let (l, r) = read_stereo(&opts.output);
+            // 每 2 秒左右两边的响度差（跳过开头 2 秒）
+            let s = 2 * FS_USIZE;
+            let e = |x: &[f32], i: usize| 10.0 * (x[i * s..(i + 1) * s].iter().map(|v| (v * v) as f64).sum::<f64>() + 1e-12).log10();
+            let mut d: Vec<f64> = (1..l.len() / s).map(|i| (e(&l, i) - e(&r, i)).abs()).collect();
+            d.sort_by(f64::total_cmp);
+            (d[d.len() / 2], rep)
+        };
+        let (off, r0) = gap(0.0);
+        let (on, r1) = gap(1.0);
+        assert!(off > 4.0, "不平衡时左右中位差 {off:.1} dB");
+        assert!(on < 2.0, "平衡后左右中位差 {on:.1} dB");
+        assert!(r0.balance_note.is_empty() && r1.balance_note.starts_with("自动平衡 100%"), "{}", r1.balance_note);
+        assert!((r1.lufs - r0.lufs).abs() < 0.5 && r1.seconds == r0.seconds);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 
     fn write_wav(path: &Path, x: &[f32]) {
         let spec = hound::WavSpec { channels: 1, sample_rate: FS_USIZE as u32, bits_per_sample: 32, sample_format: hound::SampleFormat::Float };
@@ -539,7 +711,7 @@ mod tests {
         let mut opts = ConvertOptions::new(pa.clone());
         opts.output = out.clone();
         let inputs = [MixInput { path: pa.clone(), voice: Voice::preset(0) }, MixInput { path: pb.clone(), voice: Voice::preset(1) }];
-        let rep = convert_mix(&opts, &inputs, &Params::default(), false, Arc::new(AtomicBool::new(false)), |_, _| {}).unwrap();
+        let rep = convert_mix(&opts, &inputs, &Params::default(), MixOptions::default(), Arc::new(AtomicBool::new(false)), |_, _| {}).unwrap();
         // 长度按最长的 B；响度精确归一化到目标
         assert!((rep.seconds - 12.0).abs() < 0.05, "{}", rep.seconds);
         assert!((rep.lufs - opts.lufs).abs() < 0.5, "{}", rep.lufs);
@@ -555,15 +727,15 @@ mod tests {
         // 一起移动：同样长度和响度；两个音源走同一套，所以报告的换耳次数就是一个音源的
         let mut fo = opts.clone();
         fo.output = dir.join("mix_follow.wav");
-        let rf = convert_mix(&fo, &inputs, &Params::default(), true, Arc::new(AtomicBool::new(false)), |_, _| {}).unwrap();
+        let rf = convert_mix(&fo, &inputs, &Params::default(), MixOptions { follow: true, ..Default::default() }, Arc::new(AtomicBool::new(false)), |_, _| {}).unwrap();
         assert!((rf.seconds - 12.0).abs() < 0.05 && (rf.lufs - opts.lufs).abs() < 0.5, "{} s {} LUFS", rf.seconds, rf.lufs);
         assert!(rf.n_moves >= 1, "一起移动应当换过边：{}", rf.n_moves);
         assert_eq!(rep.n_moves, 0, "各自固定不换边");
         // 只给一个音源、输出覆盖输入：拒绝
-        assert!(convert_mix(&opts, &inputs[..1], &Params::default(), false, Arc::new(AtomicBool::new(false)), |_, _| {}).is_err());
+        assert!(convert_mix(&opts, &inputs[..1], &Params::default(), MixOptions::default(), Arc::new(AtomicBool::new(false)), |_, _| {}).is_err());
         let mut bad = opts.clone();
         bad.output = pb.clone();
-        assert!(convert_mix(&bad, &inputs, &Params::default(), false, Arc::new(AtomicBool::new(false)), |_, _| {}).is_err());
+        assert!(convert_mix(&bad, &inputs, &Params::default(), MixOptions::default(), Arc::new(AtomicBool::new(false)), |_, _| {}).is_err());
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

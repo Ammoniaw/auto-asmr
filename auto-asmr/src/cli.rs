@@ -1,11 +1,11 @@
-//! 命令行：不带参数启动图形界面；`convert` 转换文件；`devices` 列出音频设备；`bench` 测处理速度。
+//! 命令行：不带参数启动图形界面；`convert` 转换文件；`align` 看几段音频怎么对齐；`devices` 列出音频设备；`bench` 测处理速度。
 
 use crate::dsp::engine::{Engine, EngineConfig, PostMode};
 use crate::dsp::mix::{self, Voice, MAX_VOICES, PRESETS};
 use crate::dsp::params::{MotionMode, Params, Playback, Via};
 use crate::dsp::tables::tables;
 use crate::dsp::{FS, FS_USIZE, R_MAX, R_MIN};
-use crate::offline::{convert, convert_mix, default_mix_output, default_output, Channel, ConvertOptions, MixInput};
+use crate::offline::{convert, convert_mix, default_mix_output, default_output, Channel, ConvertOptions, MixInput, MixOptions};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -17,6 +17,7 @@ pub const HELP: &str = "auto-asmr —— KU100 双耳 ASMR 空间化（纯 CPU�
   auto-asmr convert <输入> [选项]    转换一个音频文件（wav / m4a / mp3 / flac / ogg …），输出 WAV
   auto-asmr convert <输入1> <输入2> … [选项]   批量转换：多个文件或文件夹，多线程并行
   auto-asmr convert <输入1> <输入2> --mix [选项]   多音频合成：2–4 个音频各放一个位置（默认一左一右），合成一个文件
+  auto-asmr align <输入1> <输入2> … [--channel …]   只看自动对齐的结果：每段从哪里开始用、裁掉多少（不输出音频）
   auto-asmr devices                  列出本机的音频输入 / 输出设备
   auto-asmr bench                    测试处理速度
 
@@ -31,6 +32,10 @@ convert 的选项（括号里是默认值）：
                           back-left / back-right（也可写 左耳 / 右耳 / 正前 / 正后 / 左前 / 右前 / 左后 / 右后），
                           或“方位角[:到头中心的距离 米]”，如 270、45:0.3（0 前 90 右 180 后 270 左）。默认 left,right,front,back
   --mix-gain <dB,…>       各音源的音量增减，在自动对齐响度之后再加（默认都是 0），如 0,-3
+  --mix-align             自动对齐：同一首歌的几个版本（前奏长短不同、编曲不同都行），自动找到一起开始唱的地方，
+                          从那里叠加，对不上的开头和结尾裁掉；--start / --duration 按对齐之后的时间算
+  --mix-balance [0–100]   自动平衡（关）：按短时响度让几段每一段时间都差不多一样响（比如一左一右时左右差不多大），
+                          在空间化之前补，忽远忽近照常；数值 = 强度 %，100 = 一样响，50 = 差距减半；不写数值 = 100
   --mix-follow            一起移动：几个音源按 --mode 的方式（穿梭 / 随机走位 / 环绕 / 固定）一起走，彼此相隔 360°/个数
                           （两个时正好相对：一个贴左耳时另一个贴右耳，换边时一个从脸前、一个从脑后绕）；不加就是各自固定
   --style ear|ku100|earclean   ear=贴耳加强；ku100=像真实 KU100 轻语实录（远耳听得到、真实房间、像真人一样随机走位，
@@ -136,6 +141,13 @@ pub fn run(args: Vec<String>) -> i32 {
                 2
             }
         },
+        "align" => match run_align(&args[1..]) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("错误：{e}");
+                2
+            }
+        },
         "decode" => match run_decode(&args[1..]) {
             Ok(()) => 0,
             Err(e) => {
@@ -208,7 +220,8 @@ fn run_convert(args: &[String]) -> Result<(), String> {
     let (mut earclean, mut style_ku) = (false, false);
     let mut level_follow: Option<f32> = None;
     let mut save_traj: Option<PathBuf> = None;
-    let (mut mix_on, mut mix_follow) = (false, false);
+    let (mut mix_on, mut mix_follow, mut mix_align) = (false, false, false);
+    let mut mix_balance = 0.0f32;
     let (mut pos_list, mut gain_list): (Option<String>, Option<String>) = (None, None);
     // 风格先生效，后面的参数再覆盖
     if let Some(i) = args.iter().position(|a| a == "--style") {
@@ -235,6 +248,14 @@ fn run_convert(args: &[String]) -> Result<(), String> {
             "-j" | "--jobs" => jobs = (f(&mut it)? as usize).max(1),
             "--mix" => mix_on = true,
             "--mix-follow" => mix_follow = true,
+            "--mix-align" => mix_align = true,
+            "--mix-balance" => {
+                mix_balance = 100.0;
+                if let Some(v) = it.peek().and_then(|s| s.parse::<f32>().ok()) {
+                    mix_balance = v.clamp(0.0, 100.0);
+                    it.next();
+                }
+            }
             "--pos" => pos_list = Some(it.next().ok_or("--pos 后面缺少位置")?.clone()),
             "--mix-gain" => gain_list = Some(it.next().ok_or("--mix-gain 后面缺少数值")?.clone()),
             "--style" => {
@@ -242,15 +263,7 @@ fn run_convert(args: &[String]) -> Result<(), String> {
             }
             "--start" => start = f(&mut it)? as f64,
             "--duration" => duration = Some(f(&mut it)? as f64),
-            "--channel" => {
-                channel = match it.next().map(|s| s.as_str()) {
-                    Some("auto") => Channel::Auto,
-                    Some("left") => Channel::Left,
-                    Some("right") => Channel::Right,
-                    Some("mix") => Channel::Mix,
-                    _ => return Err("--channel 只能是 auto / left / right / mix".into()),
-                }
-            }
+            "--channel" => channel = parse_channel(it.next().map(|s| s.as_str()).unwrap_or(""))?,
             "--dist" => p.ear_dist = f(&mut it)?.clamp(0.095, 1.0),
             "--isolation" => p.isolation_db = f(&mut it)?,
             "--presence" => p.presence_db = f(&mut it)?,
@@ -394,8 +407,8 @@ fn run_convert(args: &[String]) -> Result<(), String> {
     if earclean && !lufs_set {
         lufs = crate::dsp::params::EARCLEAN_LUFS;
     }
-    if (pos_list.is_some() || gain_list.is_some() || mix_follow) && !mix_on {
-        return Err("--pos / --mix-gain / --mix-follow 只用于多音频合成，请同时加 --mix".into());
+    if (pos_list.is_some() || gain_list.is_some() || mix_follow || mix_align || mix_balance > 0.0) && !mix_on {
+        return Err("--pos / --mix-gain / --mix-follow / --mix-align / --mix-balance 只用于多音频合成，请同时加 --mix".into());
     }
     if mix_follow && pos_list.is_some() {
         return Err("一起移动时位置由 --mode 的走位决定，不能再用 --pos".into());
@@ -453,7 +466,14 @@ fn run_convert(args: &[String]) -> Result<(), String> {
             eprintln!("  {}. {}（{pos}）", k + 1, it.path.display());
         }
         let mut last = -1i32;
-        let rep = convert_mix(&opts, &items, &p, mix_follow, Arc::new(AtomicBool::new(false)), |f, stage| {
+        if mix_align {
+            eprintln!("  先自动对齐（--start / --duration 按对齐之后的时间算）");
+        }
+        if mix_balance > 0.0 {
+            eprintln!("  自动平衡 {mix_balance:.0}%（按短时响度让几段一样响）");
+        }
+        let mo = MixOptions { follow: mix_follow, align: mix_align, balance: mix_balance / 100.0 };
+        let rep = convert_mix(&opts, &items, &p, mo, Arc::new(AtomicBool::new(false)), |f, stage| {
             let pc = (f * 100.0) as i32;
             if pc / 10 != last / 10 {
                 eprintln!("  {stage} {pc}%");
@@ -462,6 +482,12 @@ fn run_convert(args: &[String]) -> Result<(), String> {
         })?;
         if !rep.channel_note.is_empty() {
             println!("{}", rep.channel_note);
+        }
+        if !rep.align_note.is_empty() {
+            println!("{}", rep.align_note);
+        }
+        if !rep.balance_note.is_empty() {
+            println!("{}", rep.balance_note);
         }
         println!(
             "完成：{}  ({:.1} s，{:.1} LUFS，真峰值 {:.1} dBTP，限制器最多压 {:.1} dB；说话平均占 {:.0}%，{}；用时 {:.1} s)",
@@ -773,6 +799,62 @@ fn run_rt_sim(args: &[String]) -> Result<(), String> {
 
 /// 调试用：只解码并取成 48 kHz 单声道，写成 WAV（用来核对解码器）。
 /// 加 `--denoise [dB]` 时再过一遍输入降噪（不做空间化），可以单独听降噪的效果。
+fn parse_channel(s: &str) -> Result<Channel, String> {
+    match s {
+        "auto" => Ok(Channel::Auto),
+        "left" => Ok(Channel::Left),
+        "right" => Ok(Channel::Right),
+        "mix" => Ok(Channel::Mix),
+        _ => Err("--channel 只能是 auto / left / right / mix".into()),
+    }
+}
+
+/// `align`：整段解码几段音频（和合成试听一样），自动对齐，打印每段从哪里开始用、裁掉多少，以及各项得分。
+fn run_align(args: &[String]) -> Result<(), String> {
+    let mut inputs: Vec<PathBuf> = Vec::new();
+    let mut channel = Channel::Auto;
+    let mut it = args.iter();
+    while let Some(a) = it.next() {
+        match a.as_str() {
+            "--channel" => channel = parse_channel(it.next().map(|s| s.as_str()).unwrap_or(""))?,
+            s if s.starts_with('-') => return Err(format!("align 不认识的选项：{s}")),
+            s => inputs.push(PathBuf::from(s)),
+        }
+    }
+    if inputs.len() < 2 || inputs.len() > MAX_VOICES {
+        return Err(format!("align 需要 2–{MAX_VOICES} 个音频"));
+    }
+    let t0 = std::time::Instant::now();
+    let mut monos = Vec::new();
+    for p in &inputs {
+        let mut o = ConvertOptions::new(p.clone());
+        o.channel = channel;
+        let (m, _) = crate::offline::load_mono(&o, &AtomicBool::new(false)).map_err(|e| format!("{}：{e}", p.display()))?;
+        monos.push(m);
+    }
+    let t1 = std::time::Instant::now();
+    let refs: Vec<&[f32]> = monos.iter().map(|m| m.as_slice()).collect();
+    let al = crate::dsp::align::align(&refs)?;
+    let names: Vec<String> = inputs.iter().map(|p| p.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()).collect();
+    println!("{}", al.describe(&names, false));
+    for (k, q) in al.pairs.iter().enumerate() {
+        println!(
+            "  第 {} 段相对第 1 段：偏移 {:+.4} s（{}），得分 {:.3}（次好 {:.3}，{:.2} 倍），重叠部分相关 {:.2}，几处偏移相差 {:.1} ms，{}",
+            k + 2,
+            q.offset as f64 / FS as f64,
+            if q.exact { "逐样本" } else { "按起音包络" },
+            q.score,
+            q.second,
+            q.score / q.second.max(1e-6),
+            q.local_r,
+            q.drift_ms,
+            if q.reliable { "可靠" } else { "不可靠" }
+        );
+    }
+    println!("解码 {:.2} s，对齐 {:.2} s", (t1 - t0).as_secs_f64(), t1.elapsed().as_secs_f64());
+    Ok(())
+}
+
 fn run_decode(args: &[String]) -> Result<(), String> {
     let input = PathBuf::from(args.first().ok_or("缺少输入文件")?);
     let out = args.iter().position(|a| a == "-o").and_then(|i| args.get(i + 1)).map(PathBuf::from).unwrap_or_else(|| input.with_extension("decoded.wav"));

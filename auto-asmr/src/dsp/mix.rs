@@ -10,6 +10,7 @@
 //! 各音源先按输入响度（BS.1770 积分响度）对齐到同样响，再加上各自的音量增减；相加之后整体收尾——
 //! 文件转换是两遍精确归一化（与转换单个文件相同），试听是自动响度 + 限制器（与单个文件的实时引擎相同）。
 
+use super::balance::{BalanceData, Balancer};
 use super::dynamics::{Leveler, Limiter, LoudnessMeter};
 use super::engine::{Engine, EngineConfig, PostMode, Telemetry};
 use super::filters::ema_coef;
@@ -107,6 +108,9 @@ pub struct MixSetup {
     pub offsets: Vec<f32>,
     /// 一起移动：几个音源共用一个说话时钟、同一套走位，位置按 `offsets` 错开。
     pub follow: bool,
+    /// 自动平衡：各音源事先由整段算好的输入响度（None = 不平衡）和强度（0–1）。
+    pub balance: Option<Arc<BalanceData>>,
+    pub balance_strength: f32,
 }
 
 impl MixSetup {
@@ -116,7 +120,14 @@ impl MixSetup {
         let n = voices.len();
         // 一起移动：每个音源都直接用总配置（同一个移动方式、同一个随机种子）
         let cfgs = if follow { vec![base.clone(); n] } else { voice_configs(base, voices, prev) };
-        MixSetup { cfgs, gains: balance_gains(lufs, voices), offsets: follow_offsets(n, follow), follow }
+        MixSetup { cfgs, gains: balance_gains(lufs, voices), offsets: follow_offsets(n, follow), follow, balance: None, balance_strength: 0.0 }
+    }
+
+    /// 加上自动平衡（强度 0–1；为 0 或没有数据时不平衡）。
+    pub fn with_balance(mut self, data: Option<Arc<BalanceData>>, strength: f32) -> Self {
+        self.balance = data.filter(|_| strength > 0.0);
+        self.balance_strength = strength;
+        self
     }
 }
 
@@ -153,16 +164,15 @@ pub fn loudness(x: &[f32]) -> Option<f32> {
 
 /// 各音源的线性增益：先把响度对齐到各音源的平均响度（最多拉 ±30 dB；无声的音源不动），再加各自的音量增减。
 pub fn balance_gains(lufs: &[Option<f32>], voices: &[Voice]) -> Vec<f32> {
+    let align = align_db(lufs);
+    voices.iter().enumerate().map(|(k, v)| db_to_lin(align.get(k).copied().unwrap_or(0.0) + v.gain_db)).collect()
+}
+
+/// 只是响度对齐的那部分（dB，不含各自的音量增减）：自动平衡在它之上再按短时响度补。
+pub fn align_db(lufs: &[Option<f32>]) -> Vec<f32> {
     let known: Vec<f32> = lufs.iter().flatten().copied().collect();
     let mean = if known.is_empty() { 0.0 } else { known.iter().sum::<f32>() / known.len() as f32 };
-    voices
-        .iter()
-        .enumerate()
-        .map(|(k, v)| {
-            let align = lufs.get(k).copied().flatten().map_or(0.0, |l| (mean - l).clamp(-30.0, 30.0));
-            db_to_lin(align + v.gain_db)
-        })
-        .collect()
+    lufs.iter().map(|l| l.map_or(0.0, |l| (mean - l).clamp(-30.0, 30.0))).collect()
 }
 
 /// 每次最多处理多少样本（更长的输入分段处理，音频线程里不分配内存）。
@@ -183,6 +193,11 @@ pub struct Mixer {
     leveler: Leveler,
     limiter: Limiter,
     buf: Vec<[Vec<f32>; 2]>,
+    /// 自动平衡：输入响度数据、强度、运行状态，以及下一个输入样本在各音频里的位置（试听每块由 [`Mixer::seek`] 设）。
+    bal_data: Option<Arc<BalanceData>>,
+    bal_strength: f32,
+    balancer: Balancer,
+    pos: usize,
     out_pk: f32,
     /// 给界面显示的合成状态：输入取各音源中最大的，输出、限幅、自动响度是相加之后的；位置是第 0 个音源的。
     pub tele: Telemetry,
@@ -210,6 +225,10 @@ impl Mixer {
             leveler: Leveler::new(),
             limiter: Limiter::new(2.0, 80.0),
             buf: (0..n).map(|_| [vec![0.0; SCRATCH], vec![0.0; SCRATCH]]).collect(),
+            bal_data: setup.balance.clone(),
+            bal_strength: setup.balance_strength,
+            balancer: Balancer::new(n),
+            pos: 0,
             out_pk: 0.0,
             tele: Telemetry::default(),
         }
@@ -239,6 +258,18 @@ impl Mixer {
         if let Some(c) = setup.cfgs.first() {
             self.cfg = c.clone();
         }
+        self.bal_data = setup.balance.clone();
+        self.bal_strength = setup.balance_strength;
+    }
+
+    /// 自动平衡的统计：几个声音都在出声时最响和最轻相差多少，平衡前、后的（中位数, 90% 分位）dB。
+    pub fn balance_stats(&self) -> Option<((f32, f32), (f32, f32))> {
+        self.balancer.stats()
+    }
+
+    /// 下一块输入从各音频的第几个样本开始（自动平衡按它取输入响度）。文件转换从截取的起点开始；试听每块都设一次。
+    pub fn seek(&mut self, pos: usize) {
+        self.pos = pos;
     }
 
     /// 算法延时（样本）：各引擎相同，实时模式再加限制器的前瞻。
@@ -265,6 +296,7 @@ impl Mixer {
             self.block(inputs, o, m, &mut out_l[o..o + m], &mut out_r[o..o + m], par);
             o += m;
         }
+        self.pos += n;
     }
 
     fn block(&mut self, inputs: &[&[f32]], o: usize, m: usize, out_l: &mut [f32], out_r: &mut [f32], par: bool) {
@@ -302,6 +334,11 @@ impl Mixer {
             for (k, (eng, [bl, br])) in self.engines.iter_mut().zip(self.buf.iter_mut()).enumerate() {
                 eng.process(input(k), &mut bl[..m], &mut br[..m]);
             }
+        }
+        // 自动平衡：各音源空间化之后、相加之前，按此刻听起来多响补增益（引擎有时延：这一块输出对应更早的输入）
+        if let Some(d) = &self.bal_data {
+            let in_pos = (self.pos + o) as i64 - self.engines[0].latency_samples() as i64;
+            self.balancer.process(d, self.bal_strength, in_pos, &mut self.buf, m);
         }
         out_l.fill(0.0);
         out_r.fill(0.0);
@@ -372,7 +409,7 @@ mod tests {
 
     fn setup(voices: &[Voice], gains: Vec<f32>) -> MixSetup {
         let base = EngineConfig::new(Params::default(), None);
-        MixSetup { cfgs: voice_configs(&base, voices, None), gains, offsets: vec![0.0; voices.len()], follow: false }
+        MixSetup { cfgs: voice_configs(&base, voices, None), gains, offsets: vec![0.0; voices.len()], follow: false, balance: None, balance_strength: 0.0 }
     }
 
     fn energy(v: &[f32]) -> f64 {
@@ -482,7 +519,7 @@ mod tests {
         // 滤波器直接共用总参数里算好的，不重算
         assert!(Arc::ptr_eq(cfgs[1].derived.ear_eq.as_ref().unwrap(), base.derived.ear_eq.as_ref().unwrap()));
         // 参数没变的音源原样复用
-        let prev = MixSetup { cfgs: cfgs.clone(), gains: vec![1.0; 2], offsets: vec![0.0; 2], follow: false };
+        let prev = MixSetup { cfgs: cfgs.clone(), gains: vec![1.0; 2], offsets: vec![0.0; 2], follow: false, balance: None, balance_strength: 0.0 };
         let again = voice_configs(&base, &voices, Some(&prev));
         assert!(Arc::ptr_eq(&again[0], &cfgs[0]) && Arc::ptr_eq(&again[1], &cfgs[1]));
     }

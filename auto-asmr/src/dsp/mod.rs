@@ -1,6 +1,8 @@
 //! 信号处理核心：与 Python 版 `asmr_binaural.py` 同一套算法，改写成可以逐块流式运行的形式，
 //! 实时模式和文件模式共用同一个 [`engine::Engine`]。
 
+pub mod align;
+pub mod balance;
 pub mod analysis;
 pub mod direct;
 pub mod dynamics;

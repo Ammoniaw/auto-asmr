@@ -566,6 +566,10 @@ impl Pump {
                         }
                     } else {
                         let ins: [&[f32]; MAX_VOICES] = std::array::from_fn(|k| self.inbs.get(k).map_or(&[][..], |b| &b[..N]));
+                        // 自动平衡按这一块在各音频里的位置取增益（拖动播放条后也对得上）
+                        if let Source::Multi { pos, .. } = &self.src {
+                            mx.seek(pos.saturating_sub(N));
+                        }
                         mx.process(&ins[..self.inbs.len().min(MAX_VOICES)], &mut self.el[..N], &mut self.er[..N]);
                     }
                 }
@@ -914,7 +918,7 @@ mod tests {
         let x = crate::cli::test_voice(8.0);
         let len = x.len();
         let base = EngineConfig::new(Params { auto_level: false, ..Params::default() }, None);
-        let setup = |v: [Voice; 2]| Arc::new(MixSetup { cfgs: voice_configs(&base, &v, None), gains: vec![1.0, 1.0], offsets: vec![0.0; 2], follow: false });
+        let setup = |v: [Voice; 2]| Arc::new(MixSetup { cfgs: voice_configs(&base, &v, None), gains: vec![1.0, 1.0], offsets: vec![0.0; 2], follow: false, balance: None, balance_strength: 0.0 });
         let first = setup([Voice::preset(0), Voice::preset(1)]);
         let shared = Arc::new(Shared::new(first.cfgs[0].clone()));
         *shared.mix.lock().unwrap() = Some(first.clone());

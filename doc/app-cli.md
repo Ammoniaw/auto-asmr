@@ -30,6 +30,26 @@ auto-asmr convert a.m4a b.m4a --mix -o 合成.wav --pos left,right --mix-gain 0,
 auto-asmr convert a.m4a b.m4a --mix --mix-follow --mode orbit -o 合成_环绕.wav
 ```
 
+同一首歌的几个版本（前奏长短不同、编曲不同）加 `--mix-align` 自动对齐：从一起开始唱的地方叠加，对不上的开头和结尾裁掉，`--start` / `--duration` 按对齐之后的时间算；完成后打印每段从哪里开始用、裁掉多少（做法见[界面使用说明 · 自动对齐](app-usage.md#自动对齐同一首歌的几个版本)）：
+
+```bash
+auto-asmr convert 摇滚版.m4a DJ版.m4a --mix --mix-align --duration 60 -o 合成.wav
+```
+
+自动平衡（让几个声音每一段时间都差不多一样响，比如一左一右时左右差不多大）加 `--mix-balance`，后面的数值是强度 %（不写就是 100）；完成后打印平衡前后的响度差（做法见[界面使用说明 · 自动平衡](app-usage.md#自动平衡让左右两边差不多大)）：
+
+```bash
+auto-asmr convert a.m4a b.m4a --mix --mix-balance 80 -o 合成.wav
+```
+
+只想先看怎么对齐、不输出音频：
+
+```bash
+auto-asmr align 摇滚版.m4a DJ版.m4a
+```
+
+它还会打印偏移、是否逐样本、得分与次好得分之比、重叠部分的相关和几处偏移相差多少，用来判断结果可不可靠。
+
 ```bash
 auto-asmr --help
 ```
