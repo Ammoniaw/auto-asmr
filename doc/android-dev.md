@@ -97,7 +97,7 @@ adb push target/aarch64-linux-android/release/examples/bench /data/local/tmp/asm
 
 ## 发布
 
-推送 tag 时，`.github/workflows/release.yml` 的 Android 任务会装好 SDK 组件、Rust 1.95 和两个安卓目标，跑 Rust 测试，用 `assembleRelease` 打 APK（版本名 = tag 名，版本号 = Actions 的运行序号），和 Windows / Linux 版一起放进 GitHub Release（`auto-asmr-android.apk`）。
+推送 tag 时，`.github/workflows/release.yml` 的 Android 任务会装好 SDK 组件、Rust 最新稳定版和两个安卓目标，跑 Rust 测试，用 `assembleRelease` 打 APK（版本名 = tag 名，版本号 = Actions 的运行序号），和其它版本一起放进 GitHub Release（`auto-asmr-android.apk`）。
 
 **签名密钥**：安卓只允许用同一把密钥签名的新版本覆盖安装旧版本，所以要准备一把固定的密钥，放进仓库的 Secrets。只需要做一次：
 

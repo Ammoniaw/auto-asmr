@@ -1,4 +1,4 @@
-name: Windows, Linux and Android Release
+name: Windows, Linux, Android and Browser Extension Release
 
 on:
   push:
@@ -143,17 +143,18 @@ jobs:
           "$SDKM" --install "platforms;android-37.2" "build-tools;36.0.0" "cmake;3.31.6" "ndk;29.0.14206865" > /dev/null
           echo "sdk.dir=$ANDROID_HOME" > local.properties
 
-      - name: Install Rust 1.95 with Android targets
+      # 安卓和插件的 Rust 代码是在最新稳定版上开发、测试的，用 stable（桌面版两个任务仍固定 1.95.0）
+      - name: Install Rust stable with Android targets
         run: |
-          rustup toolchain install 1.95.0 --profile minimal --no-self-update
-          rustup target add aarch64-linux-android armv7-linux-androideabi --toolchain 1.95.0
-          rustup default 1.95.0
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add aarch64-linux-android armv7-linux-androideabi --toolchain stable
+          rustup default stable
 
       - name: Cache Rust dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: auto-asmr-android/rust -> target
-          key: android-rust-1.95.0
+          key: android-rust-stable
 
       - name: Run Rust tests
         run: cargo test --release --locked --manifest-path rust/Cargo.toml
@@ -192,9 +193,87 @@ jobs:
           path: dist/auto-asmr-android.apk
           if-no-files-found: error
 
+  build-chromium:
+    name: Test and build browser extension
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+        working-directory: auto-asmr-chromium
+    steps:
+      - name: Check out tagged source
+        uses: actions/checkout@v4
+
+      - name: Install Rust stable with the wasm target
+        run: |
+          rustup toolchain install stable --profile minimal --no-self-update
+          rustup target add wasm32-unknown-unknown --toolchain stable
+          rustup default stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: auto-asmr-chromium/wasm -> target
+          key: chromium-rust-stable
+
+      - name: Run Rust tests
+        working-directory: auto-asmr-chromium/wasm
+        run: cargo test --release --locked
+
+      # tag 是 v1.2.3 / 1.2.3 这样的数字版本时写进 manifest.json（Chrome 只认 1–4 段数字）；否则保留原来的版本号
+      - name: Set extension version from tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          python3 - <<'EOF'
+          import json, os, re
+          tag = re.sub(r"^[vV]", "", os.environ["TAG"])
+          path = "extension/manifest.json"
+          with open(path, encoding="utf-8") as f:
+              manifest = json.load(f)
+          if re.fullmatch(r"\d+(\.\d+){0,3}", tag):
+              manifest["version"] = tag
+              with open(path, "w", encoding="utf-8") as f:
+                  json.dump(manifest, f, ensure_ascii=False, indent=2)
+                  f.write("\n")
+          print("manifest version:", manifest["version"])
+          EOF
+
+      - name: Build wasm and package extension
+        run: ./build.sh --zip
+
+      # 包里要有 manifest、引擎（wasm 文件头 \0asm）和 manifest 里引用到的页面、脚本、图标
+      - name: Check package
+        run: |
+          python3 - <<'EOF'
+          import json, zipfile
+          z = zipfile.ZipFile("dist/auto-asmr-chromium.zip")
+          names = set(z.namelist())
+          manifest = json.loads(z.read("manifest.json"))
+          assert z.read("asmr.wasm")[:4] == b"\0asm", "asmr.wasm 不是 wasm 文件"
+          refs = [manifest["background"]["service_worker"], manifest["action"]["default_popup"], manifest["options_ui"]["page"]]
+          refs += list(manifest["icons"].values()) + list(manifest["action"]["default_icon"].values())
+          missing = [r for r in refs if r not in names]
+          assert not missing, f"包里缺少：{missing}"
+          print(f"{len(names)} 个文件，版本 {manifest['version']}，asmr.wasm {z.getinfo('asmr.wasm').file_size / 1e6:.1f} MB")
+          EOF
+
+      - name: Package release
+        run: |
+          mkdir -p ../dist
+          cp dist/auto-asmr-chromium.zip ../dist/auto-asmr-chromium.zip
+
+      - name: Upload build artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: auto-asmr-chromium
+          path: dist/auto-asmr-chromium.zip
+          if-no-files-found: error
+
   release:
     name: Publish GitHub Release
-    needs: [build-windows, build-linux, build-android]
+    needs: [build-windows, build-linux, build-android, build-chromium]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -208,9 +287,9 @@ jobs:
 
       - name: Generate checksums for all platforms
         working-directory: dist
-        run: sha256sum auto-asmr.exe auto-asmr-windows-x64.zip auto-asmr-linux-x64.tar.gz auto-asmr-android.apk > SHA256SUMS.txt
+        run: sha256sum auto-asmr.exe auto-asmr-windows-x64.zip auto-asmr-linux-x64.tar.gz auto-asmr-android.apk auto-asmr-chromium.zip > SHA256SUMS.txt
 
-      - name: Publish Windows, Linux and Android packages
+      - name: Publish Windows, Linux, Android and browser extension packages
         uses: softprops/action-gh-release@v2
         with:
           generate_release_notes: true
@@ -220,4 +299,5 @@ jobs:
             dist/auto-asmr-windows-x64.zip
             dist/auto-asmr-linux-x64.tar.gz
             dist/auto-asmr-android.apk
+            dist/auto-asmr-chromium.zip
             dist/SHA256SUMS.txt

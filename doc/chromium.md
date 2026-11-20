@@ -24,7 +24,7 @@ cd auto-asmr-chromium && ./build.sh
 
 把引擎编成 `extension/asmr.wasm`（约 17 MB，其中 15.7 MB 是内嵌的 KU100 / 耳廓数据）。然后在 Chrome 打开 `chrome://extensions`，打开右上角「开发者模式」，点「加载已解压的扩展程序」，选 `auto-asmr-chromium/extension/` 目录。改了 Rust 代码要重新 `./build.sh`，再在扩展页点这个插件的「重新加载」。
 
-`./build.sh --zip` 另外打一个 `dist/auto-asmr-chromium.zip`，上传 Chrome 应用商店用。
+`./build.sh --zip` 另外打一个 `dist/auto-asmr-chromium.zip`，上传 Chrome 应用商店用。推送 tag 时 GitHub Actions 会自动打这个包（tag 是 `v1.2.3` 这样的数字版本时版本号跟着 tag），放进 GitHub Release；不想自己构建的话，下载它、解压，再按上面「加载已解压的扩展程序」选解压出来的目录。
 
 ## 使用
 

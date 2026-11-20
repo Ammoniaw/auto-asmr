@@ -22,7 +22,7 @@ cargo build --release
 
 ## GitHub 自动构建与发布
 
-推送任意名称的 tag 都会触发 `.github/workflows/release.yml`：使用 Rust 1.95.0 并行测试和构建 Windows x64、Linux x64 发布版（验证程序启动）和安卓 APK，全部成功后自动创建或更新该 tag 对应的 GitHub Release。附件包含 `auto-asmr.exe`、`auto-asmr-windows-x64.zip`、`auto-asmr-linux-x64.tar.gz`、`auto-asmr-android.apk` 和统一的 `SHA256SUMS.txt`；压缩包内含说明文档，Actions 页面也可下载构建产物。APK 的签名密钥放在仓库的 Secrets 里，做法见[安卓版 · 发布](android-dev.md#发布)；没配时 APK 用临时密钥签名，不能覆盖安装之前的版本。
+推送任意名称的 tag 都会触发 `.github/workflows/release.yml`，并行跑四个构建任务：用 Rust 1.95.0 测试和构建 Windows x64、Linux x64 发布版（验证程序启动）；用 Rust 最新稳定版测试和构建安卓 APK、浏览器插件（这两部分是在最新稳定版上开发的）。全部成功后自动创建或更新该 tag 对应的 GitHub Release。附件包含 `auto-asmr.exe`、`auto-asmr-windows-x64.zip`、`auto-asmr-linux-x64.tar.gz`、`auto-asmr-android.apk`、`auto-asmr-chromium.zip` 和统一的 `SHA256SUMS.txt`；压缩包内含说明文档，Actions 页面也可下载构建产物。APK 的签名密钥放在仓库的 Secrets 里，做法见[安卓版 · 发布](android-dev.md#发布)；没配时 APK 用临时密钥签名，不能覆盖安装之前的版本。插件任务跑插件的 Rust 测试，tag 是数字版本（`v1.2.3`）时把版本号写进 `manifest.json`，用 `build.sh --zip` 打包，再检查包里有 wasm 和 manifest 引用到的页面、图标；浏览器里的测试和端到端测试要真浏览器，没放进 CI。
 
 Linux 版在 Ubuntu 22.04 上构建（GNU/glibc），解压后运行 `./auto-asmr`，需要桌面图形环境以及 ALSA 等运行库；打包保留程序的可执行权限。
 
