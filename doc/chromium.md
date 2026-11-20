@@ -28,8 +28,8 @@ cd auto-asmr-chromium && ./build.sh
 
 ## 使用
 
-- **开始 / 停止**：在要处理的标签页上点插件图标，点「开始处理这个标签页的声音」；或者按快捷键 `Alt+Shift+A`（可以在 `chrome://extensions/shortcuts` 改）。在处理的标签页，插件图标上显示 `ON`。可以同时处理几个标签页。关掉标签页时自动停止。
-- **弹窗**：效果 / 原声切换、三个风格（贴耳加强、KU100 实录、掏耳）、左右移动的方式、雨夜背景音和它的音量；位置图实时显示声源在头的哪一侧、多远，下面是说话活动、输出电平、延时。
+- **开始 / 停止**：在要处理的标签页上点插件图标，弹窗一打开就开始处理（这个标签页已经在处理时不重复开始）；弹窗最上面的开关关掉就停止、恢复原声，再打开又继续。每次点图标都会开始，关掉之后想改设置又不想处理，就在弹窗里再把开关关上。不打开弹窗也可以按快捷键 `Alt+Shift+A` 开始 / 停止（可以在 `chrome://extensions/shortcuts` 改）。在处理的标签页，插件图标上显示 `ON`。可以同时处理几个标签页。关掉标签页时自动停止。
+- **弹窗**：处理开关、效果 / 原声切换、三个风格（贴耳加强、KU100 实录、掏耳）、左右移动的方式、雨夜背景音和它的音量；位置图实时显示声源在头的哪一侧、多远，下面是说话活动、输出电平、延时。
 - **设置页**（弹窗右上角「全部参数 / 导入配置」）：桌面版的全部效果参数，分组、名字、范围与桌面版界面相同；数字框可以手输超出滑块范围的值。改动立即对正在处理的标签页生效。
 - **配置文件**：设置页的「导入配置」读桌面版「导出配置」得到的 `.ron` 文件（也能读只写了几项的文件，缺的项用默认值）；「导出配置」写出同一格式的 `auto-asmr-export.ron`，可以导入桌面版和安卓版。插件只用 `params`（效果参数）和 `dry`（效果 / 原声），音频设备、缓冲、文件转换这些桌面版专用的设置原样保留。桌面版自检截图时留下的配置文件里没有 `app` 设置，导入会提示"没有 auto-asmr 的设置"（桌面版也一样）。
 
@@ -95,13 +95,13 @@ python3 auto-asmr-chromium/tools/serve.py
 python3 auto-asmr-chromium/tools/e2e_test.py --chrome "<Chrome for Testing 的可执行文件>"
 ```
 
-Chrome for Testing 从 [Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/) 下载（品牌版 Chrome 137 起不再支持 `--load-extension`）；macOS 上可执行文件是 `chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing`。脚本用临时用户目录启动它、装上插件，经 Chrome 调试协议驱动（只用 Python 标准库，自带一个最小的 websocket 客户端），默认无头、不出声（`--headful` 显示窗口，`--audible` 把处理后的声音接到声卡）。22 项：
+Chrome for Testing 从 [Chrome for Testing](https://googlechromelabs.github.io/chrome-for-testing/) 下载（品牌版 Chrome 137 起不再支持 `--load-extension`）；macOS 上可执行文件是 `chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing`。脚本用临时用户目录启动它、装上插件，经 Chrome 调试协议驱动（只用 Python 标准库，自带一个最小的 websocket 客户端），默认无头、不出声（`--headful` 显示窗口，`--audible` 把处理后的声音接到声卡）。23 项：
 
 - 开始处理（后台取 streamId、建 offscreen 页面、采集）后发声页在播放，AudioContext 在运行，引擎看到在说话、输入峰值约 −12 dB，声源 5 秒内转过 330°，角标 `ON`，没有报错；
 - **输出端实测**（在 offscreen 页面的输出上接两个分析器）：左右电平差在 −60 … +69 dB 之间来回；切到「原声」后恒为 0.92 dB，正好是发声页左右声道之比；
 - 写 `chrome.storage` 改配置后立即生效（固定到正前方）；设置页在插件环境里（CSP、wasm）能打开，点「掏耳」后存成桌面版格式，正在处理的标签页随即贴到耳边、伸进耳道；
 - 标签页换页面后继续处理；`stop()` 后关掉 offscreen 页面、清掉角标；停止后能再开始；关掉正在处理的标签页后自动停止；
-- 真弹窗（`chrome.action.openPopup()`）：点「开始」后显示实时状态（方位、离头距离、入耳深度、延时），点「停止处理」后停止；
+- 真弹窗（`chrome.action.openPopup()`）：一打开就自动开始处理、显示实时状态（方位、离头距离、入耳深度、延时），关掉开关后停止，再打开开关重新开始；把 `popup.html` 当成普通标签页打开时正常显示、不自动开始；
 - 各页面（后台、offscreen、设置页、弹窗）没有报错。
 
 做法上的几点：用户手势没法自动化，启动时加 `--allowlisted-extension-id=<插件 ID>`，这个插件不点图标也能采集，所以**真点图标 / 按快捷键这一关要手动验证**。不出声的办法：发声页等开始采集后才播放（被采集的标签页不在本地出声），offscreen 页面的 AudioContext 换成"无输出设备"；不能用 `--mute-audio`，它会让采集到的也是静音。

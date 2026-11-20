@@ -87,7 +87,7 @@ export const GROUPS = [
       {
         type: 'buttons',
         items: [
-          ['雨夜', 'bg_preset', 'rain_night', '关着窗在屋里听外面的小到中雨，雨声比人声低约 18 dB。只改背景音这几项'],
+          ['雨夜', 'bg_preset', 'rain_night', '四面八方的小到中雨，重心绕着头慢慢转（8D 环绕），身边地上的落地声比参考的 8D 雨声轻一点，雨声比人声低约 18 dB。只改背景音这几项'],
           ['关', 'bg_preset', 'off', '关掉背景音'],
         ],
         note: '实时生成，不是录音；人声不受影响',
@@ -96,9 +96,11 @@ export const GROUPS = [
       { key: 'rain', label: '雨量', min: 0, max: 100, dec: 0, fmt: (x) => `${(0.3 * Math.pow(200, x / 100)).toFixed(1)} mm/h`, on: (p) => p.bg_level > 0, tip: '毛毛雨（0.3 mm/h）… 暴雨（60 mm/h）' },
       { key: 'bg_pan', label: '左右', min: -100, max: 100, dec: 0, fmt: (x) => (Math.abs(x) < 0.5 ? '中' : x < 0 ? `左 ${(-x).toFixed(0)}` : `右 ${x.toFixed(0)}`), on: (p) => p.bg_level > 0, tip: '雨从哪边来：−100 = 都在左边，0 = 四周均匀，100 = 都在右边' },
       { key: 'bg_width', label: '包围感', min: 0, max: 100, dec: 0, on: (p) => p.bg_level > 0, tip: '0 = 只从一个方向来，100 = 从四面八方来' },
+      { key: 'bg_flow', label: '流动', min: 0, max: 100, dec: 0, fmt: (x) => (x < 0.5 ? '0 不动' : x.toFixed(0)), on: (p) => p.bg_level > 0, tip: '雨声的重心绕着头慢慢转（8D 环绕，平均 26 秒一圈）。0 = 不动，50 = 和参考的 8D 雨声一样，100 = 更明显' },
       { key: 'bg_indoor', label: '隔窗', min: 0, max: 100, dec: 0, on: (p) => p.bg_level > 0, tip: '0 = 站在雨里，100 = 关着窗在屋里听' },
-      { key: 'rain_near', label: '近处雨滴', min: 0, max: 100, dec: 0, on: (p) => p.bg_level > 0, tip: '身边听得清的一滴一滴；100 ≈ 每秒 12 滴。0 = 没有' },
-      { key: 'rain_drip', label: '屋檐滴水', min: 0, max: 100, dec: 0, on: (p) => p.bg_level > 0, tip: '屋檐 / 水管往水洼里滴的「滴答」。0 = 没有' },
+      { key: 'rain_near', label: '落地声', min: 0, max: 100, dec: 0, fmt: (x) => (x < 0.5 ? '0 无' : `${x.toFixed(0)} · ${0.2 * (x - 60) >= 0 ? '+' : '−'}${Math.abs(0.2 * (x - 60)).toFixed(0)} dB`), on: (p) => p.bg_level > 0, tip: '身边地上一个个雨点「噗」的一声有多明显：0 = 没有，60 ≈ 参考的 8D 雨声，每格 0.2 dB。屋檐滴水的响度也跟着它' },
+      { key: 'rain_drip', label: '屋檐滴水', min: 0, max: 100, dec: 0, on: (p) => p.bg_level > 0, tip: '屋檐往石阶 / 积水的地上滴的「嗒」，1–3 处。0 = 没有。多响跟着「落地声」' },
+      { key: 'bg_thunder', label: '雷声', min: 0, max: 100, dec: 0, fmt: (x) => { if (x < 0.5) return '0 无'; const i = 240 * Math.pow(25 / 240, x / 100), d = 8 * Math.pow(1.5 / 8, x / 100); return i >= 90 ? `${x.toFixed(0)} · ${(i / 60).toFixed(0)} 分钟 · ${d.toFixed(1)} km` : `${x.toFixed(0)} · ${i.toFixed(0)} s · ${d.toFixed(1)} km`; }, on: (p) => p.bg_level > 0, tip: '远处的雷（可选，默认没有）。0 = 没有；越大越近、越频繁、越响：30 ≈ 两分钟一次、5 km 外，100 ≈ 25 秒一次、1.5 km' },
     ],
   },
   {

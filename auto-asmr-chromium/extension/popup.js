@@ -1,52 +1,75 @@
-// 弹窗：开始 / 停止处理当前标签页，常用的几个开关，实时显示声源的位置。
+// 弹窗：点插件图标打开弹窗时自动开始处理当前标签页，开关用来停止 / 重新开始；常用的几个设置；实时显示声源的位置。
 
 import { loadAsmr, loadStored, saveStored } from './asmr.js';
 
 const $ = (id) => document.getElementById(id);
 const [tab] = await chrome.tabs.query({ active: true, currentWindow: true });
+// 把 popup.html 当成普通标签页打开时（不是弹窗），"当前标签页"就是它自己，不自动开始
+const inTab = chrome.tabs.getCurrent ? !!(await chrome.tabs.getCurrent()) : false;
 $('tab').textContent = tab ? tab.title || tab.url || '' : '没有标签页';
 $('tab').title = $('tab').textContent;
 
 let active = false;
 let busy = false;
+let stoppedByUser = false;
+let lastError = '';
 
 // ------------------------------------------------------------------ 开始 / 停止
 
-async function toggle() {
+async function start() {
+  // 先让后台取 streamId（同 Chrome 官方示例）；后台取不到时在弹窗里取一次再交给它。
+  // 两种都要求用户刚点过插件图标（打开这个弹窗就算）。
+  let r = await chrome.runtime.sendMessage({ to: 'bg', type: 'start', tabId: tab.id });
+  if (r && r.needStreamId) {
+    const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id });
+    r = await chrome.runtime.sendMessage({ to: 'bg', type: 'start', tabId: tab.id, streamId });
+  }
+  if (!r || r.ok === false) throw new Error((r && r.error) || '没有回应');
+}
+
+/** 开关：on = 开始，off = 停止。 */
+async function setRunning(on) {
   if (!tab || busy) return;
   busy = true;
+  $('toggle').checked = on;
   $('toggle').disabled = true;
+  lastError = '';
+  if (on) showLines([['muted', '正在开始…']]);
   try {
-    if (active) {
-      await chrome.runtime.sendMessage({ to: 'bg', type: 'stop', tabId: tab.id });
+    if (on) {
+      await start();
+      stoppedByUser = false;
     } else {
-      // 先让后台取 streamId（同 Chrome 官方示例）；后台取不到时在弹窗里取一次再交给它。
-      // 两种都要求用户刚点过插件图标（打开这个弹窗就算）。
-      let r = await chrome.runtime.sendMessage({ to: 'bg', type: 'start', tabId: tab.id });
-      if (r && r.needStreamId) {
-        const streamId = await chrome.tabCapture.getMediaStreamId({ targetTabId: tab.id });
-        r = await chrome.runtime.sendMessage({ to: 'bg', type: 'start', tabId: tab.id, streamId });
-      }
-      if (!r || r.ok === false) throw new Error((r && r.error) || '没有回应');
+      await chrome.runtime.sendMessage({ to: 'bg', type: 'stop', tabId: tab.id });
+      stoppedByUser = true;
     }
-    await poll();
   } catch (e) {
-    showError(e);
+    lastError = friendlyError(e);
   } finally {
     busy = false;
     $('toggle').disabled = false;
+    await poll();
   }
 }
 
-function showError(e) {
-  let text = String((e && e.message) || e);
-  if (/chrome:\/\/|Chrome pages cannot be captured|cannot be captured/i.test(text)) text = 'Chrome 自己的页面（chrome://、扩展商店等）不能处理';
-  else if (/active stream/i.test(text)) text = '这个标签页的声音已经被别的程序采集了';
-  $('status').innerHTML = '';
-  $('status').append(Object.assign(document.createElement('span'), { className: 'error', textContent: text }));
+function friendlyError(e) {
+  const text = String((e && e.message) || e);
+  if (/chrome:\/\/|Chrome pages cannot be captured|cannot be captured/i.test(text)) return 'Chrome 自己的页面（chrome://、扩展商店等）不能处理';
+  if (/active stream/i.test(text)) return '这个标签页的声音已经被别的程序采集了';
+  return text;
 }
 
-$('toggle').addEventListener('click', toggle);
+/** 改设置出错时临时显示一下（下次刷新状态时消失）。 */
+function showError(e) {
+  showLines([['error', friendlyError(e)]]);
+}
+
+function showLines(lines) {
+  $('status').innerHTML = '';
+  for (const [cls, text] of lines) $('status').append(Object.assign(document.createElement('div'), { className: cls, textContent: text }));
+}
+
+$('toggle').addEventListener('change', () => setRunning($('toggle').checked));
 
 // ------------------------------------------------------------------ 状态
 
@@ -66,11 +89,12 @@ async function poll() {
   }
   const me = st && st.tabs && tab ? st.tabs[tab.id] : null;
   active = !!me;
-  $('toggle').textContent = active ? '停止处理' : '开始处理这个标签页的声音';
-  $('toggle').className = active ? '' : 'primary';
-  if (!busy) $('toggle').disabled = !tab;
+  if (busy) return; // 正在开始 / 停止：开关和状态由 setRunning 管
+  $('toggle').checked = active;
+  $('toggle').disabled = !tab;
   const others = Object.keys((st && st.tabs) || {}).filter((id) => !tab || +id !== tab.id).length;
   const lines = [];
+  if (lastError && !active) lines.push(['error', lastError]);
   if (me) {
     if (me.error) lines.push(['error', me.error]);
     if (me.tele) {
@@ -83,13 +107,14 @@ async function poll() {
       lines.push(['muted', '正在启动…']);
     }
     drawRadar(me.tele);
+  } else if (!lastError) {
+    lines.push(['muted', stoppedByUser ? '已停止，这个标签页恢复原声。打开开关继续处理。' : '没在处理。打开开关后，这个标签页的声音会变成双耳 ASMR 效果再播放。']);
+    drawRadar(null);
   } else {
-    lines.push(['muted', '没在处理。开始后这个标签页的声音会变成双耳 ASMR 效果再播放。']);
     drawRadar(null);
   }
   if (others) lines.push(['muted', `另外还在处理 ${others} 个标签页`]);
-  $('status').innerHTML = '';
-  for (const [cls, text] of lines) $('status').append(Object.assign(document.createElement('div'), { className: cls, textContent: text }));
+  showLines(lines);
 }
 
 // 位置图：头在中间，上 = 前，右 = 右耳；距离按对数刻度（同桌面版：2 cm 在中心，80 cm 在边上）
@@ -131,6 +156,12 @@ function drawRadar(t) {
   g.arc(W / 2 + Math.sin(a) * k, W / 2 - Math.cos(a) * k, 9 + 5 * Math.min(1, t.act), 0, 2 * Math.PI);
   g.fill();
 }
+
+// ------------------------------------------------------------------ 打开弹窗就开始（这个标签页还没在处理时）
+
+await poll();
+if (tab && !active && !inTab) setRunning(true);
+setInterval(poll, 400);
 
 // ------------------------------------------------------------------ 常用开关（和设置页改的是同一份配置）
 
@@ -187,5 +218,3 @@ chrome.commands.getAll().then((cmds) => {
 });
 
 render();
-await poll();
-setInterval(poll, 400);

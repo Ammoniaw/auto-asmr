@@ -7,7 +7,7 @@
 不再支持 --load-extension）。用临时的用户目录，不碰平时用的浏览器。
 
 用户手势（点插件图标）没法自动化：用 Chrome 的测试开关 --allowlisted-extension-id 让这个插件不点图标也能采集，
-再在后台（service worker）里直接调用 start() / stop()；弹窗用 chrome.action.openPopup() 打开再点按钮。
+再在后台（service worker）里直接调用 start() / stop()；弹窗用 chrome.action.openPopup() 打开（打开就自动开始），再拨开关。
 真点图标、按快捷键时的手势要求要手动验证。
 
 默认 --headless=new、不出声：发声页等开始采集后才播放（被采集的标签页不在本地出声），插件 offscreen 页面的
@@ -373,12 +373,14 @@ def run(cdp, ext_id, page, audible):
     check("…并传到了正在处理的标签页（贴到耳边、伸进耳道）", best_r < 0.1 and best_depth > 0.3, f"离头中心最近 {best_r * 100:.1f} cm，入耳最深 {best_depth:.2f} cm")
     cdp.call("Target.closeTarget", {"targetId": opt})
 
-    # 弹窗页面能加载（在标签页里打开时"当前标签页"是它自己，只看能否正常显示）
+    # 弹窗页面当成普通标签页打开时（"当前标签页"是它自己）：能正常显示，不自动开始
+    n_before = len(cdp.eval(bg, "status()")["tabs"])
     pop = cdp.call("Target.createTarget", {"url": origin + "popup.html"})["targetId"]
     psid = cdp.attach(pop)
     time.sleep(1.5)
-    txt = cdp.eval(psid, "document.getElementById('status').textContent + ' | ' + document.getElementById('toggle').textContent")
-    check("弹窗页面能加载、显示状态", "处理" in txt, txt[:60])
+    txt = cdp.eval(psid, "document.getElementById('status').textContent + ' | 开关 ' + document.getElementById('toggle').checked")
+    n_after = len(cdp.eval(bg, "status()")["tabs"])
+    check("弹窗页面在标签页里打开：正常显示、不自动开始", "没在处理" in txt and "开关 false" in txt and n_after == n_before, txt[:70])
     cdp.call("Target.closeTarget", {"targetId": pop})
 
     # 标签页里换一个页面：采集继续
@@ -420,7 +422,7 @@ def run(cdp, ext_id, page, audible):
     n_off = cdp.eval(bg, "chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] }).then(c => c.length)")
     check("关掉正在处理的标签页后自动停止", r.get("ok") and n_off == 0, f"offscreen {n_off} 个")
 
-    # 真弹窗（chrome.action.openPopup）：查到当前标签页、点按钮开始、显示实时状态、再点停止
+    # 真弹窗（chrome.action.openPopup）：打开就自动开始处理当前标签页、显示实时状态；关掉开关停止
     tid = cdp.call("Target.createTarget", {"url": page + "?wait"})["targetId"]
     ps = cdp.attach(tid)
     time.sleep(1)
@@ -432,22 +434,33 @@ def run(cdp, ext_id, page, audible):
         check("弹窗：打开", False, str(e)[:120])
     else:
         psid = cdp.attach(pop["targetId"])
-        time.sleep(1.5)
-        cdp.eval(psid, "document.getElementById('toggle').click(); true")
         cdp.eval(ps, "window.play()")
         txt = ""
-        for _ in range(16):
+        for _ in range(20):
             time.sleep(0.25)
-            txt = cdp.eval(psid, "document.getElementById('status').textContent + ' | ' + document.getElementById('toggle').textContent")
+            txt = cdp.eval(psid, "document.getElementById('status').textContent + ' | 开关 ' + document.getElementById('toggle').checked")
             if "离头" in txt and "说话 0%" not in txt:
                 break
-        check("弹窗：点「开始」后显示实时状态", "离头" in txt and "停止处理" in txt, txt[:90])
+        check("弹窗：打开就自动开始、显示实时状态", "离头" in txt and "开关 true" in txt, txt[:90])
         cdp.eval(ps, "document.getElementById('a').pause(); true")
         cdp.eval(psid, "document.getElementById('toggle').click(); true")
         time.sleep(1.5)
         n_off = cdp.eval(bg, "chrome.runtime.getContexts({ contextTypes: ['OFFSCREEN_DOCUMENT'] }).then(c => c.length)")
-        txt = cdp.eval(psid, "document.getElementById('toggle').textContent")
-        check("弹窗：点「停止处理」后停止", n_off == 0 and "开始" in txt, f"offscreen {n_off} 个，按钮「{txt}」")
+        txt = cdp.eval(psid, "document.getElementById('status').textContent + ' | 开关 ' + document.getElementById('toggle').checked")
+        check("弹窗：关掉开关后停止", n_off == 0 and "已停止" in txt and "开关 false" in txt, f"offscreen {n_off} 个；{txt[:60]}")
+        # 再打开开关：重新开始
+        prepare_offscreen()
+        cdp.eval(psid, "document.getElementById('toggle').click(); true")
+        cdp.eval(ps, "window.play()")
+        for _ in range(20):
+            time.sleep(0.25)
+            txt = cdp.eval(psid, "document.getElementById('status').textContent + ' | 开关 ' + document.getElementById('toggle').checked")
+            if "离头" in txt:
+                break
+        check("弹窗：再打开开关后重新开始", "离头" in txt and "开关 true" in txt, txt[:70])
+        cdp.eval(ps, "document.getElementById('a').pause(); true")
+        cdp.eval(psid, "document.getElementById('toggle').click(); true")
+        time.sleep(1)
 
     errs = cdp.errors()
     check("各页面没有报错", not errs, "; ".join(errs)[:300])

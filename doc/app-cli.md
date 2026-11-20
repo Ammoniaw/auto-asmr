@@ -49,18 +49,22 @@ auto-asmr convert 人声.m4a --duo 80 --duration 60
 auto-asmr convert 人声.m4a --duo 100 --pos left,front-right --mix-balance 50 -o 双人.wav
 ```
 
-背景音（实时生成的雨声，见[界面使用说明 · 背景音](app-usage.md#背景音雨声)）：`--bg rain-night` 打开雨夜预设，后面再写 `--bg-level`（音量）、`--rain`（雨量）、`--bg-pan`（左右）、`--bg-width`（包围感）、`--bg-indoor`（隔窗）、`--rain-near`（近处雨滴）、`--rain-drip`（屋檐滴水）覆盖它，都是 0–100（`--bg-pan` 是 −100–100）。单个文件、批量、多音频合成、左右双人都能用：
+背景音（实时生成的雨声，见[界面使用说明 · 背景音](app-usage.md#背景音雨声)）：`--bg rain-night` 打开雨夜预设，后面再写 `--bg-level`（音量）、`--rain`（雨量）、`--bg-pan`（左右）、`--bg-width`（包围感）、`--bg-flow`（流动）、`--bg-indoor`（隔窗）、`--rain-land`（落地声；旧名 `--rain-near` 也能用）、`--rain-drip`（屋檐滴水）、`--thunder`（雷声，可选，默认 0 = 没有）覆盖它，都是 0–100（`--bg-pan` 是 −100–100）。单个文件、批量、多音频合成、左右双人都能用：
 
 ```bash
 auto-asmr convert 人声.m4a --bg rain-night --duration 60
-auto-asmr convert 人声.m4a --bg rain-night --rain 70 --bg-indoor 0 --bg-level 45 -o 雨中.wav
+auto-asmr convert 人声.m4a --bg rain-night --rain 70 --rain-land 15 --bg-level 45 -o 雨中.wav
+auto-asmr convert 人声.m4a --bg rain-night --bg-indoor 90 --bg-flow 0 -o 隔窗听雨.wav
+auto-asmr convert 人声.m4a --bg rain-night --thunder 50 -o 雷雨.wav
 ```
 
 只生成雨声本身（不要人声），响度按 `--lufs`（默认 −20 LUFS），默认雨夜，背景音选项一样能用：
 
 ```bash
 auto-asmr bg -o 雨夜.wav --duration 60
-auto-asmr bg -o 大雨.wav --duration 60 --rain 85 --bg-indoor 0 --rain-drip 0
+auto-asmr bg -o 大雨.wav --duration 60 --rain 85
+auto-asmr bg -o 屋檐.wav --duration 60 --rain-land 40 --rain-drip 35
+auto-asmr bg -o 雷雨.wav --duration 60 --rain 60 --thunder 70
 ```
 
 只想先看怎么对齐、不输出音频：

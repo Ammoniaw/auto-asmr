@@ -14,25 +14,31 @@
 //!    McDermott & Simoncelli（2011）：雨这类纹理靠"稀疏"（零星而集中的能量）和各频带同步起伏才像，
 //!    只把频谱做对的噪声认不出是雨——所以这里是一滴一滴叠出来的，不是滤波白噪声。
 //!    雨量还会以十几秒的节奏轻轻起伏（±25%），不是一成不变的。
-//! 2. **水洼里的"叮"**。一部分大雨滴落进水里卷进一个气泡，气泡按 Minnaert 频率振荡（f₀·r₀ ≈ 3 m/s），
-//!    衰减率 β = π·f₀·δ（δ = 辐射阻尼 0.0138 + 热阻尼 4.5×10⁻⁴·√f₀），音调随气泡上浮往上滑：
-//!    f(t) = f₀(1 + ξβt)，ξ = 0.1（van den Doel 2005 的听感实验；Moss 等 2009 转述）。空气里听到的这一声是
-//!    气泡带动水面振动发出的（Phillips 等 2018）。雨越大、水洼越多，这种"叮"越多。
-//! 3. **近处雨滴**：窗玻璃（几个挨得很近的模态，敲出"叮"带一点拍频）、窗台（木头的"嗒"或金属的"叮"）、
-//!    树叶（短促的"啪"）、水洼（气泡）上听得清的一滴一滴。"隔窗"越大，越多落在玻璃和窗台上。
-//! 4. **屋檐滴水**：1–3 处固定的位置，各有各的节奏（带一点随机和慢慢的漂移）和音高，"滴答"——
-//!    大水滴落进水洼，气泡的音调上滑更明显（ξ 0.25–0.55，真实的水滴常有 2–3 倍的上滑：Zheng & James 2009）。
-//! 5. **隔窗**：外面的雨声按墙和玻璃的隔声（越高的频率挡得越多）低通，再漏一点进来；窗玻璃上的雨点就在
-//!    玻璃上，不受影响；屋檐滴水挡一半。
+//! 2. **流动**（参考一段 8D 环绕雨声，见 doc/effects.md）：雨点落在哪个方向不是一直均匀的，有一个"重心"
+//!    绕着头慢慢转（平均 26 秒一圈，快慢随机变化），那边落得密一些。流动 50 时 1–4 kHz 左右差的起伏
+//!    （标准差约 1.5 dB）和参考一样；0 = 不动。
+//! 3. **落地声**：身边 0.5–3 m 的地上（泥地、草、积水）一个个听得出的雨点，低沉的"噗"——150–600 Hz 的一团
+//!    闷响，几十毫秒，开头带一点点溅水的"沙"；也按 KU100 HRIR 摆在四周地面上的各个方向。频谱和长短按参考
+//!    视频里的落地声做，滑块 60 时和参考一样明显，默认 30（低 6 dB）。雨越大落得越多。
+//! 4. **屋檐滴水**：1–3 处固定的位置，各有各的节奏（带一点随机和慢慢的漂移），"嗒"——一下撞击加一小团
+//!    溅开的水，各处溅水的中心频率不同。多响跟着落地声。
+//! 5. **隔窗**：外面的雨声（连同落地声）按墙和玻璃的隔声（越高的频率挡得越多）低通，再漏一点进来；
+//!    屋檐滴水挡一半。
 //! 6. **响度**：按整片雨声的期望功率（每一种雨滴的频谱 × 方向分布下的 HRIR × 各级滤波 × 回放补偿 × K 加权）
 //!    解析地算出增益，让雨声的积分响度 = 人声的目标响度 + 音量（dB）+ 雨量带来的 ±5 dB，不用先跑一遍去测。
-//!    近处雨滴和滴水按整片雨声的功率定各自的响度，所以调它们不会改变"沙沙"的大小。
+//!    落地声和滴水按整片雨声的功率定各自的响度，所以调它们不会改变"沙沙"的大小。
+//!
+//! 7. **雷声**（可选，默认没有）：见 [`crate::dsp::thunder`]，在这里和雨声一起出、一起闷、一起定增益。
+//!
+//! 没有气泡声（水洼里的"叮"、滴水的"咕嘟"）和窗玻璃上的"叮咚"：第一版有，试听觉得敲玻璃一样吵、水泡声
+//! 恶心（2026-11-20），都去掉了。
 
 use super::dynamics::KWeight;
 use super::filters::{Biquad, Fir, BUTTER_Q};
 use super::params::Params;
 use super::rng::Rng;
 use super::tables::{tables, Hrir};
+use super::thunder::{self, Thunder};
 use super::{CTRL, FS, NTAP};
 use rustfft::{num_complex::Complex32, FftPlanner};
 use std::f32::consts::{PI, TAU};
@@ -41,15 +47,14 @@ use std::sync::{Arc, OnceLock};
 // ---------------------------------------------------------------- 方向网格和脉冲
 
 /// 方位每 5° 一个方向（SOFA 方位角：逆时针，0 = 正前，90 = 左）。
-const N_AZ: usize = 72;
-const AZ_STEP: f32 = 5.0;
+pub(super) const N_AZ: usize = 72;
+pub(super) const AZ_STEP: f32 = 5.0;
 /// 仰角 5 档：地面上的雨滴在耳朵下方（近处更靠下），窗户大约和耳朵齐平，树叶在上面。
 const ELS: [f32; 5] = [-55.0, -35.0, -18.0, -5.0, 15.0];
 const N_EL: usize = ELS.len();
 const N_DIR: usize = N_AZ * N_EL;
-/// 窗户方向（隔窗时外面的雨从窗户进来）、高处（树叶）的仰角档。
+/// 窗户方向（隔窗时外面的雨从窗户进来）、屋檐滴水落地处的仰角档。
 const EL_WINDOW: usize = 3;
-const EL_HIGH: usize = 4;
 const EL_LOW: usize = 1;
 
 /// 撞击脉冲宽度（= 接触时间 D/v）的 4 档，毫秒：0.4 mm 的小雨滴约 0.26 ms，6 mm 的大雨滴约 0.64 ms。
@@ -73,14 +78,14 @@ const P_SOFT: f32 = 0.4;
 const SOFT_GAIN: f32 = 0.7;
 
 /// HRIR（含两耳时延和分数延时插值的余量）的长度；卷上脉冲之后的长度。
-const H_LEN: usize = 192;
+pub(super) const H_LEN: usize = 192;
 const B_LEN: usize = H_LEN + PULSE_LEN;
 /// 定响度用的频率网格。
 const NFFT: usize = 512;
 const NB: usize = NFFT / 2 + 1;
 /// 各条总线的环形缓冲（样本）；一个事件最长 GRAIN_MAX + H_LEN，提前不到一个控制块安排，放得下。
-const RING: usize = 4096;
-const GRAIN_MAX: usize = 2048;
+pub(super) const RING: usize = 16384;
+pub(super) const GRAIN_MAX: usize = 8192;
 
 // ---------------------------------------------------------------- 雨滴物理
 
@@ -90,7 +95,7 @@ const N0: f64 = 8000.0;
 const D_LO: f32 = 0.4;
 const D_MAX: f32 = 6.0;
 /// 耳朵离地多高（米）。
-const H_EAR: f32 = 1.2;
+pub(super) const H_EAR: f32 = 1.2;
 /// 三个圆环（米）、每个圆环逐个渲染的大雨滴和"底子"每秒各多少个、圆环按距离的低通（远处的雨被空气、地面和
 /// 植被吃掉高频），以及远处两个圆环被建筑、地形、植被挡掉之后剩下的功率比例（空旷平地上每翻一倍距离贡献一样多，
 /// 实际上远处总有遮挡）。
@@ -104,19 +109,26 @@ const ZETA_SIGMA: f32 = 0.4;
 /// 雨量的慢起伏：时间常数（秒）和对数标准差。
 const LFO_TAU: f32 = 14.0;
 const LFO_SIGMA: f32 = 0.25;
-/// 水洼"叮"每秒最多多少个；每个"叮"的能量 = 整片雨声 1.5 ms 的能量。能量集中在一个窄频带和几毫秒里，
-/// 在它那个频带里比"沙沙"高约 3 dB；再大就一个个跳出来，雨声变成"咕嘟咕嘟"（2–4 kHz 包络峰度从 5 涨到 20 以上）。
-const PLINK_MAX: f32 = 25.0;
-const PLINK_SHARE: f32 = 0.0015;
-/// 近处雨滴最多每秒几滴；近处雨滴 / 滴水比整片雨声在同样时长里响多少（dB）和按多长算（秒）。
-const NEAR_MAX: f32 = 12.0;
-const NEAR_DB: f32 = 5.0;
-/// 隔窗 100 时，窗玻璃、窗台上的雨点再响多少（dB）：它们不隔着墙，外面的雨被闷掉了，它们相对就更突出。
-/// 屋里听雨打窗的录音里，响度起伏 3.7–5 dB、每秒 3–4 个"突出的一下"，这里按它定。
-const IN_BOOST_DB: f32 = 8.0;
-const NEAR_T: f32 = 0.03;
-const DRIP_DB: f32 = 13.0;
-const DRIP_T: f32 = 0.04;
+/// 流动：重心转一圈的平均秒数、转速慢慢变化的时间常数（秒）和幅度（对数标准差）、流动 100 时的集中度
+/// （von Mises κ：方向 θ 上落得多密 ∝ e^{κ·cos(θ − 重心)}；κ = FLOW_KAPPA ×（流动/100）²）。
+/// 按参考的 8D 雨声定：流动 50（κ = 0.5）时 1–4 kHz 左右差（0.5 s）的标准差约 1.5 dB、自相关约 4–5 s 降到一半，
+/// 和参考一样；100（κ = 2）时左右摆动约 ±5–7 dB。
+const FLOW_PERIOD: f32 = 26.0;
+const FLOW_TAU: f32 = 20.0;
+const FLOW_SPEED_SIGMA: f32 = 0.45;
+const FLOW_KAPPA: f32 = 2.0;
+/// 落地声：雨量 0 / 100 时每秒几个（中间按雨量线性）。
+const LAND_RATE: (f32, f32) = (1.0, 5.0);
+/// 落地声的大小：一个"噗"的能量 = 整片雨声 LAND_T 秒的能量再高（低）多少 dB——滑块 LAND_REF 时为 LAND_DB，
+/// 每 1 格 LAND_STEP dB。LAND_DB 按参考视频定：150–600 Hz 每秒约 0.8 个比背景高 8 dB 以上、峰值中位约 9 dB。
+const LAND_T: f32 = 0.08;
+const LAND_DB: f32 = -5.5;
+const LAND_REF: f32 = 60.0;
+const LAND_STEP: f32 = 0.2;
+/// 落地声的远近：落在 0.7–3 m 的地上（耳朵离地 1.2 m）。
+const LAND_R: (f32, f32) = (0.7, 3.0);
+/// 屋檐滴水一下的能量比一个落地声高（低）多少 dB（"嗒"短而亮，同样的能量听起来更突出）。
+const DRIP_REL_DB: f32 = 2.0;
 
 /// 下落速度（m/s），直径 D（mm）。
 #[inline]
@@ -157,60 +169,6 @@ fn el_of_r(r: f32) -> usize {
     }
 }
 
-/// 气泡的衰减率（1/s）：β = π·f₀·δ，δ = 辐射阻尼 + 热阻尼（Leighton 1994；van den Doel 2005）。
-#[inline]
-fn bubble_decay(f0: f32) -> f32 {
-    PI * f0 * (0.0138 + 4.5e-4 * f0.sqrt())
-}
-
-/// 气泡"叮"：振幅 `amp`，频率从 f₀ 按 f₀(1 + ξβt) 往上滑，指数衰减，开头 0.4 ms 淡入。写进 `out`，返回长度。
-fn bubble(out: &mut [f32], f0: f32, xi: f32, amp: f32) -> usize {
-    let beta = bubble_decay(f0);
-    let len = ((5.5 / beta * FS).ceil() as usize).clamp(8, out.len());
-    let att = (0.0004 * FS) as usize;
-    let dec = (-beta / FS).exp();
-    let (mut ph, mut env) = (0f32, amp);
-    for (n, o) in out[..len].iter_mut().enumerate() {
-        let f = (f0 * (1.0 + xi * beta * n as f32 / FS)).min(0.45 * FS);
-        ph += TAU * f / FS;
-        if ph > TAU {
-            ph -= TAU;
-        }
-        let a = if n < att { 0.5 - 0.5 * (PI * n as f32 / att as f32).cos() } else { 1.0 };
-        *o = a * env * ph.sin();
-        env *= dec;
-    }
-    len
-}
-
-/// 气泡大小随机：f₀ 在 [lo, hi] Hz 之间按对数均匀；振荡幅度 ε 按 ε^−1.5 取（Moss 等 2009）。
-/// 返回 (f₀, 振幅 ∝ ε·r₀)；r₀ 按毫米算。
-fn bubble_draw(rng: &mut Rng, lo: f32, hi: f32) -> (f32, f32) {
-    let f0 = (lo.ln() + rng.unit() * (hi / lo).ln()).exp();
-    // ε 取 3%–10%（Moss 等的 1%–10% 会偶尔冒出一个比平均响十几 dB 的"咕嘟"，在雨声里很突兀）
-    let (a, b, k) = (0.03f32, 0.1f32, -0.5f32); // 1 − μ，μ = 1.5
-    let eps = (a.powf(k) + rng.unit() * (b.powf(k) - a.powf(k))).powf(1.0 / k);
-    (f0, eps * 3000.0 / f0)
-}
-
-/// 窗户的样子：几个模态（频率 Hz, 时间常数 s, 相对幅度）。整块玻璃的低模态（一两百到四五百赫兹的"咚"），
-/// 挨得很近的一簇（Farnell 的玻璃窗模型约 1969–2007 Hz，敲出来带一点拍频），再加两个更高、衰减更快的模态。
-/// 各模态的大小按两段屋里听雨打窗的录音校过（见 doc/effects.md）。每个种子一扇窗。
-fn window_modes(rng: &mut Rng) -> [(f32, f32, f32); 8] {
-    let f1 = rng.uniform(1800.0, 2300.0);
-    let t1 = rng.uniform(0.012, 0.022);
-    [
-        (rng.uniform(175.0, 275.0), 0.014, 3.0),
-        (rng.uniform(325.0, 475.0), 0.010, 2.4),
-        (f1, t1, 0.5),
-        (f1 * 0.9935, t1 * 0.9, 0.4),
-        (f1 * 0.9895, t1 * 0.8, 0.3),
-        (f1 * 0.981, t1 * 0.7, 0.25),
-        (rng.uniform(3600.0, 4500.0), 0.008, 0.6),
-        (rng.uniform(5600.0, 7000.0), 0.004, 0.5),
-    ]
-}
-
 // ---------------------------------------------------------------- 预先算好的方向表
 
 struct Bank {
@@ -222,8 +180,6 @@ struct Bank {
     hpow: Vec<f32>,
     /// `[N_PULSE][NB]`：单位峰值脉冲的功率谱。
     ppow: Vec<f32>,
-    /// `[NB]`：水洼"叮"（ε·r₀ 的分布，距离 1 m）的平均功率谱。
-    bub: Vec<f32>,
 }
 
 impl Bank {
@@ -288,21 +244,7 @@ impl Bank {
         for (p, sh) in shapes.iter().enumerate() {
             ppow[p * NB..(p + 1) * NB].copy_from_slice(&power_spectrum(&mut planner, sh, NFFT));
         }
-        // 水洼"叮"的平均功率谱：按运行时同样的分布抽 128 个（固定种子），2048 点 FFT 再并成 NB 档
-        let mut rng = Rng::new(0x5EED_B0B);
-        let mut g = vec![0f32; GRAIN_MAX];
-        let mut bub = vec![0f32; NB];
-        const NBUB: usize = 128;
-        for _ in 0..NBUB {
-            let (f0, amp) = bubble_draw(&mut rng, 2000.0, 9000.0);
-            g.fill(0.0);
-            let n = bubble(&mut g, f0, 0.1, amp);
-            let s = power_spectrum(&mut planner, &g[..n], GRAIN_MAX);
-            for (k, v) in bub.iter_mut().enumerate() {
-                *v += fold(&s, k, GRAIN_MAX / NFFT) / NBUB as f32;
-            }
-        }
-        Bank { hrir, pulse, hpow, ppow, bub }
+        Bank { hrir, pulse, hpow, ppow }
     }
 }
 
@@ -334,7 +276,7 @@ fn fold(s: &[f32], k: usize, r: usize) -> f32 {
 }
 
 /// 分数延时（16 点加汉宁窗的 sinc）：把 h 往后挪 `delay`（≥ 8）个样本写进 out。
-fn frac_delay(h: &[f32], delay: f32, out: &mut [f32]) {
+pub(super) fn frac_delay(h: &[f32], delay: f32, out: &mut [f32]) {
     const HW: i32 = 8;
     out.fill(0.0);
     for (k, &v) in h.iter().enumerate() {
@@ -432,7 +374,7 @@ fn az_weights(center: f32, half: f32, k: f32) -> [f32; N_AZ] {
 }
 
 #[inline]
-fn sample_az(cdf: &[f32; N_AZ], u: f32) -> usize {
+pub(super) fn sample_az(cdf: &[f32; N_AZ], u: f32) -> usize {
     cdf.partition_point(|&c| c < u).min(N_AZ - 1)
 }
 
@@ -454,21 +396,24 @@ pub struct RainSetup {
     floor_rate: [f32; 3],
     floor_cdf: [Cdf; 3],
     floor_w: [f32; 3],
-    plink_rate: f32,
-    plink_scale: f32,
     az_cdf: [f32; N_AZ],
     center: f32,
     /// 外面的雨从窗户方向进来的比例（隔窗时）。
     win_p: f32,
     indoor: f32,
-    near_rate: f32,
-    /// 近处雨滴落在哪里的累积概率：玻璃、窗台、树叶、水洼。
-    near_cum: [f32; 4],
+    /// 流动：重心的集中度（von Mises κ，0 = 不动）。
+    flow: f32,
+    /// 落地声每秒几个；落地声为 0 时 0。
+    land_rate: f32,
+    /// 屋檐滴水（0–1）；落地声为 0 时也是 0（滴水的响度跟着落地声）。
     drip: f32,
     /// 整片雨声在增益 1 时的期望 K 加权功率（两耳之和，每样本）。
     p_unit: f32,
-    near_energy: f32,
+    /// 一个落地声（距离取平均）、一下滴水在增益 1 时的能量（两耳之和）。
+    land_energy: f32,
     drip_energy: f32,
+    /// 雷声（0–1，0 = 没有）。
+    thunder: f32,
 }
 
 impl RainSetup {
@@ -536,7 +481,6 @@ impl RainSetup {
         let mut pow_cel = [[[0f64; N_PULSE]; N_EL]; 3];
         // 硬 / 软表面：同一档雨滴，一部分落在软表面上（脉冲更宽、强度 × SOFT_GAIN）
         let split = |b: usize, v: f64| -> [(usize, f64); 2] { [(b, v * (1.0 - P_SOFT) as f64), (b + N_HARD, v * (P_SOFT * SOFT_GAIN * SOFT_GAIN) as f64)] };
-        let mut el_near = [0f64; N_EL];
         for c in 0..3 {
             let (ri, ro) = RINGS[c];
             let area = PI as f64 * (ro as f64 * ro as f64 - ri as f64 * ri as f64);
@@ -561,9 +505,6 @@ impl RainSetup {
             };
             let (e_r2, a_el) = (mix(e_r2).map(|v| v * RING_W[c] as f64), mix(a_el));
             let inv_r2: f64 = e_r2.iter().sum();
-            if c == 0 {
-                el_near = e_r2;
-            }
             let total = area * N0 * tail(D_LO);
             let d_r = if total <= CAP_TOP[c] {
                 D_LO
@@ -668,47 +609,15 @@ impl RainSetup {
             }
         }
         p_imp /= FS as f64 * NFFT as f64;
+        let p_unit = p_imp as f32;
 
-        // 水洼里的"叮"：落在近处、直径 2.2 mm 以上的雨滴里，有水的地方（雨越大越多）一部分卷进气泡
-        let f_water = 0.15 + 0.35 * x;
-        let area0 = PI * (RINGS[0].1 * RINGS[0].1 - RINGS[0].0 * RINGS[0].0);
-        let plink_rate = ((0.2 * f_water * area0) as f64 * N0 * tail(2.2)).min(PLINK_MAX as f64) as f32;
-        let mut plink_scale = 0.0;
-        let mut p_unit = p_imp;
-        if plink_rate > 0.01 {
-            let mut s = 0f64;
-            for el in 0..N_EL {
-                if el_near[el] <= 0.0 {
-                    continue;
-                }
-                for e in 0..2 {
-                    let dv = &dav[(el * 2 + e) * NB..(el * 2 + e + 1) * NB];
-                    for k in 0..NB {
-                        s += el_near[el] * wk(k) * (bank.bub[k] * dv[k] * common[k]) as f64;
-                    }
-                }
-            }
-            let p_pl = plink_rate as f64 * s / (FS as f64 * NFFT as f64);
-            let kappa = (PLINK_SHARE * plink_rate) as f64;
-            if p_pl > 0.0 {
-                plink_scale = (kappa * p_imp / p_pl).sqrt() as f32;
-                p_unit = p_imp * (1.0 + kappa);
-            }
+        // 落地声：滑块 0 = 没有；1–100 每格 LAND_STEP dB，LAND_REF 时和参考视频一样明显
+        let land = p.rain_near.clamp(0.0, 100.0);
+        let thunder = (p.bg_thunder / 100.0).clamp(0.0, 1.0);
+        if thunder > 0.0 {
+            thunder::prepare();
         }
-        let p_unit = p_unit as f32;
-        let near = (p.rain_near / 100.0).clamp(0.0, 1.0);
-        let near_cum = {
-            let w = [0.75 * m, 0.25 * m, 0.6 * (1.0 - m), 0.4 * (1.0 - m)];
-            let s: f32 = w.iter().sum();
-            let mut c = [0f32; 4];
-            let mut a = 0.0;
-            for (o, v) in c.iter_mut().zip(w) {
-                a += v / s;
-                *o = a;
-            }
-            c[3] = 1.0;
-            c
-        };
+        let land_energy = if land > 0.0 { p_unit * LAND_T * FS * 10f32.powf((LAND_DB + LAND_STEP * (land - LAND_REF)) / 10.0) } else { 0.0 };
         Some(RainSetup {
             level_db: p.bg_db().unwrap_or(-40.0),
             trim_db: 10.0 * x - 5.0,
@@ -717,18 +626,17 @@ impl RainSetup {
             floor_rate,
             floor_cdf,
             floor_w,
-            plink_rate,
-            plink_scale,
             az_cdf,
             center,
             win_p,
             indoor: m,
-            near_rate: NEAR_MAX * near,
-            near_cum,
-            drip: (p.rain_drip / 100.0).clamp(0.0, 1.0),
+            flow: FLOW_KAPPA * (p.bg_flow / 100.0).clamp(0.0, 1.0).powi(2),
+            land_rate: if land > 0.0 { LAND_RATE.0 + (LAND_RATE.1 - LAND_RATE.0) * x } else { 0.0 },
+            drip: if land > 0.0 { (p.rain_drip / 100.0).clamp(0.0, 1.0) } else { 0.0 },
             p_unit,
-            near_energy: p_unit * NEAR_T * FS * 10f32.powf(NEAR_DB / 10.0),
-            drip_energy: p_unit * DRIP_T * FS * 10f32.powf(DRIP_DB / 10.0),
+            land_energy,
+            drip_energy: land_energy * 10f32.powf(DRIP_REL_DB / 10.0),
+            thunder,
         })
     }
 
@@ -748,7 +656,6 @@ impl RainSetup {
     }
 }
 
-/// 隔窗的滤波：二阶低通（截止频率从 20 kHz 降到 600 Hz）+ 一点漏进来的原声。返回（低通, 漏进来的比例）。
 /// 隔窗的滤波：墙和玻璃按质量定律隔声（一阶低通，每倍频程约 6 dB），双层玻璃 / 墙体在一百多赫兹的共振处透得多一点
 /// （峰值），再漏一点原声进来。
 #[derive(Clone, Copy)]
@@ -759,11 +666,11 @@ struct Muffle {
 }
 
 impl Muffle {
-    /// 隔窗 m（0–1）：一阶低通的拐点从 20 kHz 降到 700 Hz，125 Hz 的共振最多 +14 dB，漏进来的原声从 100% 降到 2%。
-    /// 这几个数按两段屋里听雨（关着窗）的录音校过：隔窗 100 时各倍频程与录音的平均相差 3 dB 以内。
+    /// 隔窗 m（0–1）：一阶低通的拐点从 20 kHz 降到 900 Hz，125 Hz 的共振最多 +14 dB，漏进来的原声从 100% 降到 2%。
+    /// 这几个数按关着窗的夜雨录音校过：隔窗 100 时 125 Hz–4 kHz 各倍频程与录音相差 3 dB 以内。
     fn new(m: f32) -> Muffle {
         let m = m.clamp(0.0, 1.0);
-        let fc = 20000.0 * (700.0f32 / 20000.0).powf(m);
+        let fc = 20000.0 * (900.0f32 / 20000.0).powf(m);
         let leak = (1.0 - m).powi(2) + 0.02 * m;
         Muffle { lp: Biquad::lowpass1(fc.min(0.45 * FS)), pk: Biquad::peaking(125.0, 0.9, 14.0 * m), leak }
     }
@@ -794,15 +701,15 @@ pub fn describe(p: &Params, english: bool) -> String {
     let Some(db) = p.bg_db() else { return String::new() };
     let mmh = 0.3 * 200f32.powf((p.rain / 100.0).clamp(0.0, 1.0));
     if english {
-        format!("Background: rain, {:.0} dB below the voice ({mmh:.1} mm/h, window {:.0}, near drops {:.0}, drips {:.0})", -db, p.bg_indoor, p.rain_near, p.rain_drip)
+        format!("Background: rain, {:.0} dB below the voice ({mmh:.1} mm/h, flow {:.0}, window {:.0}, landing drops {:.0}, drips {:.0}, thunder {:.0})", -db, p.bg_flow, p.bg_indoor, p.rain_near, p.rain_drip, p.bg_thunder)
     } else {
-        format!("背景音：雨声，比人声低 {:.0} dB（雨量约 {mmh:.1} mm/h，隔窗 {:.0}，近处雨滴 {:.0}，屋檐滴水 {:.0}）", -db, p.bg_indoor, p.rain_near, p.rain_drip)
+        format!("背景音：雨声，比人声低 {:.0} dB（雨量约 {mmh:.1} mm/h，流动 {:.0}，隔窗 {:.0}，落地声 {:.0}，屋檐滴水 {:.0}，雷声 {:.0}）", -db, p.bg_flow, p.bg_indoor, p.rain_near, p.rain_drip, p.bg_thunder)
     }
 }
 
 // ---------------------------------------------------------------- 运行时
 
-/// 屋檐下的一处滴水：下一滴的时间、慢慢漂移的节奏、位置和音高。
+/// 屋檐下的一处滴水：下一滴的时间、慢慢漂移的节奏，溅水的中心频率。
 #[derive(Clone, Copy)]
 struct Drip {
     next: f64,
@@ -810,7 +717,7 @@ struct Drip {
     f0: f32,
 }
 
-/// 各处滴水相对"雨声中心方向"的方位（度）、仰角档、距离（米）、节奏倍数、音高范围（Hz）。
+/// 各处滴水相对"雨声中心方向"的方位（度）、仰角档、距离（米）、节奏倍数、溅水中心频率的范围（Hz）。
 const DRIP_SPOTS: [(f32, usize, f32, f32, f32, f32); 3] = [(50.0, EL_LOW, 1.0, 1.0, 1250.0, 1600.0), (-65.0, 2, 1.8, 1.43, 1900.0, 2500.0), (160.0, EL_LOW, 2.6, 0.71, 2800.0, 3600.0)];
 
 /// 雨声发生器。`render` 写出加了增益的雨声（两耳），调用方加到人声上。
@@ -818,17 +725,18 @@ pub struct Rain {
     s: Arc<RainSetup>,
     off: bool,
     rng: Rng,
+    /// 各用各的随机数：整片雨声、落地声、屋檐滴水、流动——调一个滑块不会打乱别的层。
     rng_ev: Rng,
+    rng_drip: Rng,
+    rng_flow: Rng,
     pos: u64,
     next_top: [f64; 3],
     next_floor: [f64; 3],
-    next_plink: f64,
-    next_near: f64,
+    next_land: f64,
     drips: [Drip; 3],
     bed: [[Vec<f32>; 2]; 3],
     out: [Vec<f32>; 2],
     half: [Vec<f32>; 2],
-    inn: [Vec<f32>; 2],
     lp: [[Biquad; 2]; 3],
     mf: [Muffle; 2],
     hf: [Muffle; 2],
@@ -843,24 +751,35 @@ pub struct Rain {
     lfo: f32,
     lfo_sigma: f32,
     rho: f32,
-    window: [(f32, f32, f32); 8],
+    /// 流动：重心的方向（弧度，SOFA：逆时针，0 = 正前）、往哪边转（±1）、转速的慢变化，
+    /// 以及这一块里各个方位的接受概率 e^{κ(cos Δ − 1)}。
+    phi: f32,
+    spin: f32,
+    flow_ou: f32,
+    acc: [f32; N_AZ],
     grain: Vec<f32>,
     bin: [Vec<f32>; 2],
-    /// 统计：生成了多少个近处雨滴、滴水、水洼"叮"。
-    pub n_near: u64,
+    /// 雷声（见 [`crate::dsp::thunder`]）和它自己的隔窗、高通（30 Hz：雷的隆隆声在 60 Hz 以下还有不少）。
+    thunder: Thunder,
+    th_mf: [Muffle; 2],
+    th_hp: [Biquad; 2],
+    /// 统计：生成了多少个落地声、滴水。
+    pub n_land: u64,
     pub n_drips: u64,
-    pub n_plinks: u64,
 }
 
 impl Rain {
     pub fn new(s: Arc<RainSetup>, seed: u64, playback: Option<&Arc<Vec<f32>>>) -> Self {
-        let mut rng_ev = Rng::new(seed ^ 0x0052_4149_4E45_5645);
-        let window = window_modes(&mut rng_ev);
+        let rng_ev = Rng::new(seed ^ 0x0052_4149_4E45_5645);
+        let mut rng_drip = Rng::new(seed ^ 0x0052_4149_4E44_5250);
+        let mut rng_flow = Rng::new(seed ^ 0x0052_4149_4E46_4C4F);
         let mut drips = [Drip { next: 0.0, drift: 0.0, f0: 0.0 }; 3];
         for (d, spot) in drips.iter_mut().zip(DRIP_SPOTS.iter()) {
-            d.f0 = rng_ev.uniform(spot.4, spot.5);
+            d.f0 = rng_drip.uniform(spot.4, spot.5);
             d.next = f64::INFINITY;
         }
+        let phi = rng_flow.uniform(0.0, TAU);
+        let spin = if rng_flow.unit() < 0.5 { -1.0 } else { 1.0 };
         let ring = || vec![0f32; RING];
         let mf = Muffle::new(s.indoor);
         let hf = Muffle::new(0.5 * s.indoor);
@@ -869,16 +788,16 @@ impl Rain {
             off: false,
             rng: Rng::new(seed ^ 0x0052_4149_4E42_4544),
             rng_ev,
+            rng_drip,
+            rng_flow,
             pos: 0,
             next_top: [0.0; 3],
             next_floor: [0.0; 3],
-            next_plink: 0.0,
-            next_near: 0.0,
+            next_land: 0.0,
             drips,
             bed: [[ring(), ring()], [ring(), ring()], [ring(), ring()]],
             out: [ring(), ring()],
             half: [ring(), ring()],
-            inn: [ring(), ring()],
             lp: LP_FC.map(|fc| [Biquad::lowpass(fc, BUTTER_Q); 2]),
             mf: [mf; 2],
             hf: [hf; 2],
@@ -892,13 +811,19 @@ impl Rain {
             lfo: 0.0,
             lfo_sigma: LFO_SIGMA,
             rho: 1.0,
-            window,
+            phi,
+            spin,
+            flow_ou: 0.0,
+            acc: [1.0; N_AZ],
             grain: vec![0.0; GRAIN_MAX],
             bin: [vec![0.0; GRAIN_MAX + H_LEN], vec![0.0; GRAIN_MAX + H_LEN]],
-            n_near: 0,
+            thunder: Thunder::new(seed),
+            th_mf: [mf; 2],
+            th_hp: [Biquad::highpass(30.0, BUTTER_Q); 2],
+            n_land: 0,
             n_drips: 0,
-            n_plinks: 0,
         };
+        r.thunder.set_amount(0.0, s.thunder, 0);
         r.set_playback(playback);
         r.redraw_all();
         r
@@ -918,15 +843,20 @@ impl Rain {
                 self.next_floor[c] = now + self.gap(self.s.floor_rate[c]);
             }
         }
-        if changed(old.plink_rate, self.s.plink_rate) {
-            self.next_plink = now + self.gap(self.s.plink_rate);
-        }
-        if changed(old.near_rate, self.s.near_rate) {
-            self.next_near = now + self.gap_ev(self.s.near_rate);
+        if changed(old.land_rate, self.s.land_rate) {
+            self.next_land = now + self.gap_ev(self.s.land_rate);
         }
         if old.drip_spots() != self.s.drip_spots() {
             self.redraw_drips();
         }
+        if old.thunder != self.s.thunder {
+            self.thunder.set_amount(old.thunder, self.s.thunder, self.pos);
+        }
+    }
+
+    /// 统计：打了几次雷。
+    pub fn thunder_strikes(&self) -> u64 {
+        self.thunder.n_strikes
     }
 
     /// 回放补偿 FIR（与人声相同）。
@@ -981,15 +911,14 @@ impl Rain {
             self.next_top[c] = now + self.gap(self.s.top_rate[c]);
             self.next_floor[c] = now + self.gap(self.s.floor_rate[c]);
         }
-        self.next_plink = now + self.gap(self.s.plink_rate);
-        self.next_near = now + self.gap_ev(self.s.near_rate);
+        self.next_land = now + self.gap_ev(self.s.land_rate);
         self.redraw_drips();
     }
 
     fn redraw_drips(&mut self) {
         let (n, period) = self.s.drip_spots();
         for k in 0..3 {
-            self.drips[k].next = if k < n { self.pos as f64 + self.rng_ev.unit() as f64 * (period * DRIP_SPOTS[k].3 * FS) as f64 } else { f64::INFINITY };
+            self.drips[k].next = if k < n { self.pos as f64 + self.rng_drip.unit() as f64 * (period * DRIP_SPOTS[k].3 * FS) as f64 } else { f64::INFINITY };
         }
     }
 
@@ -1022,6 +951,9 @@ impl Rain {
                 self.control(ref_lufs);
             }
             let idx = (self.pos as usize) & (RING - 1);
+            // 雷声（有雷或回声还没散时才走这条路；没打雷时输出和没有雷声这个功能时逐样本相同）
+            let live = self.thunder.live(self.pos);
+            let th = if live { self.thunder.sample(idx) } else { [0.0; 2] };
             let mut y = [0f32; 2];
             for (e, ye) in y.iter_mut().enumerate() {
                 let mut b = 0.0;
@@ -1033,7 +965,10 @@ impl Rain {
                 let mb = self.mf[e].process(b);
                 let h = std::mem::take(&mut self.half[e][idx]);
                 let mh = self.hf[e].process(h);
-                let mut v = self.hp[e].process(mb + mh + std::mem::take(&mut self.inn[e][idx]));
+                let mut v = self.hp[e].process(mb + mh);
+                if live {
+                    v += self.th_hp[e].process(self.th_mf[e].process(th[e]));
+                }
                 if let Some(pb) = &mut self.pb {
                     v = pb[e].process(v);
                 }
@@ -1065,10 +1000,21 @@ impl Rain {
             for e in 0..2 {
                 self.mf[e].retune(&mf);
                 self.hf[e].retune(&hf);
+                self.th_mf[e].retune(&mf);
             }
         }
         let t1 = (self.pos + CTRL as u64) as f64;
         let s = self.s.clone();
+        // 流动：重心平均 FLOW_PERIOD 秒转一圈，转速随机慢慢变；这一块里各方位按 e^{κ(cos Δ − 1)} 接受
+        if s.flow > 0.0 {
+            let dt = CTRL as f32 / FS;
+            let a = (-dt / FLOW_TAU).exp();
+            self.flow_ou = a * self.flow_ou + (1.0 - a * a).sqrt() * self.rng_flow.normal();
+            self.phi = (self.phi + self.spin * TAU / FLOW_PERIOD * (FLOW_SPEED_SIGMA * self.flow_ou).exp() * dt).rem_euclid(TAU);
+            for (i, v) in self.acc.iter_mut().enumerate() {
+                *v = (s.flow * (((i as f32 * AZ_STEP).to_radians() - self.phi).cos() - 1.0)).exp();
+            }
+        }
         for c in 0..3 {
             while self.next_top[c] < t1 {
                 let t = self.next_top[c].max(self.pos as f64) as u64;
@@ -1081,23 +1027,19 @@ impl Rain {
                 self.next_floor[c] += self.gap(s.floor_rate[c]);
             }
         }
-        while self.next_plink < t1 {
-            let t = self.next_plink.max(self.pos as f64) as u64;
-            self.plink(&s, t);
-            self.next_plink += self.gap(s.plink_rate);
+        while self.next_land < t1 {
+            let t = self.next_land.max(self.pos as f64) as u64;
+            self.land(&s, t);
+            self.next_land += self.gap_ev(s.land_rate);
         }
-        while self.next_near < t1 {
-            let t = self.next_near.max(self.pos as f64) as u64;
-            self.near(&s, t);
-            self.next_near += self.gap_ev(s.near_rate);
-        }
+        self.thunder.control(s.thunder, &s.az_cdf, s.p_unit, self.pos, t1);
         let (n_spots, period) = s.drip_spots();
         for k in 0..n_spots {
             while self.drips[k].next < t1 {
                 let t = self.drips[k].next.max(self.pos as f64) as u64;
                 self.drip(&s, k, t);
                 // 节奏：各处自己的间隔 × 慢慢漂移（AR(1)，稳态 ±20%）× 每一滴 ±10% 的随机
-                let (n1, n2) = (self.rng_ev.normal(), self.rng_ev.normal());
+                let (n1, n2) = (self.rng_drip.normal(), self.rng_drip.normal());
                 let d = &mut self.drips[k];
                 d.drift = 0.85 * d.drift + 0.527 * 0.2 * n1;
                 let jitter = (1.0 + 0.1 * n2).clamp(0.7, 1.3);
@@ -1112,8 +1054,7 @@ impl Rain {
         let (ri, ro) = RINGS[c];
         let r = (ri * ri + self.rng.unit() * (ro * ro - ri * ri)).sqrt();
         let el = if self.rng.unit() < s.win_p { EL_WINDOW } else { el_of_r(r) };
-        let u = self.rng.unit();
-        let az = sample_az(&s.az_cdf, u);
+        let az = draw_az(&mut self.rng, &s.az_cdf, &self.acc, s.flow > 0.0);
         let w = if floor {
             if self.rng.unit() < 0.5 {
                 -s.floor_w[c]
@@ -1132,119 +1073,83 @@ impl Rain {
         }
     }
 
-    /// 水洼里的"叮"（属于整片雨声，按隔窗一起闷掉）。
-    fn plink(&mut self, s: &RainSetup, t: u64) {
-        self.n_plinks += 1;
-        let (f0, amp) = bubble_draw(&mut self.rng, 2000.0, 9000.0);
-        let (ri, ro) = RINGS[0];
-        let r = (ri * ri + self.rng.unit() * (ro * ro - ri * ri)).sqrt();
-        let el = if self.rng.unit() < s.win_p { EL_WINDOW } else { el_of_r(r) };
-        let u = self.rng.unit();
-        let az = sample_az(&s.az_cdf, u);
-        let n = bubble(&mut self.grain, f0, 0.1, amp * s.plink_scale / (r * r + H_EAR * H_EAR).sqrt());
+    /// 身边地上的一个落地声：落在 0.7–3 m 处（按面积均匀），从那个方向、那个仰角来（隔窗时一部分从窗户来，
+    /// 和外面的雨一起闷掉）；远近、轻重各有不同，平均响度按设置。
+    fn land(&mut self, s: &RainSetup, t: u64) {
+        self.n_land += 1;
+        let n = self.thump_grain();
+        let (ri, ro) = LAND_R;
+        let r = (ri * ri + self.rng_ev.unit() * (ro * ro - ri * ri)).sqrt();
+        let el = if self.rng_ev.unit() < s.win_p { EL_WINDOW } else { el_of_r(r) };
+        let az = draw_az(&mut self.rng_ev, &s.az_cdf, &self.acc, s.flow > 0.0);
         let len = self.binauralize(n, el * N_AZ + az);
-        for e in 0..2 {
-            ring_add(&mut self.out[e], t, &self.bin[e][..len], 1.0);
-        }
-    }
-
-    /// 近处听得清的一滴：窗玻璃、窗台、树叶或水洼。
-    fn near(&mut self, s: &RainSetup, t: u64) {
-        self.n_near += 1;
-        let u = self.rng_ev.unit();
-        let kind = s.near_cum.iter().position(|&c| u < c).unwrap_or(3);
-        self.grain.fill(0.0);
-        let n = match kind {
-            0 => self.glass_grain(),
-            1 => self.sill_grain(),
-            2 => self.leaf_grain(),
-            _ => {
-                let f0 = self.rng_ev.uniform(1200.0, 4500.0);
-                let xi = self.rng_ev.uniform(0.1, 0.35);
-                let n = bubble(&mut self.grain, f0, xi, 1.0);
-                // 落水时一点点溅水声
-                for v in self.grain[..72].iter_mut() {
-                    *v += 0.2 * (self.rng_ev.unit() - 0.5);
-                }
-                n.max(72)
-            }
-        };
-        let el = match kind {
-            0 | 1 => EL_WINDOW,
-            2 => EL_HIGH,
-            _ => EL_LOW,
-        };
-        let u = self.rng_ev.unit();
-        let az = sample_az(&s.az_cdf, u);
-        let dist = self.rng_ev.uniform(0.6, 2.0);
-        let len = self.binauralize(n, el * N_AZ + az);
-        // 距离 0.6–2 m 的 1/R² 平均是 0.833：平均响度按设置，远近、轻重再各有不同
-        let target = s.near_energy / (dist * dist) / 0.833 * self.rng_ev.lognormal(1.0, 0.5);
-        // 窗玻璃、窗台上的雨点不隔着墙：外面的雨被闷掉了，它们相对就更突出（隔窗 100 时 +8 dB）
-        let target = if kind <= 1 { target * 10f32.powf(IN_BOOST_DB * s.indoor / 10.0) } else { target };
+        // 能量 ∝ 1/(r² + 1.2²)，按 0.7–3 m 上的平均归一
+        let h2 = H_EAR * H_EAR;
+        let mean = ((ro * ro + h2) / (ri * ri + h2)).ln() / (ro * ro - ri * ri);
+        let target = s.land_energy / (r * r + h2) / mean * self.rng_ev.lognormal(1.0, 0.3);
         let g = (target / self.bin_energy(len).max(1e-20)).sqrt();
         for e in 0..2 {
-            let ring = if kind <= 1 { &mut self.inn[e] } else { &mut self.out[e] };
-            ring_add(ring, t, &self.bin[e][..len], g);
+            ring_add(&mut self.out[e], t, &self.bin[e][..len], g);
         }
     }
 
-    /// 屋檐的一滴：大水滴落进水洼，气泡的音调上滑明显；偶尔没卷进气泡，只有轻轻的"啪"。
+    /// 屋檐的一滴：落在石阶 / 积水的地上，"嗒"。
     fn drip(&mut self, s: &RainSetup, k: usize, t: u64) {
         self.n_drips += 1;
         let spot = DRIP_SPOTS[k];
-        self.grain.fill(0.0);
-        let n = if self.rng_ev.unit() < 0.1 {
-            tap(&mut self.grain, 0.35, 1.0)
-        } else {
-            let f0 = self.drips[k].f0 * (1.0 + 0.035 * self.rng_ev.normal());
-            let xi = self.rng_ev.uniform(0.25, 0.55);
-            let n = bubble(&mut self.grain, f0, xi, 1.0);
-            tap(&mut self.grain, 0.2, 0.25);
-            n
-        };
+        let f0 = self.drips[k].f0 * (1.0 + 0.05 * self.rng_drip.normal());
+        let n = self.drip_grain(f0);
         let az = az_index(s.center + spot.0);
         let len = self.binauralize(n, spot.1 * N_AZ + az);
-        let target = s.drip_energy * (1.4 * 1.4) / (spot.2 * spot.2) * self.rng_ev.lognormal(1.0, 0.25);
+        let target = s.drip_energy * (1.4 * 1.4) / (spot.2 * spot.2) * self.rng_drip.lognormal(1.0, 0.25);
         let g = (target / self.bin_energy(len).max(1e-20)).sqrt();
         for e in 0..2 {
             ring_add(&mut self.half[e], t, &self.bin[e][..len], g);
         }
     }
 
-    /// 窗玻璃上的一滴：一下"嗒"再加窗户的几个模态，每次落点不同，各模态的分量也不同。
-    fn glass_grain(&mut self) -> usize {
+    /// 落地的"噗"：雨点落在泥地、草、积水上——一团 150–500 Hz 的闷响（带通噪声，中心 170–300 Hz，150 Hz 以下
+    /// 四阶切掉），4 ms 起音、时间常数 35–60 ms 衰减，开头带一点点溅水的"沙"（1.5–5 kHz、3 ms，很轻）。
+    /// 按参考视频里落地声的频谱和长短做：250 Hz 倍频程最突出，1 kHz 以上几乎没有，约 80 ms 后听不出来。
+    /// 是噪声不是正弦，没有音调。
+    fn thump_grain(&mut self) -> usize {
+        let len = ((0.16 * FS) as usize).min(GRAIN_MAX);
+        let fc = (170f32.ln() + self.rng_ev.unit() * (300f32 / 170.0).ln()).exp();
+        let tau = self.rng_ev.uniform(0.035, 0.06) * FS;
+        let splash = self.rng_ev.uniform(0.03, 0.08);
+        let mut bp = Biquad::bandpass(fc, 1.0);
+        let mut hp = [Biquad::highpass(160.0, BUTTER_Q); 2];
+        let mut lp = Biquad::lowpass(700.0, BUTTER_Q);
+        let (mut hs, mut ls) = (Biquad::highpass(1500.0, BUTTER_Q), Biquad::lowpass(5000.0, BUTTER_Q));
+        let (att, ts, fade) = (0.004 * FS, 0.003 * FS, 0.01 * FS);
+        for (n, o) in self.grain[..len].iter_mut().enumerate() {
+            let x = n as f32;
+            let mut env = if x < att { 0.5 - 0.5 * (PI * x / att).cos() } else { (-(x - att) / tau).exp() };
+            let left = (len - n) as f32;
+            if left < fade {
+                env *= 0.5 - 0.5 * (PI * left / fade).cos();
+            }
+            let b0 = hp[0].process(lp.process(bp.process(env * (2.0 * self.rng_ev.unit() - 1.0))));
+            let body = hp[1].process(b0);
+            let sp = ls.process(hs.process(splash * (-x / ts).exp() * (2.0 * self.rng_ev.unit() - 1.0)));
+            *o = body + sp;
+        }
+        len
+    }
+
+    /// 滴水的"嗒"：一下撞击（0.3–0.5 ms 的半个正弦）+ 一小团溅开的水（中心 f0 的带通噪声，4–8 ms）
+    /// + 一点点"噗"（250–400 Hz，12 ms）。也是噪声，没有音调。
+    fn drip_grain(&mut self, f0: f32) -> usize {
         let len = ((0.06 * FS) as usize).min(GRAIN_MAX);
-        // "嗒"的宽度 0.2 ms（真实雨点打玻璃的上升时间约 0.1–0.3 ms；再窄就是刺耳的咔嗒）
-        tap(&mut self.grain, 0.2, 2.0);
-        let win = self.window;
-        for &(f, tau, a) in win.iter() {
-            let amp = a * self.rng_ev.uniform(0.2, 1.0) * 0.6;
-            modal(&mut self.grain[..len], f, tau, amp);
-        }
-        len
-    }
-
-    /// 窗台：木头的短"嗒"。（原来还有 30% 是金属的"叮"，长长的 2.5–7.5 kHz 尾音在屋里听雨的录音里没有，去掉了。）
-    fn sill_grain(&mut self) -> usize {
-        let len = (0.03 * FS) as usize;
-        tap(&mut self.grain, 0.2, 0.8);
-        for _ in 0..3 {
-            let (f, tau) = (self.rng_ev.uniform(700.0, 2600.0), self.rng_ev.uniform(0.003, 0.007));
-            modal(&mut self.grain[..len], f, tau, 0.8 * self.rng_ev.uniform(0.4, 1.0));
-        }
-        len
-    }
-
-    /// 树叶上的一滴：一小段带通的噪声，短促地"啪"一下。
-    fn leaf_grain(&mut self) -> usize {
-        let len = (0.025 * FS) as usize;
-        let tau = self.rng_ev.uniform(0.002, 0.006);
-        let mut bp = Biquad::bandpass(self.rng_ev.uniform(700.0, 2500.0), self.rng_ev.uniform(0.7, 1.4));
-        let att = (0.0003 * FS) as usize;
-        for n in 0..len {
-            let env = if n < att { n as f32 / att as f32 } else { (-((n - att) as f32 / FS) / tau).exp() };
-            self.grain[n] = bp.process(env * (self.rng_ev.unit() - 0.5) * 2.0);
+        self.grain[..len].fill(0.0);
+        tap(&mut self.grain, self.rng_drip.uniform(0.3, 0.5), 0.5);
+        let mut bp = Biquad::bandpass(f0, 1.2);
+        let mut lo = Biquad::bandpass(self.rng_drip.uniform(250.0, 400.0), 0.9);
+        let (ts, tl, att) = (self.rng_drip.uniform(0.004, 0.008) * FS, 0.012 * FS, 0.0005 * FS);
+        for (n, o) in self.grain[..len].iter_mut().enumerate() {
+            let x = n as f32;
+            let w = (x / att).min(1.0) * (2.0 * self.rng_drip.unit() - 1.0);
+            *o += bp.process(w * (-x / ts).exp()) + 0.5 * lo.process(w * (-x / tl).exp());
         }
         len
     }
@@ -1283,23 +1188,24 @@ fn tap(out: &mut [f32], ms: f32, amp: f32) -> usize {
     n
 }
 
-/// 一个衰减的模态（频率 f、时间常数 tau、幅度 a），加到 out 上。
-fn modal(out: &mut [f32], f: f32, tau: f32, a: f32) {
-    let (s, c) = (TAU * f / FS).sin_cos();
-    let dec = (-1.0 / (tau * FS)).exp();
-    // 复数旋转：z = a·e^{(−1/τ + j2πf)t}，取虚部
-    let (mut re, mut im) = (a, 0.0f32);
-    for v in out.iter_mut() {
-        *v += im;
-        let (r2, i2) = (re * c - im * s, re * s + im * c);
-        re = r2 * dec;
-        im = i2 * dec;
+/// 抽一个方位：按 `cdf`；流动时再按 `acc`（各方位的接受概率）拒绝重抽，最多 16 次。
+#[inline]
+fn draw_az(rng: &mut Rng, cdf: &[f32; N_AZ], acc: &[f32; N_AZ], flow: bool) -> usize {
+    let mut az = sample_az(cdf, rng.unit());
+    if flow {
+        for _ in 0..16 {
+            if rng.unit() < acc[az] {
+                break;
+            }
+            az = sample_az(cdf, rng.unit());
+        }
     }
+    az
 }
 
 /// 把 `src × g` 加进环形缓冲，从绝对时间 t 开始。
 #[inline]
-fn ring_add(ring: &mut [f32], t: u64, src: &[f32], g: f32) {
+pub(super) fn ring_add(ring: &mut [f32], t: u64, src: &[f32], g: f32) {
     let start = (t as usize) & (RING - 1);
     let first = (RING - start).min(src.len());
     for (d, s) in ring[start..start + first].iter_mut().zip(&src[..first]) {
@@ -1345,7 +1251,7 @@ pub mod tests {
     }
 
     fn bed(rain: f32, indoor: f32, pan: f32, width: f32) -> Params {
-        Params { bg_level: 60.0, rain, bg_indoor: indoor, bg_pan: pan, bg_width: width, rain_near: 0.0, rain_drip: 0.0, ..Params::default() }
+        Params { bg_level: 60.0, rain, bg_indoor: indoor, bg_pan: pan, bg_width: width, bg_flow: 0.0, rain_near: 0.0, rain_drip: 0.0, ..Params::default() }
     }
 
     #[test]
@@ -1363,10 +1269,11 @@ pub mod tests {
 
     #[test]
     fn output_does_not_depend_on_block_size() {
-        let p = Params { bg_level: 60.0, rain_near: 80.0, rain_drip: 90.0, ..Params::default() };
-        let a = render_with(&p, 4.0, 64, false);
-        let b = render_with(&p, 4.0, 4096, false);
-        let c = render_with(&p, 4.0, 1000, false);
+        // 带着雷（打开后 3–10 秒内来第一声，所以渲染 14 秒）
+        let p = Params { bg_level: 60.0, rain_near: 80.0, rain_drip: 90.0, bg_thunder: 100.0, ..Params::default() };
+        let a = render_with(&p, 14.0, 64, false);
+        let b = render_with(&p, 14.0, 4096, false);
+        let c = render_with(&p, 14.0, 1000, false);
         assert!(a == b && b == c);
         assert!(a.0.iter().chain(&a.1).all(|v| v.is_finite()));
     }
@@ -1420,7 +1327,7 @@ pub mod tests {
         let var = env.iter().map(|v| (v - m).powi(2)).sum::<f64>() / n;
         let kurt = env.iter().map(|v| (v - m).powi(4)).sum::<f64>() / n / (var * var);
         assert!(kurt > 5.0, "小雨包络峰度 {kurt:.1}");
-        // 近处雨滴 50 → 每秒约 6 滴；屋檐滴水 100 → 3 处、每秒约 4.4 滴；雨越大水洼里的"叮"越多
+        // 落地声随雨量：雨量 35 时每秒约 2.4 个；屋檐滴水 100 → 3 处、每秒约 4.4 滴；落地声为 0 时两样都没有
         let p = Params { bg_level: 60.0, rain_near: 50.0, rain_drip: 100.0, ..Params::default() };
         let s = Arc::new(RainSetup::new(&p, None).unwrap());
         let mut rain = Rain::new(s, 1, None).steady();
@@ -1429,12 +1336,164 @@ pub mod tests {
             rain.render(-16.0, &mut a, &mut b);
         }
         let secs = (60 * 48_000 / 4096 * 4096) as f32 / FS;
-        let near = rain.n_near as f32 / secs;
+        let land = rain.n_land as f32 / secs;
         let drips = rain.n_drips as f32 / secs;
-        assert!((near - 6.0).abs() < 0.8, "近处雨滴每秒 {near:.2}");
+        assert!((land - 2.4).abs() < 0.5, "落地声每秒 {land:.2}");
         assert!((drips - 4.4).abs() < 0.8, "滴水每秒 {drips:.2}");
-        let plinks = |rain: f32| RainSetup::new(&Params { bg_level: 60.0, rain, ..Params::default() }, None).unwrap().plink_rate;
-        assert!(plinks(10.0) < 1.0 && plinks(35.0) > plinks(10.0) && plinks(90.0) >= plinks(35.0));
+        let off = RainSetup::new(&Params { rain_near: 0.0, ..p.clone() }, None).unwrap();
+        assert!(off.land_rate == 0.0 && off.drip_spots().0 == 0);
+    }
+
+    /// 每 10 ms 一帧、两耳取大的，比 1 秒滑动中位数高多少 dB（只看 `lo`–`hi` Hz）。
+    fn excess(l: &[f32], r: &[f32], lo: f32, hi: f32) -> Vec<f32> {
+        let frame = (0.01 * FS) as usize;
+        let per_ear = |x: &[f32]| -> Vec<f32> {
+            let (mut h0, mut h1) = (Biquad::highpass(lo, BUTTER_Q), Biquad::highpass(lo, BUTTER_Q));
+            let (mut g0, mut g1) = (Biquad::lowpass(hi, BUTTER_Q), Biquad::lowpass(hi, BUTTER_Q));
+            x.chunks_exact(frame)
+                .map(|c| {
+                    c.iter()
+                        .map(|&v| {
+                            let y = g1.process(g0.process(h1.process(h0.process(v))));
+                            y * y
+                        })
+                        .sum::<f32>()
+                })
+                .collect()
+        };
+        let m: Vec<f32> = per_ear(l).iter().zip(per_ear(r)).map(|(a, b)| a.max(b) + 1e-30).collect();
+        (0..m.len())
+            .map(|i| {
+                let mut w = m[i.saturating_sub(50)..(i + 51).min(m.len())].to_vec();
+                w.sort_by(|a, b| a.total_cmp(b));
+                10.0 * (m[i] / w[w.len() / 2]).log10()
+            })
+            .collect()
+    }
+
+    fn pct(v: &[f32], q: f32) -> f32 {
+        let mut w = v.to_vec();
+        w.sort_by(|a, b| a.total_cmp(b));
+        w[((w.len() - 1) as f32 * q) as usize]
+    }
+
+    #[test]
+    fn nothing_sticks_out_and_landing_drops_follow_their_slider() {
+        // 第一版的雨夜：窗玻璃的"咚"和滴水的水泡一下比雨声高 15 dB 以上、每秒两三下，最高 26 dB，太吵。
+        // 参考的 8D 雨声（见 doc/effects.md）：全频 99.9% 分位 6–8.5 dB；150–500 Hz（落地声）99.9% 分位 11–12 dB。
+        let night = Params::default().bg_rain_night();
+        let (l, r) = render_with(&night, 40.0, 4096, false);
+        let full = excess(&l[FS as usize..], &r[FS as usize..], 100.0, 14000.0);
+        let (p999, max) = (pct(&full, 0.999), pct(&full, 1.0));
+        assert!(p999 < 8.0 && max < 11.0, "雨夜全频：99.9% 分位 {p999:.1} dB，最大 {max:.1} dB");
+        // 落地声：默认 30 比参考轻，60 和参考差不多，100 更明显；150–500 Hz 的 99.9% 分位
+        let low = |land: f32| {
+            let (l, r) = render_with(&Params { rain_near: land, ..night.clone() }, 40.0, 4096, false);
+            pct(&excess(&l[FS as usize..], &r[FS as usize..], 150.0, 500.0), 0.999)
+        };
+        let (a, b, c) = (low(30.0), low(60.0), low(100.0));
+        assert!(a < 10.5 && (10.5..15.0).contains(&b) && c > b + 2.0, "落地声 30 / 60 / 100：{a:.1} / {b:.1} / {c:.1} dB");
+    }
+
+    #[test]
+    fn flow_moves_the_rain_around_like_the_reference() {
+        // 1–4 kHz 左右差（每 0.5 s）的标准差：参考的 8D 雨声约 1.6 dB。流动 0 几乎不动，50 和参考差不多，100 更大
+        let ild_sd = |flow: f32| -> f32 {
+            let (l, r) = render(&Params { bg_flow: flow, ..bed(35.0, 0.0, 0.0, 100.0) }, 90.0, 4096);
+            let blk = (0.5 * FS) as usize;
+            let band = |x: &[f32]| -> Vec<f32> {
+                let (mut h0, mut h1) = (Biquad::highpass(1000.0, BUTTER_Q), Biquad::highpass(1000.0, BUTTER_Q));
+                let (mut g0, mut g1) = (Biquad::lowpass(4000.0, BUTTER_Q), Biquad::lowpass(4000.0, BUTTER_Q));
+                x.chunks_exact(blk)
+                    .map(|c| {
+                        c.iter()
+                            .map(|&v| {
+                                let y = g1.process(g0.process(h1.process(h0.process(v))));
+                                y * y
+                            })
+                            .sum::<f32>()
+                    })
+                    .collect()
+            };
+            let ild: Vec<f32> = band(&l).iter().zip(band(&r)).map(|(a, b)| 10.0 * (a / b).log10()).collect();
+            let m = ild.iter().sum::<f32>() / ild.len() as f32;
+            (ild.iter().map(|v| (v - m).powi(2)).sum::<f32>() / ild.len() as f32).sqrt()
+        };
+        let (a, b, c) = (ild_sd(0.0), ild_sd(50.0), ild_sd(100.0));
+        assert!(a < 0.7 && (1.0..2.3).contains(&b) && c > 3.0, "流动 0 / 50 / 100 的左右差标准差：{a:.2} / {b:.2} / {c:.2} dB");
+    }
+
+    /// 雷声这一层（同一个种子：有雷 − 没雷；`thunder` 是滑块 0–100）和雨声本身，各 `secs` 秒；外加打了几次雷。
+    fn thunder_layer(x: f32, secs: f32) -> (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, u64) {
+        let night = Params::default().bg_rain_night();
+        let run = |thunder: f32| -> (Vec<f32>, Vec<f32>, u64) {
+            let p = Params { bg_thunder: thunder, ..night.clone() };
+            let s = Arc::new(RainSetup::new(&p, Some(&tables().cdfc)).unwrap());
+            let pb = Arc::new(tables().cdfc.clone());
+            let mut rain = Rain::new(s, p.seed, Some(&pb)).steady();
+            rain.prime_gain(-16.0);
+            let n = (secs * FS) as usize;
+            let (mut l, mut r) = (vec![0f32; n], vec![0f32; n]);
+            for i in (0..n).step_by(4096) {
+                let m = 4096.min(n - i);
+                rain.render(-16.0, &mut l[i..i + m], &mut r[i..i + m]);
+            }
+            (l, r, rain.thunder_strikes())
+        };
+        let (l1, r1, k) = run(x);
+        let (l0, r0, k0) = run(0.0);
+        assert_eq!(k0, 0, "雷声 0 时不该打雷");
+        let tl = l1.iter().zip(&l0).map(|(a, b)| a - b).collect();
+        let tr = r1.iter().zip(&r0).map(|(a, b)| a - b).collect();
+        (tl, tr, l0, r0, k)
+    }
+
+    #[test]
+    fn thunder_is_optional_and_leaves_the_rain_alone() {
+        // 雷用自己的随机数：打开后第一声（3–10 秒）来之前，有雷和没雷逐样本相同；之后只是多了雷
+        let (tl, tr, l0, _, k) = thunder_layer(100.0, 20.0);
+        assert!(k >= 1, "20 秒里一声雷都没有");
+        let first = tl.iter().zip(&tr).position(|(a, b)| *a != 0.0 || *b != 0.0).unwrap();
+        assert!((3.0..10.5).contains(&(first as f32 / FS)), "第一声雷在 {:.1} s", first as f32 / FS);
+        assert!(energy(&tl[first..]) > 1e-3 * energy(&l0[first..]));
+    }
+
+    #[test]
+    fn thunder_rolls_low_and_follows_its_slider() {
+        // 多少：滑块 100 平均 25 秒一次（两次之间至少 8 秒），300 秒里约 12 次
+        let (tl, tr, l0, r0, k) = thunder_layer(100.0, 300.0);
+        assert!((6..=18).contains(&k), "300 秒打了 {k} 次雷");
+        // 低沉：250 Hz 以下占八成以上，1 kHz 以上不到 1%
+        let low = |x: &[f32], lo: f32, hi: f32| -> f64 {
+            let (mut h, mut g) = (Biquad::highpass(lo, BUTTER_Q), Biquad::lowpass(hi, BUTTER_Q));
+            x.iter().map(|&v| (g.process(h.process(v)) as f64).powi(2)).sum::<f64>()
+        };
+        let tot = energy(&tl) + energy(&tr);
+        let below = low(&tl, 10.0, 250.0) + low(&tr, 10.0, 250.0);
+        let above = {
+            let (mut a, mut b) = (Biquad::highpass(1000.0, BUTTER_Q), Biquad::highpass(1000.0, BUTTER_Q));
+            tl.iter().map(|&v| (a.process(v) as f64).powi(2)).sum::<f64>() + tr.iter().map(|&v| (b.process(v) as f64).powi(2)).sum::<f64>()
+        };
+        assert!(below / tot > 0.8 && above / tot < 0.01, "250 Hz 以下 {:.0}%，1 kHz 以上 {:.2}%", 100.0 * below / tot, 100.0 * above / tot);
+        // 会滚：第一声雷在它自己峰值 −20 dB 以内的时间跨度至少 4 秒（0.1 s 一格）
+        let blk = (0.1 * FS) as usize;
+        let env: Vec<f64> = tl.chunks(blk).zip(tr.chunks(blk)).take(250).map(|(a, b)| energy(a) + energy(b)).collect();
+        let pk = env.iter().cloned().fold(0.0, f64::max);
+        let on: Vec<usize> = (0..env.len()).filter(|&i| env[i] > pk * 0.01).collect();
+        let span = (on.last().unwrap() - on.first().unwrap()) as f32 * 0.1;
+        assert!(span >= 4.0, "第一声雷只滚了 {span:.1} s");
+        // 响度（K 加权、3 秒）：滑块 100 时最响的一声比雨声高 0–14 dB；滑块 30 时最响的明显更轻
+        let loud = |l: &[f32], r: &[f32]| -> Vec<f64> {
+            let (mut a, mut b) = (KWeight::new(), KWeight::new());
+            let e: Vec<f64> = l.chunks(blk * 5).zip(r.chunks(blk * 5)).map(|(x, y)| x.iter().map(|&v| (a.process(v) as f64).powi(2)).sum::<f64>() + y.iter().map(|&v| (b.process(v) as f64).powi(2)).sum::<f64>()).collect();
+            e.windows(6).map(|w| w.iter().sum::<f64>()).collect()
+        };
+        let rain = { let mut v = loud(&l0, &r0); v.sort_by(|a, b| a.total_cmp(b)); v[v.len() / 2] };
+        let peak = |l: &[f32], r: &[f32]| 10.0 * (loud(l, r).into_iter().fold(0.0, f64::max) / rain).log10();
+        let p100 = peak(&tl, &tr);
+        let (tl30, tr30, _, _, _) = thunder_layer(30.0, 300.0);
+        let p30 = peak(&tl30, &tr30);
+        assert!((0.0..14.0).contains(&p100) && p30 < p100 - 4.0, "最响的一声比雨声：雷声 100 {p100:+.1} dB，雷声 30 {p30:+.1} dB");
     }
 
     /// 倍频程能量（dB，相对 125 Hz 及以上各档的总和），中心 63, 125, …, 16000 Hz；两耳加起来。
@@ -1467,13 +1526,14 @@ pub mod tests {
 
     #[test]
     fn spectrum_matches_real_rain_recordings() {
-        // 真实录音（Freesound 试听版，见 doc/effects.md）的倍频程平均，相对 125 Hz 以上的总和：
-        // 室外 4 段（开窗双耳、树林双耳、树林小雨、大雨），屋里 2 段（关着窗的夜雨、雨打玻璃；125 Hz 只用前一段）
+        // 真实录音（Freesound 试听版，见 doc/effects.md）的倍频程，相对 125 Hz 以上的总和：
+        // 室外 4 段（开窗双耳、树林双耳、树林小雨、大雨）的平均；屋里是关着窗的夜雨那一段（贴着玻璃录的那段是密密的
+        // 雨打玻璃，窗玻璃上的雨点去掉之后不再和它比）
         const OUTDOOR: [f32; 9] = [-11.3, -12.5, -11.5, -8.8, -6.3, -7.0, -9.1, -14.1, -22.0];
-        const INDOOR: [f32; 9] = [-31.2, -3.6, -7.2, -7.7, -7.9, -8.7, -14.3, -22.5, -28.4];
+        const INDOOR: [f32; 9] = [-12.8, -3.6, -6.2, -9.4, -9.3, -11.4, -19.2, -25.9, -27.6];
         let cases = [
-            ("室外，雨量 35", Params { bg_level: 60.0, rain: 35.0, bg_indoor: 0.0, bg_width: 100.0, rain_near: 0.0, rain_drip: 0.0, ..Params::default() }, OUTDOOR),
-            ("关着窗，近处雨滴 30", Params { bg_level: 60.0, rain: 35.0, bg_indoor: 100.0, bg_width: 100.0, rain_near: 30.0, rain_drip: 0.0, ..Params::default() }, INDOOR),
+            ("室外，雨量 35", Params { rain_near: 0.0, ..bed(35.0, 0.0, 0.0, 100.0) }, OUTDOOR),
+            ("关着窗，落地声 30", Params { rain_near: 30.0, ..bed(35.0, 100.0, 0.0, 100.0) }, INDOOR),
         ];
         for (name, p, want) in cases {
             let (l, r) = render_with(&p, 40.0, 4096, false);

@@ -51,15 +51,19 @@ convert 的选项（括号里是默认值）：
   --start <秒> --duration <秒>      只处理一段
   --channel auto|left|right|mix     立体声取哪个声道（auto=更响的那个）
  背景音（实时生成的雨声，不用录音素材；人声不受影响。界面里叫「背景音」）
-  --bg rain-night|off     雨夜预设：关着窗在屋里听外面的小到中雨（雨主要从窗户那边来），窗玻璃上偶尔落一滴，屋檐在滴水，比人声低约 18 dB；
-                          后面写的背景音选项再覆盖它
+  --bg rain-night|off     雨夜预设：四面八方的小到中雨，重心绕着头慢慢转（8D 环绕），身边地上的落地声比参考的 8D 雨声轻一点，
+                          不隔窗、没有屋檐滴水，比人声低约 18 dB；后面写的背景音选项再覆盖它
   --bg-level <0–100>      音量（0 = 关）：1–100 对应比人声的目标响度低 40 … 0 dB（雨夜 55 = 低 18 dB）
   --rain <0–100>          雨量：毛毛雨 0.3 mm/h … 暴雨 60 mm/h（对数刻度，35）
   --bg-pan <−100–100>     雨从哪边来：−100 左、0 四周、100 右（0）
-  --bg-width <0–100>      包围感：0 只从一个方向来，100 四面八方（60）
-  --bg-indoor <0–100>     隔窗：0 站在雨里，100 关着窗在屋里（90）
-  --rain-near <0–100>     近处雨滴：窗玻璃 / 窗台 / 树叶 / 水洼上听得清的一滴一滴，100 ≈ 每秒 12 滴（30）
-  --rain-drip <0–100>     屋檐滴水：越大越快、地方越多（最多 3 处），0 = 没有（35）
+  --bg-width <0–100>      包围感：0 只从一个方向来，100 四面八方（100）
+  --bg-flow <0–100>       流动：雨声的重心绕着头慢慢转（平均 30 秒一圈），0 不动，50 和参考的 8D 雨声一样（50）
+  --bg-indoor <0–100>     隔窗：0 站在雨里，100 关着窗在屋里（0）
+  --rain-land <0–100>     落地声：身边地上雨点「噗」的一声，0 = 没有，60 ≈ 参考的 8D 雨声，每格 0.2 dB；
+                          屋檐滴水的响度也跟着它（30；旧名 --rain-near 照样能用）
+  --rain-drip <0–100>     屋檐滴水「嗒」：越大越快、地方越多（最多 3 处），0 = 没有（0）
+  --thunder <0–100>       雷声（可选）：0 = 没有；越大越近、越频繁、越响——1 ≈ 4 分钟一次、8 km 外的闷雷，
+                          50 ≈ 77 秒、3.5 km，100 ≈ 25 秒、1.5 km；打开后 3–10 秒内来第一声（0）
  贴耳感
   --dist <米>             贴耳时嘴到头中心的距离（0.105，即离耳约 1.7 cm）
   --isolation <dB>        远耳额外压低（32）      --presence <dB>     近耳临场感（3）
@@ -130,8 +134,10 @@ fn parse_bg_option(p: &mut Params, name: &str, it: &mut std::iter::Peekable<std:
         "--bg-pan" => p.bg_pan = f(-100.0, 100.0)?,
         "--bg-width" => p.bg_width = f(0.0, 100.0)?,
         "--bg-indoor" => p.bg_indoor = f(0.0, 100.0)?,
-        "--rain-near" => p.rain_near = f(0.0, 100.0)?,
+        "--rain-land" | "--rain-near" => p.rain_near = f(0.0, 100.0)?,
+        "--bg-flow" => p.bg_flow = f(0.0, 100.0)?,
         "--rain-drip" => p.rain_drip = f(0.0, 100.0)?,
+        "--thunder" => p.bg_thunder = f(0.0, 100.0)?,
         _ => return Ok(false),
     }
     Ok(true)
@@ -203,12 +209,12 @@ fn run_bg(args: &[String]) -> Result<(), String> {
     wav.finalize().map_err(|e| e.to_string())?;
     println!("{}", crate::dsp::rain::describe(&Params { bg_level: 55.0, ..p.clone() }, false).replace("比人声低 18 dB，", ""));
     println!(
-        "完成：{}  ({secs:.1} s，{:.1} LUFS；近处雨滴 {} 滴，屋檐滴水 {} 滴，水洼里的\"叮\" {} 个；生成用时 {:.2} s)",
+        "完成：{}  ({secs:.1} s，{:.1} LUFS；落地声 {} 个，屋檐滴水 {} 滴，雷 {} 次；生成用时 {:.2} s)",
         out.display(),
         meter.integrated(),
-        rain.n_near,
+        rain.n_land,
         rain.n_drips,
-        rain.n_plinks,
+        rain.thunder_strikes(),
         t0.elapsed().as_secs_f64()
     );
     Ok(())
@@ -1078,8 +1084,11 @@ fn bench() {
     let x = test_voice(30.0);
     // 掏耳预设用刮擦声来测（给触发音用的），其余用人声
     let scratch = test_scratch(30.0);
-    let cases: [(&str, Params); 4] = [
+    let cases: [(&str, Params); 7] = [
         ("贴耳加强（默认）", Params::default()),
+        ("贴耳加强 + 雨夜背景音", Params::default().bg_rain_night()),
+        ("贴耳加强 + 雨（落地声 100、屋檐滴水 100、暴雨）", Params { rain: 100.0, rain_near: 100.0, rain_drip: 100.0, ..Params::default().bg_rain_night() }),
+        ("贴耳加强 + 雨夜 + 雷声 100", Params { bg_thunder: 100.0, ..Params::default().bg_rain_night() }),
         ("掏耳（入耳：耳道共鸣 + 耳内低频）", Params::default().style_earclean()),
         ("KU100 风格（真实房间）", Params::default().style_ku100()),
         ("KU100 风格 + 降噪 + 去齿音 + 轻声化", {

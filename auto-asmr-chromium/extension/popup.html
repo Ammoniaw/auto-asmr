@@ -24,15 +24,18 @@
         cursor: pointer;
         text-decoration: none;
       }
+      .power {
+        padding: 10px 12px;
+        border: 1px solid var(--line);
+        border-radius: 8px;
+        background: var(--panel);
+      }
       #tab {
         white-space: nowrap;
         overflow: hidden;
         text-overflow: ellipsis;
-        margin-bottom: 8px;
-      }
-      #toggle {
-        width: 100%;
-        padding: 8px;
+        margin: 4px 2px 0;
+        font-size: 12px;
       }
       .live {
         display: flex;
@@ -83,8 +86,11 @@
       <h1>auto-asmr</h1>
       <a id="options">全部参数 / 导入配置</a>
     </header>
+    <label class="switch power" title="点插件图标就会开始处理；关掉开关停止">
+      <input id="toggle" type="checkbox" role="switch" disabled />
+      <span>处理这个标签页的声音</span>
+    </label>
     <div id="tab" class="muted"></div>
-    <button id="toggle" class="primary" disabled>开始处理这个标签页的声音</button>
 
     <div class="live">
       <canvas id="radar" width="184" height="184"></canvas>
@@ -117,7 +123,7 @@
       </div>
     </div>
 
-    <footer class="muted">快捷键 <span id="key">Alt+Shift+A</span> 开始 / 停止当前标签页。</footer>
+    <footer class="muted">点插件图标就开始处理当前标签页。快捷键 <span id="key">Alt+Shift+A</span> 不用打开弹窗就能开始 / 停止。</footer>
     <script type="module" src="popup.js"></script>
   </body>
 </html>

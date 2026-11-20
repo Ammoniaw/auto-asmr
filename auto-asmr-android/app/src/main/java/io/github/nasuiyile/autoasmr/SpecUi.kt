@@ -41,8 +41,14 @@ object SpecUi {
             v < 0 -> f("左 %.0f", -v)
             else -> f("右 %.0f", v)
         }
-        "near" -> if (v < 0.5) "0 无" else f("%.0f · %.1f/s", v, 0.12 * v)
+        "flow" -> if (v < 0.5) "0 不动" else f("%.0f", v)
+        "land" -> if (v < 0.5) "0 无" else f("%.0f · %+.0f dB", v, 0.2 * (v - 60))
         "drip" -> if (v < 0.5) "0 无" else f("%.0f · %d 处", v, if (v < 34) 1 else if (v < 67) 2 else 3)
+        "thunder" -> if (v < 0.5) "0 无" else {
+            val i = 240.0 * (25.0 / 240.0).pow(v / 100)
+            val d = 8.0 * (1.5 / 8.0).pow(v / 100)
+            if (i >= 90) f("%.0f · %.0f 分钟 · %.1f km", v, i / 60, d) else f("%.0f · %.0f s · %.1f km", v, i, d)
+        }
         "plain" -> f("%.0f", v)
         else -> {
             val unit = item.optString("unit")

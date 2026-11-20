@@ -726,8 +726,8 @@
      "action": "bg_rain_night",
      "label": "雨夜",
      "label_en": "Rainy night",
-     "tip": "关着窗在屋里听外面的小到中雨（约 2 mm/h），雨主要从窗户那边来；窗玻璃上偶尔落一滴，屋檐在滴水；雨声比人声低约 18 dB。只改背景音这几项",
-     "tip_en": "Light-to-moderate rain heard indoors through a closed window; 18 dB below the voice. Only changes the background settings"
+     "tip": "四面八方的小到中雨（约 2 mm/h），重心绕着头慢慢转（8D 环绕）；身边地上的落地声比参考的 8D 雨声轻一点；不隔窗、没有屋檐滴水；雨声比人声低约 18 dB。只改背景音这几项",
+     "tip_en": "Light-to-moderate rain all around you, its centre slowly circling your head (8D surround); landing drops a little softer than the 8D reference; 18 dB below the voice. Only changes the background settings"
     },
     {
      "action": "bg_off",
@@ -750,7 +750,7 @@
      "key": "bg_level",
      "label": "音量",
      "label_en": "Volume",
-     "tip": "雨声比人声的目标响度低多少：1 = 低 40 dB，100 = 一样响；0 = 关闭。整片雨声按这个定响度，近处雨滴和滴水在它之上",
+     "tip": "雨声比人声的目标响度低多少：1 = 低 40 dB，100 = 一样响；0 = 关闭。整片雨声按这个定响度，落地声和滴水在它之上",
      "tip_en": "How far below the voice's target loudness the rain sits: 1 = 40 dB below, 100 = as loud; 0 = off",
      "min": 0.0,
      "max": 100.0,
@@ -763,7 +763,7 @@
      "key": "rain",
      "label": "雨量",
      "label_en": "Rain",
-     "tip": "毛毛雨（0.3 mm/h）… 暴雨（60 mm/h）。雨越大，大雨滴越多、越密、越低沉，水洼里的「叮」也越多；也会响一点（±5 dB）",
+     "tip": "毛毛雨（0.3 mm/h）… 暴雨（60 mm/h）。雨越大，大雨滴越多、越密、越低沉，落地声也越多；也会响一点（±5 dB）",
      "tip_en": "Drizzle (0.3 mm/h) … downpour (60 mm/h)",
      "min": 0.0,
      "max": 100.0,
@@ -799,10 +799,23 @@
     },
     {
      "type": "slider",
+     "key": "bg_flow",
+     "label": "流动",
+     "label_en": "Flow",
+     "tip": "雨声的重心绕着头慢慢转（8D 环绕，平均 26 秒一圈，快慢随机）：那个方向的雨落得密一些。0 = 不动，50 = 和参考的 8D 雨声一样，100 = 更明显",
+     "tip_en": "The rain's centre slowly circles your head (8D surround). 0 = still, 50 = like the 8D reference, 100 = stronger",
+     "min": 0.0,
+     "max": 100.0,
+     "decimals": 0,
+     "step": 1.0,
+     "fmt": "flow"
+    },
+    {
+     "type": "slider",
      "key": "bg_indoor",
      "label": "隔窗",
      "label_en": "Window",
-     "tip": "0 = 站在雨里，100 = 关着窗在屋里听：墙和玻璃挡掉高频，只剩闷闷的雨声；窗玻璃上的雨点不闷，越隔窗越突出；屋檐滴水挡一半",
+     "tip": "0 = 站在雨里，100 = 关着窗在屋里听：墙和玻璃挡掉高频，只剩闷闷的雨声；落地声一起闷掉，屋檐滴水挡一半",
      "tip_en": "0 = standing in the rain, 100 = indoors with the window shut",
      "min": 0.0,
      "max": 100.0,
@@ -813,28 +826,41 @@
     {
      "type": "slider",
      "key": "rain_near",
-     "label": "近处雨滴",
-     "label_en": "Near drops",
-     "tip": "身边听得清的一滴一滴：隔窗时多是落在窗玻璃和窗台上，在外面时多是树叶和水洼；100 ≈ 每秒 12 滴。0 = 没有",
-     "tip_en": "Single drops you can pick out nearby; 100 ≈ 12 per second. 0 = none",
+     "label": "落地声",
+     "label_en": "Landing drops",
+     "tip": "身边地上一个个雨点「噗」的一声（低沉、短促，按 HRTF 摆在四周地上）有多明显：0 = 没有，60 ≈ 参考的 8D 雨声，每格 0.2 dB；雨越大落得越多。屋檐滴水的响度也跟着它",
+     "tip_en": "How noticeable the single drops landing around you are: 0 = none, 60 ≈ the 8D reference, 0.2 dB per step. Eave drips follow this loudness too",
      "min": 0.0,
      "max": 100.0,
      "decimals": 0,
      "step": 1.0,
-     "fmt": "near"
+     "fmt": "land"
     },
     {
      "type": "slider",
      "key": "rain_drip",
      "label": "屋檐滴水",
      "label_en": "Eave drips",
-     "tip": "屋檐 / 水管往水洼里滴的「滴答」：1–3 处固定的位置，各有各的节奏和音高。越大滴得越快、地方越多；0 = 没有",
-     "tip_en": "Drips from the eaves into a puddle: 1–3 fixed spots. 0 = none",
+     "tip": "屋檐往石阶 / 积水的地上滴的「嗒」：1–3 处固定的位置，各有各的节奏，溅水声高低不同。越大滴得越快、地方越多；0 = 没有。多响跟着「落地声」，落地声为 0 时听不到",
+     "tip_en": "Drips from the eaves onto wet stone: 1–3 fixed spots. 0 = none. Loudness follows Landing drops",
      "min": 0.0,
      "max": 100.0,
      "decimals": 0,
      "step": 1.0,
      "fmt": "drip"
+    },
+    {
+     "type": "slider",
+     "key": "bg_thunder",
+     "label": "雷声",
+     "label_en": "Thunder",
+     "tip": "远处的雷（可选，默认没有）：曲折的闪电通道上每一段发出一个激波，按距离先后到达、按 HRTF 从天上各个方向来，远的只剩低沉的隆隆声，还有地形的回声。0 = 没有；越大越近、越频繁、越响：30 ≈ 两分钟一次、5 km 外，50 ≈ 77 秒、3.5 km，100 ≈ 25 秒、1.5 km",
+     "tip_en": "Distant thunder (optional, off by default). 0 = none; higher = closer, more frequent and louder: 30 ≈ every 2 min at 5 km, 100 ≈ every 25 s at 1.5 km",
+     "min": 0.0,
+     "max": 100.0,
+     "decimals": 0,
+     "step": 1.0,
+     "fmt": "thunder"
     }
    ]
   },
