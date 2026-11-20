@@ -392,6 +392,10 @@ impl App {
             if let Some(v) = std::env::var("AUTO_ASMR_SHOT_DUO").ok().and_then(|v| v.trim().parse::<f32>().ok()) {
                 app.s.duo_ms = v.clamp(0.0, DUO_MAX_MS);
             }
+            // AUTO_ASMR_SHOT_RT_DUO=<毫秒>：实时（主播）页的左右双人
+            if let Some(v) = std::env::var("AUTO_ASMR_SHOT_RT_DUO").ok().and_then(|v| v.trim().parse::<f32>().ok()) {
+                app.s.rt_duo_ms = v.clamp(0.0, DUO_MAX_MS);
+            }
             // AUTO_ASMR_SHOT_BALANCE=<0–100>：合成的自动平衡强度
             if let Some(v) = std::env::var("AUTO_ASMR_SHOT_BALANCE").ok().and_then(|v| v.trim().parse::<f32>().ok()) {
                 app.s.mix_balance = v.clamp(0.0, 100.0);
@@ -461,6 +465,11 @@ impl App {
         !self.multi() && self.s.duo_ms > 0.0 && self.file_in.is_some()
     }
 
+    /// 实时（主播）页的左右双人是否打开：麦克风的声音一左一右两个人说。
+    fn mic_duo(&self) -> bool {
+        self.s.tab == Tab::Realtime && self.s.rt_duo_ms > 0.0
+    }
+
     /// 试听、位置图按"几个声音合成"来：多音频合成，或左右双人（同一个音频当成两个声音）。
     fn mixing(&self) -> bool {
         self.multi() || self.duo()
@@ -471,10 +480,12 @@ impl App {
         self.multi() && self.s.mix_align
     }
 
-    /// 各声音比时间线晚多少个样本：左右双人的第 2 个声音晚 `duo_ms`，其余都是 0。
+    /// 各声音比时间线晚多少个样本：左右双人的第 2 个声音晚 `duo_ms`（实时页是 `rt_duo_ms`），其余都是 0。
     fn mix_delays(&self) -> [usize; MAX_VOICES] {
         let mut d = [0; MAX_VOICES];
-        if self.duo() {
+        if self.mic_duo() {
+            d[1] = mix::delay_samples(self.s.rt_duo_ms);
+        } else if self.duo() {
             d[1] = mix::delay_samples(self.s.duo_ms);
         }
         d
@@ -485,9 +496,9 @@ impl App {
         (!self.multi() && self.s.duo_ms > 0.0).then(|| Duo { delay_ms: self.s.duo_ms, voices: self.duo_voices, follow: self.s.mix_follow, balance: self.s.mix_balance / 100.0 })
     }
 
-    /// 改第 k 个声音的位置 / 音量：多音频合成按文件记，左右双人记在自己的两个位置里。
+    /// 改第 k 个声音的位置 / 音量：多音频合成按文件记，左右双人（文件和实时共用）记在自己的两个位置里。
     fn set_mix_voice(&mut self, k: usize, v: Voice) {
-        if self.duo() {
+        if self.mic_duo() || self.duo() {
             if let Some(d) = self.duo_voices.get_mut(k) {
                 *d = v;
             }
@@ -513,9 +524,24 @@ impl App {
         }
     }
 
-    /// 位置图、右侧参数是否按合成显示（只在文件页）。
+    /// 改实时（主播）页左右双人的延迟（0 = 关）。运行中开 / 关时按新的方式重新开始（单个引擎 ↔ 两个声音）；
+    /// 只是改延迟时实时生效（淡过去）。
+    fn set_rt_duo(&mut self, ms: f32) {
+        let was = self.mic_duo();
+        self.s.rt_duo_ms = ms.clamp(0.0, DUO_MAX_MS);
+        if self.mic_duo() == was {
+            return;
+        }
+        self.mix_trails.clear();
+        self.mix_sel = None;
+        if self.rt.is_some() && !self.rt_preview {
+            self.start_mic();
+        }
+    }
+
+    /// 位置图、右侧参数是否按合成显示：文件页的多音频合成 / 左右双人，或实时页的左右双人。
     fn mix_view(&self) -> bool {
-        self.s.tab == Tab::File && self.mixing()
+        (self.s.tab == Tab::File && self.mixing()) || self.mic_duo()
     }
 
     /// 参与合成的音频：列表里的前 [`MAX_VOICES`] 个；左右双人是选中的那个音频两次。
@@ -528,7 +554,7 @@ impl App {
 
     /// 参与合成的每个音频的位置和音量。
     fn mix_voices(&self) -> Vec<Voice> {
-        if self.duo() {
+        if self.mic_duo() || self.duo() {
             return self.duo_voices.to_vec();
         }
         let mut used: Vec<Voice> = Vec::new();
@@ -571,7 +597,8 @@ impl App {
 
     /// 当前合成用的自动平衡数据（强度为 0、或音频还没准备好时没有）。
     fn cur_balance(&self) -> Option<Arc<BalanceData>> {
-        if self.s.mix_balance <= 0.0 {
+        // 实时页的左右双人没有自动平衡（要事先知道整段的响度）
+        if self.s.mix_balance <= 0.0 || self.mic_duo() {
             return None;
         }
         let t = self.mix_audio.as_ref().filter(|m| m.paths == self.mix_paths() && m.ch == self.s.file_channel)?.tracks(self.align_on())?;
@@ -581,7 +608,7 @@ impl App {
 
     /// 每帧：自动平衡的输入响度数据跟当前这组音频（对齐与否）不符时重算（由 10 ms 均方算，很快）。强度不影响它。
     fn sync_balance(&mut self) {
-        if !self.mixing() || self.s.mix_balance <= 0.0 {
+        if !self.mixing() || self.s.mix_balance <= 0.0 || self.mic_duo() {
             return;
         }
         let Some(t) = self.mix_audio.as_ref().filter(|m| m.paths == self.mix_paths() && m.ch == self.s.file_channel).and_then(|m| m.tracks(self.align_on())) else { return };
@@ -616,7 +643,8 @@ impl App {
             .collect()
     }
 
-    /// 切换合成的排布（各自固定 / 一起移动）。合成试听中切换时从当前位置重新开始（几个引擎的走位要从头对齐）。
+    /// 切换合成的排布（各自固定 / 一起移动）。合成试听中切换时从当前位置重新开始（几个引擎的走位要从头对齐）；
+    /// 主播模式的左右双人也重新开始。
     fn set_mix_follow(&mut self, follow: bool) {
         if follow == self.s.mix_follow {
             return;
@@ -624,7 +652,11 @@ impl App {
         self.s.mix_follow = follow;
         self.mix_trails.clear();
         if self.rt_mix && self.rt.is_some() {
-            self.start_mix_preview();
+            if self.rt_preview {
+                self.start_mix_preview();
+            } else {
+                self.start_mic();
+            }
         }
     }
 
@@ -880,11 +912,22 @@ impl App {
     fn start_mic(&mut self) {
         self.stop();
         self.sync_params();
-        match Realtime::start(&self.rt_options(), self.cfg.clone()) {
+        // 左右双人：两个声音都来自麦克风，本来就是同一个声音，不用做响度对齐
+        let duo = self.mic_duo().then(|| self.mix_setup(&[None, None]));
+        let started = match &duo {
+            Some((_, setup)) => Realtime::start_duo(&self.rt_options(), setup.clone()),
+            None => Realtime::start(&self.rt_options(), self.cfg.clone()),
+        };
+        match started {
             Ok(rt) => {
                 rt.shared.monitor_dry.store(self.s.dry, Ordering::Relaxed);
-                self.status = format!("{}：{} → {}（{} Hz → {} Hz）", t("运行中", "Running"), rt.info.input_name, rt.info.output_name, rt.info.in_rate, rt.info.out_rate);
+                let note = if duo.is_some() { format!("；{} {:.0} ms", t("左右双人，第 2 个声音晚", "two voices, the second one later by"), self.s.rt_duo_ms) } else { String::new() };
+                self.status = format!("{}：{} → {}（{} Hz → {} Hz）{note}", t("运行中", "Running"), rt.info.input_name, rt.info.output_name, rt.info.in_rate, rt.info.out_rate);
                 self.rt = Some(rt);
+                if let Some(d) = duo {
+                    self.rt_mix = true;
+                    self.mix_sent = Some(d);
+                }
             }
             Err(e) => self.status = e,
         }
@@ -1221,7 +1264,7 @@ impl App {
             // 手动摆位：在俯视图里点 / 拖改方位和距离，在右侧竖条上点 / 拖改高度（双击竖条回到与耳朵齐平）。
             // 合成"一起移动"时抓住离按下点最近的那个音源，拖它就是挪整组（其余音源保持错开的角度）
             let origin = ui.input(|i| i.pointer.press_origin());
-            let offsets = if follow { mix::follow_offsets(self.files.len().min(MAX_VOICES), true) } else { Vec::new() };
+            let offsets = if follow { mix::follow_offsets(self.mix_voices().len(), true) } else { Vec::new() };
             if resp.is_pointer_button_down_on() {
                 if follow && self.mix_drag.is_none() {
                     if let Some(o) = origin.filter(|&o| !on_gauge(o)) {
@@ -1375,7 +1418,9 @@ impl App {
                 let (up, _, plan_r) = up_angle(q[0], q[1], q[2]);
                 p.text(rect.left_top() + egui::vec2(8.0, 6.0), egui::Align2::LEFT_TOP, format!("{} {}  {} {:.1} cm   {:.0}°{}", t("音源", "Source"), k + 1, t("离耳", "from ear"), ((plan_r - HEAD_A) * 100.0).max(0.0), q[0], hgt_text(up)), egui::FontId::proportional(12.0), VOICE_COLORS[k]);
             }
-            let hint = if !follow {
+            let hint = if !follow && (self.mic_duo() || self.duo()) {
+                t("拖动圆圈，改两个声音的位置", "drag a ring to move that voice")
+            } else if !follow {
                 t("拖动圆圈，改各音频的位置", "drag a ring to move that file")
             } else if manual {
                 t("拖任意一个，整组一起挪 · 右侧拖高度", "drag any dot to move the group · height at right")
@@ -1505,6 +1550,7 @@ impl App {
                 }
             }
         });
+        self.ui_rt_duo(ui);
         ui.label(
             RichText::new(t(
                 "直播时把输出设备选成虚拟声卡（如 VB-Cable / BlackHole），再在直播软件里把它当作麦克风。自己监听请戴耳机，外放听不出效果。",
@@ -1642,7 +1688,7 @@ impl App {
         });
         // 合成的排布：各自固定 / 一起移动
         if self.s.mix {
-            self.ui_layout_row(ui, busy);
+            self.ui_layout_row(ui, busy, true);
         }
         // 合成前自动对齐：同一首歌的几个版本（前奏长短不同、编曲不同），从一起开始唱的地方叠加
         if self.s.mix {
@@ -1755,8 +1801,9 @@ impl App {
         }
     }
 
-    /// 合成的排布（各自固定 / 一起移动）和自动平衡：多音频合成和左右双人共用。
-    fn ui_layout_row(&mut self, ui: &mut egui::Ui, busy: bool) {
+    /// 合成的排布（各自固定 / 一起移动）和自动平衡：多音频合成和左右双人共用。`balance`：显示自动平衡
+    /// （实时页的左右双人没有：它要事先知道整段的响度）。
+    fn ui_layout_row(&mut self, ui: &mut egui::Ui, busy: bool, balance: bool) {
         ui.horizontal(|ui| {
             ui.label(t("排布", "Layout"));
             let mut follow = self.s.mix_follow;
@@ -1770,6 +1817,9 @@ impl App {
             ));
             if follow != self.s.mix_follow {
                 self.set_mix_follow(follow);
+            }
+            if !balance {
+                return;
             }
             // 自动平衡（0 = 关）：和排布放在一行，不多占高度
             ui.add_space(8.0);
@@ -1802,12 +1852,7 @@ impl App {
                 ui.label(t("左右双人", "Two voices")).on_hover_text(tip);
                 ui.spacing_mut().slider_width = 140.0;
                 let mut v = self.s.duo_ms;
-                let slider = egui::Slider::new(&mut v, 0.0..=DUO_MAX_MS)
-                    .step_by(1.0)
-                    .fixed_decimals(0)
-                    .custom_formatter(|x, _| if x < 0.5 { t("0 关", "0 off").to_string() } else { format!("{x:.0} ms") })
-                    .custom_parser(|s| s.trim().split(|c: char| !(c.is_ascii_digit() || c == '.')).find(|w| !w.is_empty()).and_then(|w| w.parse::<f64>().ok()));
-                if ui.add(slider).on_hover_text(tip).changed() {
+                if ui.add(duo_slider(&mut v)).on_hover_text(tip).changed() {
                     self.set_duo(v);
                 }
             });
@@ -1823,11 +1868,19 @@ impl App {
         if !self.duo() {
             return;
         }
-        // 两个声音放在一行：颜色和编号（和位置图一致）、位置、音量；一起移动时位置由走位决定
+        self.ui_duo_voices(ui, busy, self.s.duo_ms);
+        if !self.s.mix {
+            self.ui_layout_row(ui, busy, true);
+        }
+    }
+
+    /// 左右双人的两个声音放在一行：颜色和编号（和位置图一致）、位置、音量；一起移动时位置由走位决定。
+    /// 文件页和实时页共用这两个位置。`ms`：第 2 个声音晚多少毫秒（写在提示里）。
+    fn ui_duo_voices(&mut self, ui: &mut egui::Ui, busy: bool, ms: f32) {
         let combo_w = if ENGLISH.load(Ordering::Relaxed) { 104.0 } else { 64.0 };
         let follow = self.s.mix_follow;
         let offsets = mix::follow_offsets(2, true);
-        let names = [t("1 号：原声（准时）", "1: the original (on time)").to_string(), format!("{} {:.0} ms", t("2 号：晚", "2: later by"), self.s.duo_ms)];
+        let names = [t("1 号：原声（准时）", "1: the original (on time)").to_string(), format!("{} {:.0} ms", t("2 号：晚", "2: later by"), ms)];
         ui.horizontal(|ui| {
             for k in 0..2 {
                 if k == 1 {
@@ -1848,9 +1901,30 @@ impl App {
                 self.duo_voices[k] = v;
             }
         });
-        if !self.s.mix {
-            self.ui_layout_row(ui, busy);
+    }
+
+    /// 实时（主播）页的左右双人：麦克风的声音变成一左一右两个人，第 2 个晚一点。下面是两个声音的位置 / 音量和排布
+    /// （没有自动平衡）。运行中拖滑条实时生效；从 0 拖上来、拖回 0 时重新开始一下。
+    fn ui_rt_duo(&mut self, ui: &mut egui::Ui) {
+        let tip = t(
+            "把你的声音变成两个人：同一个声音一个在左耳、一个在右耳（各自忽远忽近），第 2 个整体晚这么多毫秒，听起来是两个人一前一后地说。30 ms 以下两边容易融成一个声音（听起来偏在先到的那一边），50–120 ms 像两个人，150 ms 以上像回声。只有第 2 个声音晚，第 1 个和平时一样及时。打开后下面可以改两个声音的位置、音量和排布；运行中拖这个滑条实时生效，从 0 拖上来或拖回 0 时会重新开始一下。处理量约是平时的两倍。0 = 关闭",
+            "Turns your voice into two people: the same voice at the left ear and at the right ear (each sways near and far on its own), the second one this many milliseconds later, so it sounds like two people speaking one after the other. Below about 30 ms the two tend to fuse into one voice (heard on the earlier side); 50–120 ms sounds like two people; above 150 ms it sounds like an echo. Only the second voice is delayed; the first is as immediate as usual. When on, the two voices' positions, volumes and layout can be set below; dragging this slider while running takes effect live, and turning it on or off restarts briefly. Uses about twice the processing. 0 = off",
+        );
+        ui.horizontal(|ui| {
+            ui.label(t("左右双人", "Two voices")).on_hover_text(tip);
+            ui.spacing_mut().slider_width = 140.0;
+            let mut v = self.s.rt_duo_ms;
+            if ui.add(duo_slider(&mut v)).on_hover_text(tip).changed() {
+                self.set_rt_duo(v);
+            }
+            let note = if self.s.rt_duo_ms <= 0.0 { t("你的声音一左一右两个人说", "your voice on both sides") } else { t("50–120 ms 最像两个人", "50–120 ms: most like two people") };
+            ui.label(RichText::new(note).small().weak());
+        });
+        if !self.mic_duo() {
+            return;
         }
+        self.ui_duo_voices(ui, false, self.s.rt_duo_ms);
+        self.ui_layout_row(ui, false, false);
     }
 
     /// 文件列表右侧的状态：等待 / 进度条 / 完成 / 失败。
@@ -2398,7 +2472,8 @@ impl App {
         }
         // 合成试听：参数、位置或音量变了，重新算各音源的配置交给音频线程（文件组变了时 sync_mix 会停掉重来）
         if self.rt_mix && self.rt.is_some() {
-            let lufs = self.mix_audio.as_ref().filter(|m| m.paths == self.mix_paths()).and_then(|m| m.tracks(self.align_on())).map(|t| t.lufs);
+            // 主播模式的左右双人：两个声音都是麦克风，不做响度对齐
+            let lufs = if self.mic_duo() { Some(vec![None; 2]) } else { self.mix_audio.as_ref().filter(|m| m.paths == self.mix_paths()).and_then(|m| m.tracks(self.align_on())).map(|t| t.lufs) };
             self.sync_balance();
             let bal = self.cur_balance();
             if let Some(lufs) = lufs {
@@ -2703,7 +2778,7 @@ impl eframe::App for App {
         let wait = self.shot_wait.unwrap_or(if self.file_in.is_some() { 150 } else { 20 });
         let drag_note = self.shot_drag.map(|_| {
             let mut s = format!("手动位置：方位角 {:.1}°，到头中心 {:.3} m，高度 {:.1}°", self.s.params.manual_az, self.s.params.manual_dist, self.s.params.manual_tilt);
-            if self.mixing() {
+            if self.mixing() || self.mic_duo() {
                 for (k, v) in self.mix_voices().iter().enumerate() {
                     s.push_str(&format!("\n合成音源 {}：方位角 {:.1}°，到头中心 {}", k + 1, v.az, v.dist.map_or("贴耳".to_string(), |d| format!("{d:.3} m"))));
                 }
@@ -2827,6 +2902,15 @@ fn mix_report_text(rep: &ConvertReport, out: &Path, desc: &str) -> String {
     ) + &if rep.align_note.is_empty() { String::new() } else { format!("\n{}", rep.align_note) }
         + &if rep.balance_note.is_empty() { String::new() } else { format!("\n{}", rep.balance_note) }
         + &if rep.bg_note.is_empty() { String::new() } else { format!("\n{}", rep.bg_note) }
+}
+
+/// 左右双人的延迟滑条（0–300 ms，0 = 关），文件页和实时页共用。
+fn duo_slider(v: &mut f32) -> egui::Slider<'_> {
+    egui::Slider::new(v, 0.0..=DUO_MAX_MS)
+        .step_by(1.0)
+        .fixed_decimals(0)
+        .custom_formatter(|x, _| if x < 0.5 { t("0 关", "0 off").to_string() } else { format!("{x:.0} ms") })
+        .custom_parser(|s| s.trim().split(|c: char| !(c.is_ascii_digit() || c == '.')).find(|w| !w.is_empty()).and_then(|w| w.parse::<f64>().ok()))
 }
 
 fn playback_time(seconds: f64) -> String {

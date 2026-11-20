@@ -2,6 +2,9 @@
 //!
 //! 输入回调把麦克风的声音（重采样到 48 kHz）写进无锁环形缓冲；输出回调取出来、过引擎、再重采样到
 //! 输出设备的采样率。两个设备的时钟不会完全一致，用输出端重采样比例的微调（±0.5%）把缓冲量稳在目标值。
+//!
+//! 主播模式的左右双人：麦克风的声音同时交给两个引擎（[`Mixer`]，一个在左耳、一个在右耳），输出回调把麦克风的输入
+//! 记进一小段历史（[`HIST`]），第 2 个声音从里面晚几十毫秒取——和试听文件时的左右双人是同一套做法。
 
 use crate::dsp::engine::{Engine, EngineConfig, PostMode, Telemetry};
 use crate::dsp::mix::{self, MixSetup, Mixer, MAX_VOICES};
@@ -395,11 +398,36 @@ struct Pump {
     dl: [usize; MAX_VOICES],
     dl_old: [usize; MAX_VOICES],
     dl_fade: usize,
+    /// 主播模式的左右双人：麦克风输入的历史（环形，[`HIST`] 个样本）和已经写进去多少个样本。其余情况为空。
+    hist: Vec<f32>,
+    hist_pos: usize,
 }
 
 const N: usize = 64;
 /// 试听中改了延迟：从旧的位置淡到新的位置用多少样本（20 ms），免得一下跳过去咔嗒一声。
 const DL_FADE: usize = 960;
+/// 主播模式左右双人的输入历史（样本，2 的幂）：要装得下最长的延迟（300 ms = 14400 个样本）再加一块。
+const HIST: usize = 1 << 15;
+const _: () = assert!(HIST >= (mix::DUO_MAX_MS as usize) * FS_USIZE / 1000 + N);
+
+/// 各声音这一块（时间线上 `pos..pos+N`）的输入：第 k 个按"t − 它的延迟"取（左右双人的第 2 个声音晚一点）。
+/// `fading`：改了延迟后的淡变已经走了多少样本，期间是新旧两个位置的混合。`get(k, s)`：第 k 段的第 s 个样本。
+fn read_delayed(inbs: &mut [Vec<f32>], pos: usize, dl: &[usize; MAX_VOICES], dl_old: &[usize; MAX_VOICES], fading: Option<usize>, get: impl Fn(usize, usize) -> f32) {
+    for (k, b) in inbs.iter_mut().enumerate() {
+        let at = |t: usize, d: usize| if t >= d { get(k, t - d) } else { 0.0 };
+        let (new, old) = (dl[k], dl_old[k]);
+        for (i, v) in b[..N].iter_mut().enumerate() {
+            let t = pos + i;
+            *v = match fading {
+                Some(done) if new != old => {
+                    let w = ((done + i + 1) as f32 / DL_FADE as f32).min(1.0);
+                    at(t, old) * (1.0 - w) + at(t, new) * w
+                }
+                _ => at(t, new),
+            };
+        }
+    }
+}
 
 impl Pump {
     #[cfg(test)]
@@ -420,7 +448,13 @@ impl Pump {
             }
             Source::Ring(_) => {}
         }
-        let n_in = if let Source::Multi { data, .. } = &src { data.len() } else { 0 };
+        // 合成时每个声音一块输入：试听是几段音频，主播模式是同一个麦克风按各自的延迟取
+        let n_in = match (&src, &proc) {
+            (Source::Multi { data, .. }, _) => data.len(),
+            (Source::Ring(_), Proc::Mix(m)) => m.voices(),
+            _ => 0,
+        };
+        let mic_mix = matches!((&src, &proc), (Source::Ring(_), Proc::Mix(_)));
         let dl = if let Proc::Mix(m) = &proc { m.delays() } else { [0; MAX_VOICES] };
         Pump {
             src,
@@ -444,13 +478,29 @@ impl Pump {
             dl,
             dl_old: dl,
             dl_fade: 0,
+            hist: if mic_mix { vec![0.0; HIST] } else { Vec::new() },
+            hist_pos: 0,
         }
     }
 
-    /// 取下一块 64 个输入样本；麦克风还没送到时返回 false。
+    /// 取下一块 64 个输入样本；麦克风还没送到时返回 false。合成时再按各声音的延迟给每个声音取一块（`inbs`）。
     fn next_block(&mut self) -> bool {
-        match &mut self.src {
-            Source::Ring(rx) => rx.len() >= N && rx.pop_slice(&mut self.inb[..N]) == N,
+        let pos = match &mut self.src {
+            Source::Ring(rx) => {
+                if !(rx.len() >= N && rx.pop_slice(&mut self.inb[..N]) == N) {
+                    return false;
+                }
+                if self.inbs.is_empty() {
+                    return true;
+                }
+                // 主播模式的左右双人：麦克风的输入记进历史，各声音从里面按自己的延迟取
+                let p = self.hist_pos;
+                for (i, &v) in self.inb[..N].iter().enumerate() {
+                    self.hist[(p + i) & (HIST - 1)] = v;
+                }
+                self.hist_pos += N;
+                p
+            }
             Source::Memory { data, pos } => {
                 let n = data.len();
                 for (i, v) in self.inb[..N].iter_mut().enumerate() {
@@ -462,44 +512,41 @@ impl Pump {
                 if *pos > n + FS_USIZE {
                     self.shared.finished.store(true, Ordering::Relaxed);
                 }
-                true
+                return true;
             }
-            Source::Multi { data, pos, len } => {
-                // 第 k 段按"现在位置 − 它的延迟"取（左右双人的第 2 个声音晚一点）。试听中改了延迟：先把这次的淡变走完，
-                // 再在 20 ms 里从旧位置淡到新位置
-                if self.dl_fade == 0 {
-                    if let Proc::Mix(m) = &self.proc {
-                        let want = m.delays();
-                        if want != self.dl {
-                            self.dl_old = self.dl;
-                            self.dl = want;
-                            self.dl_fade = DL_FADE;
-                        }
-                    }
-                }
-                let done = DL_FADE - self.dl_fade;
-                for (k, (d, b)) in data.iter().zip(self.inbs.iter_mut()).enumerate() {
-                    let at = |t: usize, dl: usize| if t >= dl { d.get(t - dl).copied().unwrap_or(0.0) } else { 0.0 };
-                    let (new, old) = (self.dl[k], self.dl_old[k]);
-                    for (i, v) in b[..N].iter_mut().enumerate() {
-                        let t = *pos + i;
-                        *v = if self.dl_fade > 0 && new != old {
-                            let w = ((done + i + 1) as f32 / DL_FADE as f32).min(1.0);
-                            at(t, old) * (1.0 - w) + at(t, new) * w
-                        } else {
-                            at(t, new)
-                        };
-                    }
-                }
-                self.dl_fade = self.dl_fade.saturating_sub(N);
+            Source::Multi { pos, len, .. } => {
+                let p = *pos;
                 *pos += N;
                 self.shared.play_pos.store((*pos).min(*len) as u64, Ordering::Relaxed);
                 if *pos > *len + FS_USIZE {
                     self.shared.finished.store(true, Ordering::Relaxed);
                 }
-                true
+                p
+            }
+        };
+        // 第 k 段按"现在位置 − 它的延迟"取（左右双人的第 2 个声音晚一点）。改了延迟：先把这次的淡变走完，
+        // 再在 20 ms 里从旧位置淡到新位置
+        if self.dl_fade == 0 {
+            if let Proc::Mix(m) = &self.proc {
+                let want = m.delays();
+                if want != self.dl {
+                    self.dl_old = self.dl;
+                    self.dl = want;
+                    self.dl_fade = DL_FADE;
+                }
             }
         }
+        let fading = (self.dl_fade > 0).then(|| DL_FADE - self.dl_fade);
+        match &self.src {
+            Source::Multi { data, .. } => read_delayed(&mut self.inbs, pos, &self.dl, &self.dl_old, fading, |k, s| data[k].get(s).copied().unwrap_or(0.0)),
+            _ => {
+                // 麦克风的历史：只留最近 HIST 个样本（延迟最多 300 ms，远在这之内）
+                let (h, end) = (&self.hist, self.hist_pos);
+                read_delayed(&mut self.inbs, pos, &self.dl, &self.dl_old, fading, |_, s| if end - s <= HIST { h[s & (HIST - 1)] } else { 0.0 })
+            }
+        }
+        self.dl_fade = self.dl_fade.saturating_sub(N);
+        true
     }
 
     fn fill(&mut self, out_l: &mut [f32], out_r: &mut [f32]) {
@@ -596,8 +643,10 @@ impl Pump {
                 }
                 Proc::Mix(mx) => {
                     if dry {
+                        // 监听原声：麦克风就是麦克风本身（左右双人不叠出回声）；试听文件是几段原声相加
+                        let mic = matches!(self.src, Source::Ring(_));
                         for i in 0..N {
-                            let s: f32 = self.inbs.iter().map(|b| b[i]).sum();
+                            let s: f32 = if mic { self.inb[i] } else { self.inbs.iter().map(|b| b[i]).sum() };
                             self.el[i] = s;
                             self.er[i] = s;
                         }
@@ -696,7 +745,8 @@ fn mic_sink(in_rate: u32, mut tx: spsc::Producer, shared: Arc<Shared>) -> impl F
 
 /// 实时引擎的输入从哪里来。
 enum Feed {
-    Mic,
+    /// 麦克风；带着合成配置时是主播模式的左右双人（同一个麦克风交给几个声音，按各自的延迟取）。
+    Mic(Option<Arc<MixSetup>>),
     /// 试听一个文件：（48 kHz 单声道, 从第几个样本开始）。
     File(Arc<Vec<f32>>, usize),
     /// 多音频合成的试听：（各段 48 kHz 单声道, 合成配置, 从第几个样本开始）。
@@ -706,7 +756,19 @@ enum Feed {
 impl Realtime {
     /// 麦克风 → 引擎 → 输出设备。
     pub fn start(opts: &RtOptions, cfg: Arc<EngineConfig>) -> Result<Realtime, String> {
-        Self::start_inner(opts, cfg, Feed::Mic)
+        Self::start_inner(opts, cfg, Feed::Mic(None))
+    }
+
+    /// 主播模式的左右双人：麦克风 → 几个声音（`setup` 里每个音源一个引擎，一般是左耳、右耳两个）→ 相加 → 输出设备。
+    /// 第 k 个声音的输入是麦克风晚 `setup.delays[k]` 个样本（最多 300 ms）；动作按主播模式（停顿超过 1 秒恢复正常速度）。
+    /// 运行中用 [`Realtime::set_mix`] 改参数、位置、音量和延迟（延迟在 20 ms 里淡过去）；音源数、排布方式要重新开始才能改。
+    pub fn start_duo(opts: &RtOptions, setup: Arc<MixSetup>) -> Result<Realtime, String> {
+        let max = mix::delay_samples(mix::DUO_MAX_MS);
+        if setup.cfgs.is_empty() || setup.cfgs.len() > MAX_VOICES || setup.delays.iter().any(|&d| d > max) {
+            return Err(format!("左右双人需要 1–{MAX_VOICES} 个声音，延迟不超过 {:.0} ms", mix::DUO_MAX_MS));
+        }
+        let cfg = setup.cfgs[0].clone();
+        Self::start_inner(opts, cfg, Feed::Mic(Some(setup)))
     }
 
     /// 试听：用实时引擎把一段已解码的音频（48 kHz 单声道）播到输出设备，可以边听边调参数。
@@ -740,7 +802,7 @@ impl Realtime {
         let out_dev = find(&opts.output, false)?;
         let (out_cfg, out_fmt) = pick_config(&out_dev, false, opts.buffer_frames)?;
         let sh = Shared::new(cfg.clone());
-        if let Feed::Mix(_, setup, _) = &feed {
+        if let Feed::Mix(_, setup, _) | Feed::Mic(Some(setup)) = &feed {
             if let Ok(mut g) = sh.mix.lock() {
                 *g = Some(setup.clone());
             }
@@ -766,7 +828,7 @@ impl Realtime {
                 let len = mix::timeline_len(&lens, &setup.delays);
                 (None, Source::Multi { data: audio, pos, len }, Proc::Mix(Mixer::new(&setup, PostMode::Realtime, 0.0)))
             }
-            Feed::Mic => {
+            Feed::Mic(duo) => {
                 let in_dev = find(&opts.input, true)?;
                 let (in_cfg, in_fmt) = pick_config(&in_dev, true, opts.buffer_frames).map_err(|e| format!("{e}（可能没有麦克风，或没有授予麦克风权限）"))?;
                 info.input_name = name(&in_dev);
@@ -775,9 +837,20 @@ impl Realtime {
                 let (tx, rx) = spsc::channel(FS_USIZE); // 最多积压 1 秒
                 let sink = mic_sink(in_cfg.sample_rate, tx, shared.clone());
                 let st = by_format!(in_fmt, build_in, &in_dev, in_cfg, opts.input_channel, sink, shared.clone()).map_err(|e| err_text("打开输入设备失败（检查麦克风权限，或换一个缓冲大小）", e))?;
-                let mut eng = Engine::new(cfg, PostMode::Realtime, 0.0);
-                eng.set_live(true);
-                (Some(st), Source::Ring(rx), Proc::One(eng))
+                // 主播模式：停顿超过 1 秒后动作恢复正常速度（左右双人时每个声音都这样）
+                let proc = match duo {
+                    Some(setup) => {
+                        let mut m = Mixer::new(&setup, PostMode::Realtime, 0.0);
+                        m.set_live(true);
+                        Proc::Mix(m)
+                    }
+                    None => {
+                        let mut eng = Engine::new(cfg, PostMode::Realtime, 0.0);
+                        eng.set_live(true);
+                        Proc::One(eng)
+                    }
+                };
+                (Some(st), Source::Ring(rx), proc)
             }
         };
         let mut pump = Pump::with_proc(src, proc, shared.clone(), out_rate);
@@ -1080,6 +1153,143 @@ mod tests {
             }
         }
         assert!(min_gap > 150.0, "最近时只相隔 {min_gap:.0}°");
+    }
+
+    /// 主播模式的左右双人：一个环形缓冲当麦克风，输出回调里的合成器按主播模式（停顿 1 秒后恢复动作）。
+    fn mic_duo_pump(setup: &Arc<MixSetup>, live: bool) -> (Pump, spsc::Producer, Arc<Shared>) {
+        let shared = Arc::new(Shared::new(setup.cfgs[0].clone()));
+        *shared.mix.lock().unwrap() = Some(setup.clone());
+        let (tx, rx) = spsc::channel(FS_USIZE);
+        let mut m = Mixer::new(setup, PostMode::Realtime, 0.0);
+        m.set_live(live);
+        (Pump::with_proc(Source::Ring(rx), Proc::Mix(m), shared.clone(), 48_000.0), tx, shared)
+    }
+
+    fn duo_setup(base: &Arc<EngineConfig>, follow: bool, delay: usize) -> Arc<MixSetup> {
+        use crate::dsp::mix::Voice;
+        Arc::new(MixSetup::new(base, &[Voice::preset(0), Voice::preset(1)], &[None, None], follow, None).with_delays(&[0, delay]))
+    }
+
+    #[test]
+    fn mic_duo_reads_the_second_voice_later_from_the_mic_history() {
+        // 两个声音都来自麦克风：1 号就是麦克风这一块，2 号是麦克风晚 100 ms；改成 50 ms 时 20 ms 淡过去、没有跳变；
+        // 历史是环形的，跑过好几圈（3 秒 > HIST）之后照样逐样本对得上
+        let x = crate::cli::test_voice(3.0);
+        let base = Arc::new(EngineConfig::new(Params::default(), None));
+        let (mut pump, mut tx, _) = mic_duo_pump(&duo_setup(&base, false, 4800), true);
+        assert_eq!(pump.inbs.len(), 2);
+        let at = |t: usize, d: usize| if t >= d { x[t - d] } else { 0.0 };
+        let mut t = 0;
+        let mut feed = |pump: &mut Pump, t: &mut usize| {
+            assert_eq!(tx.push_slice(&x[*t..*t + N]), N);
+            assert!(pump.next_block());
+            *t += N;
+            *t - N
+        };
+        // 还没送到时不往前走
+        assert!(!pump.next_block());
+        while t + N <= FS_USIZE * 2 {
+            let p0 = feed(&mut pump, &mut t);
+            for i in 0..N {
+                assert_eq!(pump.inb[i], x[p0 + i]);
+                assert_eq!(pump.inbs[0][i], at(p0 + i, 0));
+                assert_eq!(pump.inbs[1][i], at(p0 + i, 4800));
+            }
+        }
+        assert!(t > HIST);
+        if let Proc::Mix(m) = &mut pump.proc {
+            m.set_setup(&duo_setup(&base, false, 2400));
+        }
+        let mut max_step = 0f32;
+        let mut prev = pump.inbs[1][N - 1];
+        for b in 0..40 {
+            let p0 = feed(&mut pump, &mut t);
+            for i in 0..N {
+                let v = pump.inbs[1][i];
+                if b < DL_FADE / N {
+                    max_step = max_step.max((v - prev).abs());
+                } else {
+                    assert_eq!(v, at(p0 + i, 2400));
+                }
+                assert_eq!(pump.inbs[0][i], x[p0 + i]);
+                prev = v;
+            }
+        }
+        let own_step = x.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0f32, f32::max);
+        assert!(max_step <= own_step * 1.01 + 1e-6, "淡变中一步跳了 {max_step}（原音频自己最多 {own_step}）");
+    }
+
+    #[test]
+    fn mic_duo_puts_one_voice_at_each_ear_and_monitors_the_plain_mic() {
+        // 各自固定（左耳、右耳）：两个声音各在一边，左右两边差不多一样响；位置图拿到两个声音的位置；
+        // 监听原声时输出就是麦克风本身（不叠出第 2 个声音）
+        let x = crate::cli::test_voice(8.0);
+        let base = Arc::new(EngineConfig::new(Params { auto_level: false, ..Params::default() }, None));
+        let (mut pump, tx, shared) = mic_duo_pump(&duo_setup(&base, false, 3840), true);
+        let mut mic = mic_sink(FS_USIZE as u32, tx, shared.clone());
+        let (mut l, mut r) = (vec![0f32; 256], vec![0f32; 256]);
+        let (mut el, mut er) = (0f64, 0f64);
+        for (j, c) in x.chunks_exact(256).enumerate() {
+            mic(c);
+            pump.fill(&mut l, &mut r);
+            if j > 100 {
+                el += l.iter().map(|v| (v * v) as f64).sum::<f64>();
+                er += r.iter().map(|v| (v * v) as f64).sum::<f64>();
+            }
+        }
+        let lr = 10.0 * (el / er).log10();
+        println!("主播模式左右双人（各自固定）：左比右 {lr:.2} dB");
+        assert!(lr.abs() < 3.0, "左右两边应差不多一样响：左比右 {lr:.1} dB");
+        let vt = shared.voice_telemetry();
+        assert_eq!(vt.len(), 2);
+        assert!(vt[0][0] > 180.0 && vt[1][0] < 180.0, "{vt:?}");
+        assert_eq!(shared.xruns.load(Ordering::Relaxed), 0);
+        // 监听原声：输出就是麦克风本身——送进去一下脉冲，出来只有一下，没有晚 80 ms 的第 2 下
+        shared.monitor_dry.store(true, Ordering::Relaxed);
+        let mut click = vec![0f32; FS_USIZE];
+        click[FS_USIZE / 2] = 1.0;
+        let mut got = Vec::new();
+        for (j, c) in click.chunks_exact(256).enumerate() {
+            mic(c);
+            pump.fill(&mut l, &mut r);
+            // 头几次回调还在放切换前已经算好排着队的效果声
+            if j > 4 {
+                assert_eq!(l, r);
+                got.extend_from_slice(&l);
+            }
+        }
+        let peaks: Vec<usize> = got.iter().enumerate().filter(|(_, v)| v.abs() > 0.3).map(|(i, _)| i).collect();
+        assert!(!peaks.is_empty() && peaks[peaks.len() - 1] - peaks[0] < 8, "监听原声应只有麦克风这一下：{peaks:?}");
+    }
+
+    #[test]
+    fn mic_duo_keeps_moving_when_speech_is_sparse_and_stays_opposite() {
+        // 一起移动 + 话很少（每说 1 秒停 8 秒）：主播模式的两个声音照常换边，而且始终在头的两侧相对；
+        // 严格跟着说话走（试听的做法）时几乎不动
+        let voice = crate::cli::test_voice(1.0);
+        let x: Vec<f32> = (0..FS_USIZE * 54).map(|i| if i % (FS_USIZE * 9) < voice.len() { voice[i % (FS_USIZE * 9)] } else { 0.0 }).collect();
+        let base = Arc::new(EngineConfig::new(Params::default(), None));
+        let run = |live: bool| {
+            let (mut pump, mut tx, shared) = mic_duo_pump(&duo_setup(&base, true, 3840), live);
+            let (mut l, mut r) = (vec![0f32; 512], vec![0f32; 512]);
+            let mut min_gap = 180f32;
+            for (j, c) in x.chunks_exact(512).enumerate() {
+                tx.push_slice(c);
+                pump.fill(&mut l, &mut r);
+                let v = shared.voice_telemetry();
+                if j > 10 {
+                    min_gap = min_gap.min(((v[0][0] - v[1][0] + 180.0).rem_euclid(360.0) - 180.0).abs());
+                }
+            }
+            let moves = if let Proc::Mix(m) = &pump.proc { [m.engine(0).tele.n_moves, m.engine(1).tele.n_moves] } else { [0; 2] };
+            (moves, min_gap)
+        };
+        let (strict, _) = run(false);
+        let (live, gap) = run(true);
+        println!("每说 1 秒停 8 秒、54 秒：主播模式换边 {live:?} 次（严格跟着说话 {strict:?} 次），两个声音最近时相隔 {gap:.0}°");
+        assert_eq!(live[0], live[1], "一起移动：同一套走位");
+        assert!(live[0] >= 6 && live[0] >= strict[0] + 3, "主播模式换边 {live:?} 次，严格跟着说话 {strict:?} 次");
+        assert!(gap > 150.0, "最近时只相隔 {gap:.0}°");
     }
 
     /// 用虚拟时钟模拟"输入回调每次 `n_in` 帧、输出回调每次 `n_out` 帧、输出设备时钟快 `drift`"，

@@ -52,11 +52,14 @@ pub struct Saved {
     pub mix_balance: f32,
     /// 左右双人（0 = 关）：一个音频当成两个人，同一个声音一左一右，第 2 个晚这么多毫秒。排布、自动平衡与多音频合成共用。
     pub duo_ms: f32,
+    /// 实时（主播）模式的左右双人（0 = 关）：麦克风的声音一左一右两个人说，第 2 个晚这么多毫秒。和文件转换的
+    /// `duo_ms` 分开记（直播用不用和转换文件用不用互不影响）；两个声音的位置、排布与文件转换的左右双人共用。
+    pub rt_duo_ms: f32,
 }
 
 impl Default for Saved {
     fn default() -> Self {
-        Saved { params: Params::default(), english: false, tab: Tab::Realtime, host: String::new(), input: None, output: None, buffer: 256, in_channel: 0, dry: false, bits: 24, file_lufs: -16.0, file_channel: 0, jobs: 0, out_dir: None, view3d: false, mix: false, mix_follow: false, mix_align: false, mix_balance: 0.0, duo_ms: 0.0 }
+        Saved { params: Params::default(), english: false, tab: Tab::Realtime, host: String::new(), input: None, output: None, buffer: 256, in_channel: 0, dry: false, bits: 24, file_lufs: -16.0, file_channel: 0, jobs: 0, out_dir: None, view3d: false, mix: false, mix_follow: false, mix_align: false, mix_balance: 0.0, duo_ms: 0.0, rt_duo_ms: 0.0 }
     }
 }
 
@@ -91,14 +94,15 @@ mod tests {
 
     #[test]
     fn export_text_reads_back_and_keeps_desktop_only_settings() {
-        let s = Saved { buffer: 512, input: Some("Mic".into()), dry: true, params: Params { puff: 2.5, ..Params::default() }, ..Saved::default() };
+        let s = Saved { buffer: 512, input: Some("Mic".into()), dry: true, rt_duo_ms: 90.0, params: Params { puff: 2.5, ..Params::default() }, ..Saved::default() };
         let back = parse(&to_text(&s).unwrap()).unwrap();
         assert_eq!(back.params, s.params);
-        assert!(back.dry && back.buffer == 512 && back.input.as_deref() == Some("Mic"));
+        assert!(back.dry && back.buffer == 512 && back.input.as_deref() == Some("Mic") && back.rt_duo_ms == 90.0);
         // 只写了参数的文件（比如手写的）也能读，其余用默认值
         let bare = parse("(params: (seed: 3))").unwrap();
         assert_eq!(bare.params.seed, 3);
         assert_eq!(bare.buffer, 256);
+        assert_eq!(bare.rt_duo_ms, 0.0);
         assert!(matches!(parse("{\"other\": \"()\"}"), Err(ConfigError::NotAutoAsmr)));
         assert!(matches!(parse("not ron"), Err(ConfigError::Parse(_))));
     }
