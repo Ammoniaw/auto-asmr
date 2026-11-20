@@ -42,6 +42,27 @@ auto-asmr convert 摇滚版.m4a DJ版.m4a --mix --mix-align --duration 60 -o 合
 auto-asmr convert a.m4a b.m4a --mix --mix-balance 80 -o 合成.wav
 ```
 
+一个音频当成左右两个人（同一个声音一个在左耳、一个在右耳，第 2 个晚一点）加 `--duo`，后面是第 2 个声音晚多少毫秒（1–300，不写就是 80）。`--pos`（两个位置）、`--mix-gain`、`--mix-follow`、`--mix-balance` 也能一起用；批量时每个文件都这样做；输出比原音频长出这段延迟（做法见[界面使用说明 · 左右双人](app-usage.md#左右双人一个音频当成两个人)）：
+
+```bash
+auto-asmr convert 人声.m4a --duo 80 --duration 60
+auto-asmr convert 人声.m4a --duo 100 --pos left,front-right --mix-balance 50 -o 双人.wav
+```
+
+背景音（实时生成的雨声，见[界面使用说明 · 背景音](app-usage.md#背景音雨声)）：`--bg rain-night` 打开雨夜预设，后面再写 `--bg-level`（音量）、`--rain`（雨量）、`--bg-pan`（左右）、`--bg-width`（包围感）、`--bg-indoor`（隔窗）、`--rain-near`（近处雨滴）、`--rain-drip`（屋檐滴水）覆盖它，都是 0–100（`--bg-pan` 是 −100–100）。单个文件、批量、多音频合成、左右双人都能用：
+
+```bash
+auto-asmr convert 人声.m4a --bg rain-night --duration 60
+auto-asmr convert 人声.m4a --bg rain-night --rain 70 --bg-indoor 0 --bg-level 45 -o 雨中.wav
+```
+
+只生成雨声本身（不要人声），响度按 `--lufs`（默认 −20 LUFS），默认雨夜，背景音选项一样能用：
+
+```bash
+auto-asmr bg -o 雨夜.wav --duration 60
+auto-asmr bg -o 大雨.wav --duration 60 --rain 85 --bg-indoor 0 --rain-drip 0
+```
+
 只想先看怎么对齐、不输出音频：
 
 ```bash

@@ -8,6 +8,7 @@ use super::filters::{Biquad, Fir, OnePoleLp, BUTTER_Q};
 use super::motion::{clock_step, clock_step_live, Motion, Pose};
 use super::params::{Params, Playback};
 use super::pinna::pinnas;
+use super::rain::{Rain, RainSetup};
 use super::room::{conv_energy, Room};
 use super::tables::{tables, Hrir, Tables};
 use super::voice::{ear_eq_fir, far_shadow_fir, muffle_fir, soft_voice_fir, BreathFx, CanalComb, ContactFx, DeEsser, Denoiser, Gate, DENOISE_DELAY, EAR_EQ_TAPS};
@@ -46,6 +47,8 @@ pub struct Derived {
     pub pinna: Option<usize>,
     pub room_gain: f32,
     pub pref: f32,
+    /// 背景音（雨声）的设置；音量为 0 时 None。
+    pub rain: Option<Arc<RainSetup>>,
 }
 
 /// 参数 + 派生数据的一份不可变快照。
@@ -118,7 +121,22 @@ impl EngineConfig {
             (0.5 * (e_r + e_l)).sqrt() * (p_ear / pref).powf(-(1.0 - params.level_follow) / 2.0)
         };
         let pinna = pinnas().index(&params.pinna);
-        EngineConfig { params, derived: Derived { ear_eq, playback, soft, far_eq, soft_near, muffle, inear_gain, pinna, room_gain, pref } }
+        let rain = if same_pb && same(&|q| q.bg_same(&params)) { pd.unwrap().rain.clone() } else { RainSetup::new(&params, playback.as_deref().map(|v| v.as_slice())).map(Arc::new) };
+        EngineConfig { params, derived: Derived { ear_eq, playback, soft, far_eq, soft_near, muffle, inear_gain, pinna, room_gain, pref, rain } }
+    }
+}
+
+/// 实时模式的背景音跟着配置走：打开时建一个（第一次会在音频线程里分配缓冲，和换回放补偿一样），
+/// 改了就换设置，关掉时淡出（淡完由调用方丢掉）。引擎和多音频合成共用。
+pub fn sync_rain(rain: &mut Option<Rain>, cfg: &EngineConfig) {
+    match (&cfg.derived.rain, rain.as_mut()) {
+        (Some(s), Some(r)) => {
+            r.set_setup(s.clone());
+            r.set_playback(cfg.derived.playback.as_ref());
+        }
+        (Some(s), None) => *rain = Some(Rain::new(s.clone(), cfg.params.seed, cfg.derived.playback.as_ref())),
+        (None, Some(r)) => r.set_off(),
+        (None, None) => {}
     }
 }
 
@@ -268,6 +286,10 @@ pub struct Engine {
     amp_ms: f32,
     live: bool,
     pause_s: f32,
+    /// 背景音（实时模式才有；文件模式在第二遍里加）。
+    rain: Option<Rain>,
+    rain_l: [f32; CTRL],
+    rain_r: [f32; CTRL],
 }
 
 impl Engine {
@@ -335,6 +357,9 @@ impl Engine {
             amp_ms: 1.0,
             live: false,
             pause_s: 0.0,
+            rain: None,
+            rain_l: [0.0; CTRL],
+            rain_r: [0.0; CTRL],
         };
         e.set_config(cfg);
         e
@@ -373,6 +398,9 @@ impl Engine {
                 (_, None) => self.softn = None,
             }
             self.softn_src = d.soft_near.clone();
+        }
+        if self.post == PostMode::Realtime {
+            sync_rain(&mut self.rain, &cfg);
         }
         self.cfg = cfg;
     }
@@ -711,6 +739,17 @@ impl Engine {
         let speaking = self.feats.act > 0.5;
         let gain = db_to_lin(p.out_gain_db);
         let ceiling = db_to_lin(p.ceiling_db - 0.1);
+        // 背景音：比人声的目标响度低"音量"那么多，加在自动响度之后、限制器之前（只有实时模式在这里加）
+        let rain_on = match &mut self.rain {
+            Some(rain) => {
+                rain.render(p.target_lufs, &mut self.rain_l[..m], &mut self.rain_r[..m]);
+                true
+            }
+            None => false,
+        };
+        if self.rain.as_ref().map_or(false, |r| r.silent()) {
+            self.rain = None;
+        }
         for i in 0..m {
             let (mut l, mut r) = (self.dl[i], self.dr[i]);
             if let Some(pb) = &mut self.pb {
@@ -721,7 +760,11 @@ impl Engine {
             r = self.out_hp[1].process(r);
             if self.post == PostMode::Realtime {
                 let lg = if p.auto_level { self.leveler.process(l, r, speaking, p.target_lufs) } else { 1.0 };
-                let (a, b) = self.limiter.process(l * lg * gain, r * lg * gain, ceiling);
+                let (a, b) = if rain_on {
+                    self.limiter.process((l * lg + self.rain_l[i]) * gain, (r * lg + self.rain_r[i]) * gain, ceiling)
+                } else {
+                    self.limiter.process(l * lg * gain, r * lg * gain, ceiling)
+                };
                 l = a;
                 r = b;
             }
@@ -745,6 +788,36 @@ mod tests {
             eng.process(c, &mut l[o..o + c.len()], &mut r[o..o + c.len()]);
         }
         (l, r)
+    }
+
+    /// 背景音：实时引擎在人声之外加上雨声（没有人声时也在），比目标响度低"音量"那么多；拖到 0 淡出后完全消失，
+    /// 文件模式的引擎不加（在第二遍里加）。
+    #[test]
+    fn realtime_engine_adds_rain_and_removes_it_when_turned_off() {
+        let p = Params { bg_level: 60.0, rain_near: 0.0, rain_drip: 0.0, auto_level: false, ..Params::default() };
+        let mut eng = Engine::new(Arc::new(EngineConfig::new(p.clone(), None)), PostMode::Realtime, 0.0);
+        let x = vec![0f32; 20 * 48_000];
+        let (mut l, mut r) = (vec![0f32; x.len()], vec![0f32; x.len()]);
+        for (i, c) in x.chunks(64).enumerate() {
+            eng.process(c, &mut l[i * 64..i * 64 + c.len()], &mut r[i * 64..i * 64 + c.len()]);
+        }
+        let got = crate::dsp::rain::tests::lufs(&l[48_000..], &r[48_000..]);
+        let want = -16.0 + p.bg_db().unwrap() + 10.0 * p.rain / 100.0 - 5.0;
+        assert!((got - want).abs() < 2.5, "实时雨声 {got:.1} LUFS，应约为 {want:.1}");
+        let ceiling = db_to_lin(p.ceiling_db);
+        assert!(l.iter().chain(&r).all(|v| v.abs() <= ceiling));
+        // 关掉：淡出，之后输出是 0（人声也是 0），引擎里的雨声被丢掉
+        eng.set_config(Arc::new(EngineConfig::new(Params { bg_level: 0.0, ..p.clone() }, None)));
+        let (mut a, mut b) = (vec![0f32; 64], vec![0f32; 64]);
+        for _ in 0..(2 * 48_000 / 64) {
+            eng.process(&[0.0; 64], &mut a, &mut b);
+        }
+        assert!(eng.rain.is_none());
+        eng.process(&[0.0; 64], &mut a, &mut b);
+        assert!(a.iter().chain(&b).all(|v| v.abs() < 1e-6));
+        // 文件模式的引擎不加雨声
+        let (lo, ro) = render(p, &x[..48_000]);
+        assert!(lo.iter().chain(&ro).all(|&v| v == 0.0));
     }
 
     /// 一段信号在 lo–hi Hz 里的能量（dB）：4 阶高通 + 4 阶低通。

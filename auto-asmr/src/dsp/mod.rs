@@ -12,6 +12,7 @@ pub mod mix;
 pub mod motion;
 pub mod params;
 pub mod pinna;
+pub mod rain;
 pub mod resample;
 pub mod rng;
 pub mod room;

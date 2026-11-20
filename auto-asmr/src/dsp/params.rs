@@ -185,6 +185,22 @@ pub struct Params {
     pub ceiling_db: f32,
     /// 随机种子（换一个就换一套走位）。
     pub seed: u64,
+
+    // ---- 背景音（实时生成的雨声，见 [`crate::dsp::rain`]；音量为 0 时关闭，人声不受影响）
+    /// 背景音音量，0–100：0 = 关闭；1–100 对应雨声比人声的目标响度低 40 … 0 dB（见 [`Params::bg_db`]）。
+    pub bg_level: f32,
+    /// 雨量，0–100：毛毛雨（0.3 mm/h）… 暴雨（60 mm/h），对数刻度。雨越大，大雨滴越多、越密、越低沉。
+    pub rain: f32,
+    /// 雨从哪边来：−100 = 都在左边，0 = 四周均匀，100 = 都在右边。
+    pub bg_pan: f32,
+    /// 包围感，0–100：0 = 只从一个方向来，100 = 从四面八方来。
+    pub bg_width: f32,
+    /// 隔窗，0–100：0 = 站在雨里，100 = 关着窗在屋里听（高频被墙和玻璃挡掉）。
+    pub bg_indoor: f32,
+    /// 近处雨滴，0–100：窗玻璃 / 窗台 / 树叶 / 水洼上听得清的一滴一滴；0 = 没有，100 = 每秒约 12 滴。
+    pub rain_near: f32,
+    /// 屋檐滴水，0–100：0 = 没有；越大滴得越快、滴水的地方越多（最多 3 处）。
+    pub rain_drip: f32,
 }
 
 impl Default for Params {
@@ -252,6 +268,13 @@ impl Default for Params {
             out_gain_db: 0.0,
             ceiling_db: -1.0,
             seed: 1,
+            bg_level: 0.0,
+            rain: 35.0,
+            bg_pan: 0.0,
+            bg_width: 60.0,
+            bg_indoor: 90.0,
+            rain_near: 30.0,
+            rain_drip: 35.0,
         }
     }
 }
@@ -331,6 +354,25 @@ impl Params {
         p.updown = 10.0;
         p.target_lufs = EARCLEAN_LIVE_LUFS;
         p
+    }
+
+    /// "雨夜"：关着窗在屋里听外面的小到中雨（约 2 mm/h），雨声主要从窗户那边来；窗玻璃上偶尔落一滴，屋檐在滴水；
+    /// 雨声比人声低约 18 dB。只改背景音这几项。隔窗和窗玻璃上的雨点按两段屋里听雨打窗的录音校过。
+    pub fn bg_rain_night(mut self) -> Self {
+        let d = Params::default();
+        (self.rain, self.bg_pan, self.bg_width, self.bg_indoor, self.rain_near, self.rain_drip) = (d.rain, d.bg_pan, d.bg_width, d.bg_indoor, d.rain_near, d.rain_drip);
+        self.bg_level = 55.0;
+        self
+    }
+
+    /// 背景音比人声的目标响度低多少 dB（音量 1 → −40 dB，100 → 0 dB）；音量为 0（关闭）时 None。
+    pub fn bg_db(&self) -> Option<f32> {
+        (self.bg_level > 0.0).then(|| -40.0 + 0.4 * self.bg_level.min(100.0))
+    }
+
+    /// 背景音的几项是否和 `o` 相同。
+    pub fn bg_same(&self, o: &Params) -> bool {
+        (self.bg_level, self.rain, self.bg_pan, self.bg_width, self.bg_indoor, self.rain_near, self.rain_drip) == (o.bg_level, o.rain, o.bg_pan, o.bg_width, o.bg_indoor, o.rain_near, o.rain_drip)
     }
 
     /// 降噪强度换成"降噪后的声音占多少"：输出 = 原声 × (1 − m) + 降噪后 × m。

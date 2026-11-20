@@ -7,12 +7,17 @@
 //!   （任何一个音源在说话时按真实时间走），所以走位一模一样；位置再整体绕头错开 360°/N。两个音源时正好相对：
 //!   一个贴左耳时另一个贴右耳，换边时一个从脸前、一个从脑后绕过去，不会撞在一起。
 //!
+//! **左右双人**：同一段音频当成两个声音（默认一个在左耳、一个在右耳），第 2 个整体晚几十毫秒（[`MixSetup::delays`]），
+//! 听起来是两个人一前一后、一左一右地说。延迟在读输入时加（输入第 k 段的第 t 个样本 = 原音频的第 t − 延迟 个），
+//! 引擎、排布、自动平衡与多音频合成完全相同。
+//!
 //! 各音源先按输入响度（BS.1770 积分响度）对齐到同样响，再加上各自的音量增减；相加之后整体收尾——
 //! 文件转换是两遍精确归一化（与转换单个文件相同），试听是自动响度 + 限制器（与单个文件的实时引擎相同）。
 
 use super::balance::{BalanceData, Balancer};
 use super::dynamics::{Leveler, Limiter, LoudnessMeter};
-use super::engine::{Engine, EngineConfig, PostMode, Telemetry};
+use super::engine::{sync_rain, Engine, EngineConfig, PostMode, Telemetry};
+use super::rain::Rain;
 use super::filters::ema_coef;
 use super::params::{MotionMode, Params};
 use super::{db_to_lin, lin_to_db, CTRL, FS, R_MAX, R_MIN};
@@ -21,6 +26,37 @@ use std::sync::Arc;
 
 /// 最多同时合成几个音源。试听时每个音源是一个实时运行的引擎（每个约占单核 1%）。
 pub const MAX_VOICES: usize = 4;
+
+/// 左右双人：第 2 个声音最多晚多少毫秒、命令行只写 `--duo` 时用多少。
+pub const DUO_MAX_MS: f32 = 300.0;
+pub const DUO_DEFAULT_MS: f32 = 80.0;
+
+/// 毫秒 → 样本数（48 kHz，四舍五入；负数当 0，最多 [`DUO_MAX_MS`]）。
+pub fn delay_samples(ms: f32) -> usize {
+    (ms.clamp(0.0, DUO_MAX_MS) * 0.001 * FS).round() as usize
+}
+
+/// 加了声部延迟之后的总长：各段（长 `lens[k]`、晚 `delays[k]` 个样本）都放完为止。
+pub fn timeline_len(lens: &[usize], delays: &[usize]) -> usize {
+    lens.iter().enumerate().map(|(k, &l)| l + delays.get(k).copied().unwrap_or(0)).max().unwrap_or(0)
+}
+
+/// 一段音频晚 `delay` 个样本之后，时间线上 `[s0, s1)` 这一段（前面不够的补 0；结尾不补，到音频结束为止）。
+/// `delay` 为 0 时就是 `x[s0..s1]`（超出结尾的部分不要）。
+pub fn delayed(x: &[f32], delay: usize, s0: usize, s1: usize) -> Vec<f32> {
+    let end = s1.min(x.len() + delay);
+    if end <= s0 {
+        return Vec::new();
+    }
+    // 音频在时间线上从 `delay` 开始：之前的部分是 0
+    let a = s0.max(delay).min(end);
+    let mut out = Vec::with_capacity(end - s0);
+    out.resize(a - s0, 0.0);
+    if a < end {
+        out.extend_from_slice(&x[a - delay..end - delay]);
+    }
+    out
+}
 
 /// 一个音源的位置和音量。
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
@@ -111,6 +147,9 @@ pub struct MixSetup {
     /// 自动平衡：各音源事先由整段算好的输入响度（None = 不平衡）和强度（0–1）。
     pub balance: Option<Arc<BalanceData>>,
     pub balance_strength: f32,
+    /// 各音源比时间线晚多少个样本（左右双人：[0, 延迟]；多音频合成全是 0）。延迟由读输入的一方加
+    /// （文件转换截取各段时、试听读音频时），混音器只用它让自动平衡取对位置。
+    pub delays: Vec<usize>,
 }
 
 impl MixSetup {
@@ -120,7 +159,15 @@ impl MixSetup {
         let n = voices.len();
         // 一起移动：每个音源都直接用总配置（同一个移动方式、同一个随机种子）
         let cfgs = if follow { vec![base.clone(); n] } else { voice_configs(base, voices, prev) };
-        MixSetup { cfgs, gains: balance_gains(lufs, voices), offsets: follow_offsets(n, follow), follow, balance: None, balance_strength: 0.0 }
+        MixSetup { cfgs, gains: balance_gains(lufs, voices), offsets: follow_offsets(n, follow), follow, balance: None, balance_strength: 0.0, delays: vec![0; n] }
+    }
+
+    /// 设各音源的延迟（样本；少给的按 0）。
+    pub fn with_delays(mut self, delays: &[usize]) -> Self {
+        for (d, &v) in self.delays.iter_mut().zip(delays) {
+            *d = v;
+        }
+        self
     }
 
     /// 加上自动平衡（强度 0–1；为 0 或没有数据时不平衡）。
@@ -175,6 +222,10 @@ pub fn align_db(lufs: &[Option<f32>]) -> Vec<f32> {
     lufs.iter().map(|l| l.map_or(0.0, |l| (mean - l).clamp(-30.0, 30.0))).collect()
 }
 
+fn delay_array(d: &[usize]) -> [usize; MAX_VOICES] {
+    std::array::from_fn(|k| d.get(k).copied().unwrap_or(0))
+}
+
 /// 每次最多处理多少样本（更长的输入分段处理，音频线程里不分配内存）。
 const SCRATCH: usize = 4096;
 
@@ -198,7 +249,12 @@ pub struct Mixer {
     bal_strength: f32,
     balancer: Balancer,
     pos: usize,
+    /// 各音源的延迟（样本，见 [`MixSetup::delays`]）。
+    delays: [usize; MAX_VOICES],
     out_pk: f32,
+    /// 背景音（实时模式才有，相加之后加一份；文件模式在第二遍里加）。
+    rain: Option<Rain>,
+    rain_buf: [Vec<f32>; 2],
     /// 给界面显示的合成状态：输入取各音源中最大的，输出、限幅、自动响度是相加之后的；位置是第 0 个音源的。
     pub tele: Telemetry,
 }
@@ -229,9 +285,20 @@ impl Mixer {
             bal_strength: setup.balance_strength,
             balancer: Balancer::new(n),
             pos: 0,
+            delays: delay_array(&setup.delays),
             out_pk: 0.0,
+            rain: None,
+            rain_buf: [Vec::new(), Vec::new()],
             tele: Telemetry::default(),
         }
+        .with_rain()
+    }
+
+    fn with_rain(mut self) -> Self {
+        if self.post == PostMode::Realtime {
+            sync_rain(&mut self.rain, &self.cfg);
+        }
+        self
     }
 
     pub fn voices(&self) -> usize {
@@ -258,8 +325,17 @@ impl Mixer {
         if let Some(c) = setup.cfgs.first() {
             self.cfg = c.clone();
         }
+        if self.post == PostMode::Realtime {
+            sync_rain(&mut self.rain, &self.cfg);
+        }
         self.bal_data = setup.balance.clone();
         self.bal_strength = setup.balance_strength;
+        self.delays = delay_array(&setup.delays);
+    }
+
+    /// 各音源现在的延迟（样本）：试听读输入时按它取（变了就淡过去）。
+    pub fn delays(&self) -> [usize; MAX_VOICES] {
+        self.delays
     }
 
     /// 自动平衡的统计：几个声音都在出声时最响和最轻相差多少，平衡前、后的（中位数, 90% 分位）dB。
@@ -338,7 +414,7 @@ impl Mixer {
         // 自动平衡：各音源空间化之后、相加之前，按此刻听起来多响补增益（引擎有时延：这一块输出对应更早的输入）
         if let Some(d) = &self.bal_data {
             let in_pos = (self.pos + o) as i64 - self.engines[0].latency_samples() as i64;
-            self.balancer.process(d, self.bal_strength, in_pos, &mut self.buf, m);
+            self.balancer.process(d, self.bal_strength, in_pos, &self.delays, &mut self.buf, m);
         }
         out_l.fill(0.0);
         out_r.fill(0.0);
@@ -369,12 +445,33 @@ impl Mixer {
             let p = &self.cfg.params;
             let gain = db_to_lin(p.out_gain_db);
             let ceiling = db_to_lin(p.ceiling_db - 0.1);
+            // 背景音：相加之后加一份，和单个音源的引擎一样在自动响度之后、限制器之前
+            let rain_on = match &mut self.rain {
+                Some(rain) => {
+                    for b in self.rain_buf.iter_mut() {
+                        if b.len() < m {
+                            b.resize(SCRATCH, 0.0);
+                        }
+                    }
+                    let [bl, br] = &mut self.rain_buf;
+                    rain.render(p.target_lufs, &mut bl[..m], &mut br[..m]);
+                    true
+                }
+                None => false,
+            };
             for i in 0..m {
                 let (l, r) = (out_l[i], out_r[i]);
                 let lg = if p.auto_level { self.leveler.process(l, r, speaking, p.target_lufs) } else { 1.0 };
-                let (a, b) = self.limiter.process(l * lg * gain, r * lg * gain, ceiling);
+                let (a, b) = if rain_on {
+                    self.limiter.process((l * lg + self.rain_buf[0][i]) * gain, (r * lg + self.rain_buf[1][i]) * gain, ceiling)
+                } else {
+                    self.limiter.process(l * lg * gain, r * lg * gain, ceiling)
+                };
                 out_l[i] = a;
                 out_r[i] = b;
+            }
+            if self.rain.as_ref().map_or(false, |r| r.silent()) {
+                self.rain = None;
             }
         }
         let pk = out_l.iter().chain(out_r.iter()).fold(0f32, |a, &v| a.max(v.abs()));
@@ -409,7 +506,25 @@ mod tests {
 
     fn setup(voices: &[Voice], gains: Vec<f32>) -> MixSetup {
         let base = EngineConfig::new(Params::default(), None);
-        MixSetup { cfgs: voice_configs(&base, voices, None), gains, offsets: vec![0.0; voices.len()], follow: false, balance: None, balance_strength: 0.0 }
+        MixSetup { cfgs: voice_configs(&base, voices, None), gains, offsets: vec![0.0; voices.len()], follow: false, balance: None, balance_strength: 0.0, delays: vec![0; voices.len()] }
+    }
+
+    #[test]
+    fn delayed_windows_and_timeline() {
+        let x: Vec<f32> = (1..=10).map(|v| v as f32).collect();
+        // 不延迟：就是原来的那一段，超出结尾的不要
+        assert_eq!(delayed(&x, 0, 2, 5), vec![3.0, 4.0, 5.0]);
+        assert_eq!(delayed(&x, 0, 8, 20), vec![9.0, 10.0]);
+        assert!(delayed(&x, 0, 12, 20).is_empty());
+        // 晚 3 个样本：开头补 0，结尾多出 3 个
+        assert_eq!(delayed(&x, 3, 0, 5), vec![0.0, 0.0, 0.0, 1.0, 2.0]);
+        assert_eq!(delayed(&x, 3, 2, 6), vec![0.0, 1.0, 2.0, 3.0]);
+        assert_eq!(delayed(&x, 3, 10, 20), vec![8.0, 9.0, 10.0]);
+        assert_eq!(delayed(&x, 30, 0, 4), vec![0.0; 4]);
+        assert_eq!(timeline_len(&[10, 10], &[0, 3]), 13);
+        assert_eq!(timeline_len(&[10, 20], &[5]), 20);
+        assert_eq!(delay_samples(80.0), 3840);
+        assert_eq!(delay_samples(1e6), delay_samples(DUO_MAX_MS));
     }
 
     fn energy(v: &[f32]) -> f64 {
@@ -519,7 +634,7 @@ mod tests {
         // 滤波器直接共用总参数里算好的，不重算
         assert!(Arc::ptr_eq(cfgs[1].derived.ear_eq.as_ref().unwrap(), base.derived.ear_eq.as_ref().unwrap()));
         // 参数没变的音源原样复用
-        let prev = MixSetup { cfgs: cfgs.clone(), gains: vec![1.0; 2], offsets: vec![0.0; 2], follow: false, balance: None, balance_strength: 0.0 };
+        let prev = MixSetup { cfgs: cfgs.clone(), gains: vec![1.0; 2], offsets: vec![0.0; 2], follow: false, balance: None, balance_strength: 0.0, delays: vec![0; voices.len()] };
         let again = voice_configs(&base, &voices, Some(&prev));
         assert!(Arc::ptr_eq(&again[0], &cfgs[0]) && Arc::ptr_eq(&again[1], &cfgs[1]));
     }

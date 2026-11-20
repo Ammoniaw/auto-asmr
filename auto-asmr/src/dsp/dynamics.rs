@@ -22,6 +22,11 @@ impl KWeight {
     pub fn process(&mut self, x: f32) -> f32 {
         self.s2.process(self.s1.process(x))
     }
+
+    /// 频率 `f` 处的功率增益（背景音按期望功率定响度时用）。
+    pub fn mag2(&self, f: f32) -> f32 {
+        self.s1.mag2(f) * self.s2.mag2(f)
+    }
 }
 
 /// ITU-R BS.1770-4 积分响度（绝对门限 −70 LUFS，相对门限 −10 LU）。

@@ -1,6 +1,7 @@
 //! 文件模式：解码任意常见格式 → 取一个声道 → 48 kHz → 引擎（带约 1 秒预读）→ 精确响度归一化和真峰值限制 → WAV。
 //! 多音频合成（[`convert_mix`]）：几个文件各过一个引擎、各在一个位置，相加之后同样两遍处理；
 //! 可以先自动对齐（[`align_tracks`]：同一首歌的几个版本，从一起开始唱的地方叠加）。
+//! 左右双人（[`ConvertOptions::duo`]）：一个文件当成两个声音合成，第 2 个晚几十毫秒，走的也是 [`convert_mix`]。
 
 use crate::dsp::align::{self, Alignment};
 use crate::dsp::analysis::prescan;
@@ -9,6 +10,7 @@ use crate::dsp::dynamics::{Limiter, LoudnessMeter, TruePeak};
 use crate::dsp::engine::{Engine, EngineConfig, PostMode};
 use crate::dsp::mix::{self, MixSetup, Mixer, Voice, MAX_VOICES};
 use crate::dsp::params::Params;
+use crate::dsp::rain::{self, Rain};
 use crate::dsp::resample::Resampler;
 use crate::dsp::{db_to_lin, FS, FS_USIZE};
 use std::fs::File;
@@ -46,12 +48,53 @@ pub struct ConvertOptions {
     pub max_gr_db: f32,
     /// 把实际走位写成 CSV（时间, 方位角, 距离, 不含忽远忽近的距离, 说话活动, 仰角, 入耳深度）。
     pub save_trajectory: Option<PathBuf>,
+    /// 左右双人：同一个声音一左一右两个人说，第 2 个晚一点（None = 普通转换）。批量转换时每个文件都这样做。
+    pub duo: Option<Duo>,
 }
 
 impl ConvertOptions {
     pub fn new(input: PathBuf) -> Self {
         let output = default_output(&input);
-        ConvertOptions { input, output, start: 0.0, duration: None, channel: Channel::Auto, bits: 24, lufs: -16.0, peak_db: -1.0, max_gr_db: 8.0, save_trajectory: None }
+        ConvertOptions { input, output, start: 0.0, duration: None, channel: Channel::Auto, bits: 24, lufs: -16.0, peak_db: -1.0, max_gr_db: 8.0, save_trajectory: None, duo: None }
+    }
+}
+
+/// 左右双人：把一个音频当成两个声音合成（和导入两个音频的多音频合成一样：各在一个位置、各自忽远忽近），
+/// 第 2 个声音整体晚 `delay_ms`，听起来是两个人一前一后地说。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct Duo {
+    /// 第 2 个声音晚多少毫秒（0–[`mix::DUO_MAX_MS`]）。
+    pub delay_ms: f32,
+    /// 两个声音的位置和音量（默认左耳、右耳）。
+    pub voices: [Voice; 2],
+    /// 一起移动（按移动方式一起走、彼此相对）；否则各自固定。
+    pub follow: bool,
+    /// 自动平衡的强度（0–1，0 = 关）。
+    pub balance: f32,
+}
+
+impl Duo {
+    /// 默认：一个在左耳、一个在右耳，各自固定，不平衡。
+    pub fn new(delay_ms: f32) -> Self {
+        Duo { delay_ms, voices: [Voice::preset(0), Voice::preset(1)], follow: false, balance: 0.0 }
+    }
+
+    /// 一句话说明（写进转换完成后的报告）。
+    pub fn describe(&self, english: bool) -> String {
+        let name = |v: &Voice| match v.preset_index() {
+            Some(i) => if english { mix::PRESETS[i].1 } else { mix::PRESETS[i].0 }.to_string(),
+            None => format!("{:.0}°", v.az),
+        };
+        let pos = if self.follow {
+            if english { "moving together, opposite each other".to_string() } else { "一起移动，彼此相对".to_string() }
+        } else {
+            format!("{} / {}", name(&self.voices[0]), name(&self.voices[1]))
+        };
+        if english {
+            format!("Two voices: the second {:.0} ms later ({pos})", self.delay_ms)
+        } else {
+            format!("左右双人：第 2 个声音晚 {:.0} ms（{pos}）", self.delay_ms)
+        }
     }
 }
 
@@ -77,6 +120,8 @@ pub struct MixOptions {
     pub align: bool,
     /// 自动平衡的强度（0–1，0 = 关）：按短时响度让几段每一段时间都差不多一样响。
     pub balance: f32,
+    /// 各音源比时间线晚多少个样本（左右双人：[0, 延迟, …]；多音频合成全是 0）。
+    pub delays: [usize; MAX_VOICES],
 }
 
 /// 由各段的 10 ms 均方和整段响度算出自动平衡要用的输入响度数据（与强度无关）。合成试听和保存共用。
@@ -102,6 +147,10 @@ pub struct ConvertReport {
     pub align_note: String,
     /// 多音频合成·自动平衡的说明：平衡前后两边的短时响度差（没平衡时为空）。
     pub balance_note: String,
+    /// 左右双人的说明：第 2 个声音晚多少、两个声音在哪里（不是左右双人时为空）。
+    pub duo_note: String,
+    /// 背景音的说明（没开背景音时为空）。
+    pub bg_note: String,
     pub n_moves: u32,
     pub n_sways: u32,
     /// 从头顶绕的次数、上下换位的次数。
@@ -313,7 +362,8 @@ struct Finished {
 }
 
 /// 去掉尾部多余的静音，第二遍精确响度归一化 + 真峰值限制，写出 WAV。`n_sig`：输入（最长的那个）的样本数。
-fn finish(opts: &ConvertOptions, r: Rendered, n_sig: usize, cancel: &AtomicBool, progress: &mut impl FnMut(f32, &str)) -> Result<Finished, String> {
+/// 第二遍。`cfg`：背景音（雨声）在这里加——人声归一化之后、限制器之前，比人声低"音量"那么多，开头 1 秒淡入、结尾 2 秒淡出。
+fn finish(opts: &ConvertOptions, r: Rendered, n_sig: usize, cfg: &EngineConfig, cancel: &AtomicBool, progress: &mut impl FnMut(f32, &str)) -> Result<Finished, String> {
     let Rendered { tmp, written, peak, meter } = r;
     let cancelled = || cancel.load(Ordering::Relaxed);
     // 去掉尾部多余的静音：保留到最后一个高于最大值 −100 dB 的样本
@@ -332,7 +382,8 @@ fn finish(opts: &ConvertOptions, r: Rendered, n_sig: usize, cancel: &AtomicBool,
     }
 
     // 第二遍：响度归一化；峰值太高时用前瞻限制器最多压 max_gr dB，再不够就整体降低
-    let mut gain = db_to_lin(meter.gain_db_for(opts.lufs));
+    let g0 = db_to_lin(meter.gain_db_for(opts.lufs));
+    let mut gain = g0;
     let lim = db_to_lin(opts.peak_db);
     if peak * gain > lim {
         let need = 20.0 * (peak * gain / lim).log10();
@@ -340,6 +391,22 @@ fn finish(opts: &ConvertOptions, r: Rendered, n_sig: usize, cancel: &AtomicBool,
             gain *= db_to_lin(-(need - opts.max_gr_db));
         }
     }
+    // 背景音按人声实际的响度定（峰值太高、人声整体降低了时跟着降）
+    let rain_ref = opts.lufs + 20.0 * (gain / g0).max(1e-9).log10();
+    let mut rain = cfg.derived.rain.as_ref().map(|s| {
+        let mut r = Rain::new(s.clone(), cfg.params.seed, cfg.derived.playback.as_ref());
+        r.prime_gain(rain_ref);
+        r
+    });
+    let (mut rain_l, mut rain_r) = if rain.is_some() { (vec![0f32; CH], vec![0f32; CH]) } else { (Vec::new(), Vec::new()) };
+    let fade_in = (FS_USIZE).min(n_out / 4).max(1);
+    let fade_out = (2 * FS_USIZE).min(n_out / 3).max(1);
+    let fade = |i: usize| -> f32 {
+        let a = if i < fade_in { 0.5 - 0.5 * (std::f32::consts::PI * i as f32 / fade_in as f32).cos() } else { 1.0 };
+        let left = n_out.saturating_sub(i);
+        let b = if left < fade_out { 0.5 - 0.5 * (std::f32::consts::PI * left as f32 / fade_out as f32).cos() } else { 1.0 };
+        a * b
+    };
     let spec = hound::WavSpec { channels: 2, sample_rate: FS_USIZE as u32, bits_per_sample: opts.bits, sample_format: hound::SampleFormat::Int };
     let mut wav = hound::WavWriter::create(&opts.output, spec).map_err(|e| format!("无法写入 {}：{e}", opts.output.display()))?;
     let mut limiter = Limiter::new(6.0, 40.0);
@@ -362,10 +429,25 @@ fn finish(opts: &ConvertOptions, r: Rendered, n_sig: usize, cancel: &AtomicBool,
             if avail > 0 {
                 rd.read_exact(&mut buf[..avail * 8]).map_err(|e| e.to_string())?;
             }
+            if let Some(r) = &mut rain {
+                if avail > 0 {
+                    r.render(rain_ref, &mut rain_l[..avail], &mut rain_r[..avail]);
+                    for i in 0..avail {
+                        let f = fade(fed + i);
+                        rain_l[i] *= f;
+                        rain_r[i] *= f;
+                    }
+                }
+            }
             for i in 0..m {
                 let (l, r) = if i < avail {
                     let o = i * 8;
-                    (f32::from_le_bytes(buf[o..o + 4].try_into().unwrap()) * gain, f32::from_le_bytes(buf[o + 4..o + 8].try_into().unwrap()) * gain)
+                    let (l, r) = (f32::from_le_bytes(buf[o..o + 4].try_into().unwrap()) * gain, f32::from_le_bytes(buf[o + 4..o + 8].try_into().unwrap()) * gain);
+                    if rain.is_some() {
+                        (l + rain_l[i], r + rain_r[i])
+                    } else {
+                        (l, r)
+                    }
                 } else {
                     (0.0, 0.0)
                 };
@@ -395,6 +477,9 @@ fn finish(opts: &ConvertOptions, r: Rendered, n_sig: usize, cancel: &AtomicBool,
 
 /// 转换一个文件。`progress(0–1, 阶段说明)`；`cancel` 置位时中止。
 pub fn convert(opts: &ConvertOptions, params: &Params, cancel: Arc<AtomicBool>, mut progress: impl FnMut(f32, &str)) -> Result<ConvertReport, String> {
+    if let Some(d) = opts.duo.filter(|d| d.delay_ms > 0.0) {
+        return convert_duo(opts, d, params, cancel, progress);
+    }
     let t_start = std::time::Instant::now();
     crate::dsp::flush_denormals();
     progress(0.0, "读取音频");
@@ -406,6 +491,7 @@ pub fn convert(opts: &ConvertOptions, params: &Params, cancel: Arc<AtomicBool>, 
 
     // 文件模式：响度和限幅放到第二遍，引擎里不做自动响度
     let cfg = Arc::new(EngineConfig::new(params.clone(), None));
+    let eng_cfg = cfg.clone();
     let lookahead = 1.0;
     let mut eng = Engine::new(cfg, PostMode::Offline, lookahead);
     if let Some((thr, med)) = prescan(&mono) {
@@ -432,15 +518,17 @@ pub fn convert(opts: &ConvertOptions, params: &Params, cancel: Arc<AtomicBool>, 
             writeln!(f, "{:.4},{:.2},{:.5},{:.5},{:.3},{:.2},{:.5}", row[0], row[1], row[2], row[3], row[4], row[5], row[6]).map_err(|e| e.to_string())?;
         }
     }
-    let fin = finish(opts, rendered, n_sig, &cancel, &mut progress)?;
+    let fin = finish(opts, rendered, n_sig, &eng_cfg, &cancel, &mut progress)?;
     Ok(ConvertReport {
         seconds: fin.seconds,
         lufs: fin.lufs,
         true_peak_db: fin.true_peak_db,
         max_gr_db: fin.max_gr_db,
+        bg_note: rain::describe(params, false),
         channel_note: note,
         align_note: String::new(),
         balance_note: String::new(),
+        duo_note: String::new(),
         n_moves: eng.tele.n_moves,
         n_sways: eng.tele.n_sways,
         n_tops: eng.tele.n_tops,
@@ -449,6 +537,23 @@ pub fn convert(opts: &ConvertOptions, params: &Params, cancel: Arc<AtomicBool>, 
         speech_pct: 100.0 * eng.n_speech as f32 / eng.n_blocks.max(1) as f32,
         elapsed_s: t_start.elapsed().as_secs_f64(),
     })
+}
+
+/// 左右双人：同一个文件当成两个声音（`d.voices`），第 2 个晚 `d.delay_ms`，按多音频合成做（文件只解码一次）。
+/// 输出比原音频长出这段延迟（第 2 个声音说完为止）；起点和时长按第 1 个声音（原音频）的时间算。
+fn convert_duo(opts: &ConvertOptions, d: Duo, params: &Params, cancel: Arc<AtomicBool>, progress: impl FnMut(f32, &str)) -> Result<ConvertReport, String> {
+    if opts.save_trajectory.is_some() {
+        return Err("左右双人不支持导出走位".into());
+    }
+    let mut o = opts.clone();
+    o.duo = None;
+    let inputs = [MixInput { path: opts.input.clone(), voice: d.voices[0] }, MixInput { path: opts.input.clone(), voice: d.voices[1] }];
+    let mut delays = [0; MAX_VOICES];
+    delays[1] = mix::delay_samples(d.delay_ms);
+    let mo = MixOptions { follow: d.follow, align: false, balance: d.balance, delays };
+    let mut rep = convert_mix(&o, &inputs, params, mo, cancel, progress)?;
+    rep.duo_note = d.describe(false);
+    Ok(rep)
 }
 
 /// 自动对齐几段整段解码好的单声道音频（见 [`crate::dsp::align`]）：返回对齐、裁剪（裁开处淡入淡出）之后的各段和对齐结果。
@@ -471,11 +576,14 @@ pub fn align_tracks(monos: &[&[f32]], names: &[String]) -> Result<(Vec<Vec<f32>>
 /// `mo.align`：先自动对齐（整段解码后对齐、裁掉对不上的开头和结尾），起点和时长按对齐之后的时间算；
 /// 对齐的说明（每段从哪里开始用、裁掉多少）放在报告的 `align_note` 里。
 /// `mo.balance`：自动平衡（整段算增益曲线，再截起点和时长），说明放在 `balance_note` 里。
-/// 对齐或平衡时整段解码、按整段测响度，和合成试听完全一样；两者都关时和以前一样只解码要处理的那一段。
+/// `mo.delays`：各音源比时间线晚多少个样本（左右双人），截取各段时直接错开，时间线随之变长。
+/// 对齐、平衡或有延迟时整段解码（同一个文件只解码一次）、按整段测响度，和合成试听完全一样；
+/// 都没有时和以前一样只解码要处理的那一段。
 pub fn convert_mix(opts: &ConvertOptions, inputs: &[MixInput], params: &Params, mo: MixOptions, cancel: Arc<AtomicBool>, mut progress: impl FnMut(f32, &str)) -> Result<ConvertReport, String> {
     let (follow, align) = (mo.follow, mo.align);
-    let full = mo.align || mo.balance > 0.0;
     let n = inputs.len();
+    let delays = &mo.delays[..n.min(MAX_VOICES)];
+    let full = mo.align || mo.balance > 0.0 || delays.iter().any(|&d| d > 0);
     if n < 2 {
         return Err("多音频合成至少需要两个音频".into());
     }
@@ -490,7 +598,14 @@ pub fn convert_mix(opts: &ConvertOptions, inputs: &[MixInput], params: &Params, 
     crate::dsp::flush_denormals();
     let mut monos = Vec::with_capacity(n);
     let mut notes = Vec::new();
+    // 整段处理时同一个文件只解码一次（左右双人）：src[k] = 第 k 个音源用的是第几段解码结果
+    let mut src: Vec<usize> = (0..n).map(|k| if full { inputs[..k].iter().position(|i| i.path == inputs[k].path).unwrap_or(k) } else { k }).collect();
+    let unique = src.iter().enumerate().filter(|&(k, &j)| k == j).count();
     for (k, inp) in inputs.iter().enumerate() {
+        if src[k] != k {
+            monos.push(Vec::new());
+            continue;
+        }
         progress(0.05 * k as f32 / n as f32, "读取音频");
         let mut o = opts.clone();
         o.input = inp.path.clone();
@@ -502,7 +617,7 @@ pub fn convert_mix(opts: &ConvertOptions, inputs: &[MixInput], params: &Params, 
         let name = inp.path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default();
         let (m, note) = load_mono(&o, &cancel).map_err(|e| format!("{name}：{e}"))?;
         if !note.is_empty() {
-            notes.push(format!("{}. {name}：{note}", k + 1));
+            notes.push(if unique > 1 { format!("{}. {name}：{note}", k + 1) } else { format!("{name}：{note}") });
         }
         monos.push(m);
         if cancel.load(Ordering::Relaxed) {
@@ -517,35 +632,35 @@ pub fn convert_mix(opts: &ConvertOptions, inputs: &[MixInput], params: &Params, 
         let names: Vec<String> = inputs.iter().map(|i| i.path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()).collect();
         if align {
             progress(0.05, "自动对齐");
-            let refs: Vec<&[f32]> = monos.iter().map(|m| m.as_slice()).collect();
+            let refs: Vec<&[f32]> = (0..n).map(|k| monos[src[k]].as_slice()).collect();
             match align_tracks(&refs, &names) {
                 Ok((aligned, al)) => {
                     align_note = al.describe(&names, false);
                     monos = aligned;
+                    src = (0..n).collect();
                 }
                 // 对不上：和合成试听一样，按没对齐的原样合成
                 Err(e) => align_note = format!("自动对齐：{e}"),
             }
         }
-        // 响度和平衡曲线按整段算（和合成试听一样），之后再截起点和时长
-        lufs = monos.iter().map(|m| mix::loudness(m)).collect();
+        // 响度和平衡曲线按整段算（和合成试听一样），之后再截起点和时长；同一段只算一次
+        let per: Vec<Option<f32>> = (0..n).map(|k| if src[k] == k { mix::loudness(&monos[k]) } else { None }).collect();
+        lufs = (0..n).map(|k| per[src[k]]).collect();
         if mo.balance > 0.0 {
             progress(0.05, "自动平衡");
-            let lv: Vec<Vec<f32>> = monos.iter().map(|m| balance::levels(m)).collect();
-            let refs: Vec<&[f32]> = lv.iter().map(|l| l.as_slice()).collect();
+            let lv: Vec<Vec<f32>> = (0..n).map(|k| if src[k] == k { balance::levels(&monos[k]) } else { Vec::new() }).collect();
+            let refs: Vec<&[f32]> = (0..n).map(|k| lv[src[k]].as_slice()).collect();
             bal = Some(balance_data(&refs, &lufs));
         }
-        // 起点和时长按对齐之后的时间算（没对齐时就是原来的时间）
-        let len = monos.iter().map(|m| m.len()).max().unwrap_or(0);
+        // 起点和时长按对齐之后的时间算（没对齐时就是原来的时间）；有延迟的音源整体往后挪，时间线随之变长
+        let lens: Vec<usize> = (0..n).map(|k| monos[src[k]].len()).collect();
+        let len = mix::timeline_len(&lens, delays);
         s0 = (opts.start.max(0.0) * FS as f64) as usize;
         if s0 >= len {
             return Err(format!("起点 {:.1} s 超出了长度 {:.1} s", opts.start, len as f64 / FS as f64));
         }
         let s1 = opts.duration.map_or(len, |d| (s0 + (d * FS as f64) as usize).min(len));
-        for m in monos.iter_mut() {
-            let e = s1.min(m.len());
-            *m = m[s0.min(e)..e].to_vec();
-        }
+        monos = (0..n).map(|k| mix::delayed(&monos[src[k]], delays.get(k).copied().unwrap_or(0), s0, s1)).collect();
         if cancel.load(Ordering::Relaxed) {
             return Err("已取消".into());
         }
@@ -554,7 +669,7 @@ pub fn convert_mix(opts: &ConvertOptions, inputs: &[MixInput], params: &Params, 
     }
     let voices: Vec<Voice> = inputs.iter().map(|i| i.voice).collect();
     let base = Arc::new(EngineConfig::new(params.clone(), None));
-    let setup = MixSetup::new(&base, &voices, &lufs, follow, None).with_balance(bal, mo.balance);
+    let setup = MixSetup::new(&base, &voices, &lufs, follow, None).with_balance(bal, mo.balance).with_delays(delays);
     let mut mixer = Mixer::new(&setup, PostMode::Offline, 1.0);
     mixer.seek(s0); // 平衡曲线按整段的位置取
     for (k, m) in monos.iter().enumerate() {
@@ -577,7 +692,7 @@ pub fn convert_mix(opts: &ConvertOptions, inputs: &[MixInput], params: &Params, 
         let ins: Vec<&[f32]> = bufs.iter().map(|b| &b[..m]).collect();
         mixer.process_parallel(&ins, ol, or);
     })?;
-    let fin = finish(opts, rendered, n_sig, &cancel, &mut progress)?;
+    let fin = finish(opts, rendered, n_sig, &base, &cancel, &mut progress)?;
     if mo.balance > 0.0 {
         balance_note = balance::describe(mo.balance, mixer.balance_stats(), false);
     }
@@ -592,6 +707,8 @@ pub fn convert_mix(opts: &ConvertOptions, inputs: &[MixInput], params: &Params, 
         channel_note: notes.join("\n"),
         align_note,
         balance_note,
+        duo_note: String::new(),
+        bg_note: rain::describe(params, false),
         n_moves: t.n_moves,
         n_sways: t.n_sways,
         n_tops: t.n_tops,
@@ -679,6 +796,108 @@ mod tests {
         assert!(on < 2.0, "平衡后左右中位差 {on:.1} dB");
         assert!(r0.balance_note.is_empty() && r1.balance_note.starts_with("自动平衡 100%"), "{}", r1.balance_note);
         assert!((r1.lufs - r0.lufs).abs() < 0.5 && r1.seconds == r0.seconds);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 左右两路的 1 ms 对数包络，算右路比左路晚多少毫秒（互相关峰，±200 ms 内）。
+    fn envelope_lag_ms(l: &[f32], r: &[f32]) -> i64 {
+        let env = |x: &[f32]| -> Vec<f64> {
+            let mut e = 0f64;
+            let a = (-1.0 / (0.004 * FS as f64)).exp();
+            let v: Vec<f64> = x.iter().map(|&s| { e = a * e + (1.0 - a) * (s * s) as f64; (e + 1e-9).ln() }).step_by(48).collect();
+            let m = v.iter().sum::<f64>() / v.len() as f64;
+            v.into_iter().map(|x| x - m).collect()
+        };
+        let (a, b) = (env(l), env(r));
+        let corr = |lag: i64| {
+            let n = a.len() as i64 - lag.abs();
+            let (i0, j0) = if lag >= 0 { (0, lag) } else { (-lag, 0) };
+            (0..n).map(|i| a[(i0 + i) as usize] * b[(j0 + i) as usize]).sum::<f64>() / n as f64
+        };
+        (-200..=200).max_by(|&x, &y| corr(x).total_cmp(&corr(y))).unwrap()
+    }
+
+    #[test]
+    fn duo_puts_the_same_voice_on_both_sides_one_slightly_later() {
+        let dir = std::env::temp_dir().join(format!("auto_asmr_duo_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let v = test_voice(12.0);
+        let pa = dir.join("a.wav");
+        write_wav(&pa, &v);
+        let run = |start: f64, duration: Option<f64>, ms: f32| {
+            let mut opts = ConvertOptions::new(pa.clone());
+            opts.output = dir.join(format!("duo_{start}_{ms}.wav"));
+            opts.start = start;
+            opts.duration = duration;
+            opts.duo = Some(Duo::new(ms));
+            let rep = convert(&opts, &Params::default(), Arc::new(AtomicBool::new(false)), |_, _| {}).unwrap();
+            let (l, r) = read_stereo(&opts.output);
+            (rep, l, r)
+        };
+        // 整段：输出比原音频长出这段延迟；右耳（第 2 个声音）比左耳正好晚 100 ms；两边差不多一样响
+        let (rep, l, r) = run(0.0, None, 100.0);
+        // （输出末尾和普通转换一样保留最多 512 个样本的滤波器余尾）
+        assert!(l.len() >= v.len() + 4800 && l.len() <= v.len() + 4800 + 512, "{} 样本，原音频 {}", l.len(), v.len());
+        assert_eq!(rep.duo_note, "左右双人：第 2 个声音晚 100 ms（左耳 / 右耳）");
+        let lag = envelope_lag_ms(&l, &r);
+        assert!((lag - 100).abs() <= 2, "右耳比左耳晚 {lag} ms");
+        let db = |x: &[f32]| 10.0 * x.iter().map(|v| (v * v) as f64).sum::<f64>().log10();
+        assert!((db(&l) - db(&r)).abs() < 3.0, "左 {:.1} dB，右 {:.1} dB", db(&l), db(&r));
+        // 换一个延迟，错开的时间跟着变
+        let (_, l, r) = run(0.0, None, 50.0);
+        assert!((envelope_lag_ms(&l, &r) - 50).abs() <= 2);
+        // 只处理一段：长度按要求；第 2 个声音从原音频起点之前 100 ms 开始（和试听拖到这里时听到的一样），不是从静音开始
+        let (rep, l, r) = run(3.0, Some(5.0), 100.0);
+        assert!(rep.seconds >= 5.0 && rep.seconds < 5.011, "{}", rep.seconds);
+        assert!((envelope_lag_ms(&l, &r) - 100).abs() <= 2);
+        let lead = |x: &[f32]| x[..2400].iter().map(|v| (v * v) as f64).sum::<f64>();
+        assert!(lead(&r) > 1e-6 * lead(&l).max(1e-9), "右耳开头是静音");
+        // 关掉（0 ms）就是普通转换
+        let mut plain = ConvertOptions::new(pa.clone());
+        plain.output = dir.join("plain.wav");
+        plain.duration = Some(4.0);
+        let mut zero = plain.clone();
+        zero.output = dir.join("zero.wav");
+        zero.duo = Some(Duo::new(0.0));
+        let a = convert(&plain, &Params::default(), Arc::new(AtomicBool::new(false)), |_, _| {}).unwrap();
+        let b = convert(&zero, &Params::default(), Arc::new(AtomicBool::new(false)), |_, _| {}).unwrap();
+        assert!(b.duo_note.is_empty() && a.seconds == b.seconds);
+        assert_eq!(std::fs::read(&plain.output).unwrap(), std::fs::read(&zero.output).unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn background_rain_fills_the_pauses_and_off_changes_nothing() {
+        let dir = std::env::temp_dir().join(format!("auto_asmr_rain_test_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 第 1–4 秒说话，前 1 秒和后 4 秒静音
+        let v = test_voice(8.0);
+        let x: Vec<f32> = v.iter().enumerate().map(|(i, &s)| if (FS_USIZE..4 * FS_USIZE).contains(&i) { s } else { 0.0 }).collect();
+        let pa = dir.join("a.wav");
+        write_wav(&pa, &x);
+        let run = |p: &Params, name: &str| {
+            let mut opts = ConvertOptions::new(pa.clone());
+            opts.output = dir.join(name);
+            let rep = convert(&opts, p, Arc::new(AtomicBool::new(false)), |_, _| {}).unwrap();
+            (rep, read_stereo(&opts.output), opts.output)
+        };
+        // 音量为 0：其它背景音设置怎么改，输出都逐字节相同，报告里没有背景音
+        let (r0, _, o0) = run(&Params::default(), "plain.wav");
+        let (r1, _, o1) = run(&Params { rain: 90.0, bg_indoor: 0.0, bg_pan: -100.0, rain_near: 100.0, ..Params::default() }, "off.wav");
+        assert_eq!(std::fs::read(&o0).unwrap(), std::fs::read(&o1).unwrap());
+        assert!(r0.bg_note.is_empty() && r1.bg_note.is_empty());
+        // 打开雨夜：静音的那几秒里有雨声（比人声低约 18 dB 上下），开头是淡入的
+        let night = Params::default().bg_rain_night();
+        let (rep, (l, r), _) = run(&night, "night.wav");
+        assert!(rep.bg_note.starts_with("背景音：雨声，比人声低 18 dB"), "{}", rep.bg_note);
+        let (_, (l0, r0s), _) = run(&Params::default(), "plain2.wav");
+        let tail_rain = crate::dsp::rain::tests::lufs(&l[5 * FS_USIZE..6 * FS_USIZE + FS_USIZE / 2], &r[5 * FS_USIZE..6 * FS_USIZE + FS_USIZE / 2]);
+        let voice = crate::dsp::rain::tests::lufs(&l0[FS_USIZE..4 * FS_USIZE], &r0s[FS_USIZE..4 * FS_USIZE]);
+        assert!(tail_rain > voice - 26.0 && tail_rain < voice - 12.0, "人声 {voice:.1}，静音处的雨声 {tail_rain:.1} LUFS");
+        let e = |a: &[f32]| a.iter().map(|v| (*v as f64).powi(2)).sum::<f64>() / a.len() as f64;
+        // 开头 1 秒淡入：前 50 ms 的雨声比 0.75–0.95 s 轻得多（这两段都没有人声）
+        assert!(e(&l[..2400]) < 0.05 * e(&l[36_000..45_600]), "开头没有淡入");
+        assert!(e(&l0[..45_600]) == 0.0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

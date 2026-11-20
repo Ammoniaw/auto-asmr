@@ -4,7 +4,7 @@
 //! 输出设备的采样率。两个设备的时钟不会完全一致，用输出端重采样比例的微调（±0.5%）把缓冲量稳在目标值。
 
 use crate::dsp::engine::{Engine, EngineConfig, PostMode, Telemetry};
-use crate::dsp::mix::{MixSetup, Mixer, MAX_VOICES};
+use crate::dsp::mix::{self, MixSetup, Mixer, MAX_VOICES};
 use crate::dsp::resample::Resampler;
 use crate::dsp::{FS, FS_USIZE};
 use crate::spsc;
@@ -391,9 +391,15 @@ struct Pump {
     er: Vec<f32>,
     last_output: [f32; 2],
     seek_fade: usize,
+    /// 合成试听各段的延迟（样本，左右双人）：现在用的、淡出中的旧值，以及淡变还剩多少样本。
+    dl: [usize; MAX_VOICES],
+    dl_old: [usize; MAX_VOICES],
+    dl_fade: usize,
 }
 
 const N: usize = 64;
+/// 试听中改了延迟：从旧的位置淡到新的位置用多少样本（20 ms），免得一下跳过去咔嗒一声。
+const DL_FADE: usize = 960;
 
 impl Pump {
     #[cfg(test)]
@@ -415,6 +421,7 @@ impl Pump {
             Source::Ring(_) => {}
         }
         let n_in = if let Source::Multi { data, .. } = &src { data.len() } else { 0 };
+        let dl = if let Proc::Mix(m) = &proc { m.delays() } else { [0; MAX_VOICES] };
         Pump {
             src,
             proc,
@@ -434,6 +441,9 @@ impl Pump {
             er: vec![0.0; N],
             last_output: [0.0; 2],
             seek_fade: 0,
+            dl,
+            dl_old: dl,
+            dl_fade: 0,
         }
     }
 
@@ -455,12 +465,33 @@ impl Pump {
                 true
             }
             Source::Multi { data, pos, len } => {
-                for (d, b) in data.iter().zip(self.inbs.iter_mut()) {
-                    let n = d.len();
-                    for (i, v) in b[..N].iter_mut().enumerate() {
-                        *v = if *pos + i < n { d[*pos + i] } else { 0.0 };
+                // 第 k 段按"现在位置 − 它的延迟"取（左右双人的第 2 个声音晚一点）。试听中改了延迟：先把这次的淡变走完，
+                // 再在 20 ms 里从旧位置淡到新位置
+                if self.dl_fade == 0 {
+                    if let Proc::Mix(m) = &self.proc {
+                        let want = m.delays();
+                        if want != self.dl {
+                            self.dl_old = self.dl;
+                            self.dl = want;
+                            self.dl_fade = DL_FADE;
+                        }
                     }
                 }
+                let done = DL_FADE - self.dl_fade;
+                for (k, (d, b)) in data.iter().zip(self.inbs.iter_mut()).enumerate() {
+                    let at = |t: usize, dl: usize| if t >= dl { d.get(t - dl).copied().unwrap_or(0.0) } else { 0.0 };
+                    let (new, old) = (self.dl[k], self.dl_old[k]);
+                    for (i, v) in b[..N].iter_mut().enumerate() {
+                        let t = *pos + i;
+                        *v = if self.dl_fade > 0 && new != old {
+                            let w = ((done + i + 1) as f32 / DL_FADE as f32).min(1.0);
+                            at(t, old) * (1.0 - w) + at(t, new) * w
+                        } else {
+                            at(t, new)
+                        };
+                    }
+                }
+                self.dl_fade = self.dl_fade.saturating_sub(N);
                 *pos += N;
                 self.shared.play_pos.store((*pos).min(*len) as u64, Ordering::Relaxed);
                 if *pos > *len + FS_USIZE {
@@ -520,6 +551,12 @@ impl Pump {
                     rs.reset();
                 }
                 self.seek_fade = (self.out_rate * 0.005).round().max(1.0) as usize;
+                // 跳转本身有淡入：延迟直接用新的，不用再淡
+                if let Proc::Mix(m) = &self.proc {
+                    self.dl = m.delays();
+                }
+                self.dl_old = self.dl;
+                self.dl_fade = 0;
             }
             // 先清除播完状态，再确认跳转完成；期间的新拖动请求留到下一回调。
             let _ = self.shared.seek_sample.compare_exchange(seek, u64::MAX, Ordering::AcqRel, Ordering::Acquire);
@@ -725,7 +762,8 @@ impl Realtime {
                 info.input_name = format!("{} 个文件合成", audio.len());
                 info.in_rate = FS_USIZE as u32;
                 info.in_channels = audio.len() as u16;
-                let len = audio.iter().map(|a| a.len()).max().unwrap_or(0);
+                let lens: Vec<usize> = audio.iter().map(|a| a.len()).collect();
+                let len = mix::timeline_len(&lens, &setup.delays);
                 (None, Source::Multi { data: audio, pos, len }, Proc::Mix(Mixer::new(&setup, PostMode::Realtime, 0.0)))
             }
             Feed::Mic => {
@@ -918,7 +956,7 @@ mod tests {
         let x = crate::cli::test_voice(8.0);
         let len = x.len();
         let base = EngineConfig::new(Params { auto_level: false, ..Params::default() }, None);
-        let setup = |v: [Voice; 2]| Arc::new(MixSetup { cfgs: voice_configs(&base, &v, None), gains: vec![1.0, 1.0], offsets: vec![0.0; 2], follow: false, balance: None, balance_strength: 0.0 });
+        let setup = |v: [Voice; 2]| Arc::new(MixSetup { cfgs: voice_configs(&base, &v, None), gains: vec![1.0, 1.0], offsets: vec![0.0; 2], follow: false, balance: None, balance_strength: 0.0, delays: vec![0; 2] });
         let first = setup([Voice::preset(0), Voice::preset(1)]);
         let shared = Arc::new(Shared::new(first.cfgs[0].clone()));
         *shared.mix.lock().unwrap() = Some(first.clone());
@@ -953,6 +991,63 @@ mod tests {
         shared.seek_preview(u64::MAX);
         run(&mut pump, 60);
         assert!(shared.preview_finished());
+    }
+
+    #[test]
+    fn duo_preview_reads_the_second_voice_later_and_changes_delay_smoothly() {
+        use crate::dsp::mix::Voice;
+        // 左右双人的试听：同一段音频给两个声音，第 2 个按"位置 − 延迟"取；拖延迟滑条时 20 ms 淡过去；跳转后立刻对上
+        let x = crate::cli::test_voice(6.0);
+        let len = x.len();
+        let base = Arc::new(EngineConfig::new(Params { auto_level: false, ..Params::default() }, None));
+        let voices = [Voice::preset(0), Voice::preset(1)];
+        let st = |d: usize| Arc::new(MixSetup::new(&base, &voices, &[None, None], false, None).with_delays(&[0, d]));
+        let first = st(4800);
+        let shared = Arc::new(Shared::new(base.clone()));
+        *shared.mix.lock().unwrap() = Some(first.clone());
+        let audio = Arc::new(x.clone());
+        let src = Source::Multi { data: vec![audio.clone(), audio], pos: 0, len: len + 4800 };
+        let mut pump = Pump::with_proc(src, Proc::Mix(Mixer::new(&first, PostMode::Realtime, 0.0)), shared.clone(), 48_000.0);
+        let at = |t: usize, d: usize| if t >= d { x.get(t - d).copied().unwrap_or(0.0) } else { 0.0 };
+        let pos = |p: &Pump| if let Source::Multi { pos, .. } = &p.src { *pos } else { 0 };
+        for _ in 0..200 {
+            let p0 = pos(&pump);
+            assert!(pump.next_block());
+            for i in 0..N {
+                assert_eq!(pump.inbs[0][i], at(p0 + i, 0));
+                assert_eq!(pump.inbs[1][i], at(p0 + i, 4800));
+            }
+        }
+        // 改成 50 ms：淡变中是新旧两个位置的混合（连续、没有跳变），20 ms 之后完全是新的
+        if let Proc::Mix(m) = &mut pump.proc {
+            m.set_setup(&st(2400));
+        }
+        let mut max_step = 0f32;
+        let mut prev = pump.inbs[1][N - 1];
+        for b in 0..30 {
+            let p0 = pos(&pump);
+            assert!(pump.next_block());
+            for i in 0..N {
+                let v = pump.inbs[1][i];
+                if b < DL_FADE / N {
+                    max_step = max_step.max((v - prev).abs());
+                } else {
+                    assert_eq!(v, at(p0 + i, 2400));
+                }
+                prev = v;
+            }
+        }
+        let own_step = x.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0f32, f32::max);
+        assert!(max_step <= own_step * 1.01 + 1e-6, "淡变中一步跳了 {max_step}（原音频自己最多 {own_step}）");
+        // 跳转：新位置上第 2 个声音直接从 50 ms 之前开始
+        shared.seek_preview(96_000);
+        let (mut l, mut r) = (vec![0f32; 64], vec![0f32; 64]);
+        pump.fill(&mut l, &mut r);
+        let p0 = pos(&pump);
+        assert!(pump.next_block());
+        for i in 0..N {
+            assert_eq!(pump.inbs[1][i], at(p0 + i, 2400));
+        }
     }
 
     #[test]

@@ -76,6 +76,29 @@ impl Biquad {
         Self::from_coeffs([(1.0 + c) / 2.0, -(1.0 + c), (1.0 + c) / 2.0], [1.0 + al, -2.0 * c, 1.0 - al])
     }
 
+    /// 一阶低通（双线性变换），写成双二阶的形式（方便算频响、慢慢改参数）。
+    pub fn lowpass1(fc: f32) -> Self {
+        let k = (PI * fc / FS).tan();
+        Self::from_coeffs([k, k, 0.0], [1.0 + k, k - 1.0, 0.0])
+    }
+
+    /// 峰值均衡（RBJ）：在 fc 处提升 / 衰减 `gain_db`。
+    pub fn peaking(fc: f32, q: f32, gain_db: f32) -> Self {
+        let a = 10f32.powf(gain_db / 40.0);
+        let w0 = 2.0 * PI * fc / FS;
+        let (s, c) = w0.sin_cos();
+        let al = s / (2.0 * q);
+        Self::from_coeffs([1.0 + al * a, -2.0 * c, 1.0 - al * a], [1.0 + al / a, -2.0 * c, 1.0 - al / a])
+    }
+
+    /// 二阶带通（峰值增益 0 dB）。
+    pub fn bandpass(fc: f32, q: f32) -> Self {
+        let w0 = 2.0 * PI * fc / FS;
+        let (s, c) = w0.sin_cos();
+        let al = s / (2.0 * q);
+        Self::from_coeffs([al, 0.0, -al], [1.0 + al, -2.0 * c, 1.0 - al])
+    }
+
     #[inline]
     pub fn process(&mut self, x: f32) -> f32 {
         let y = self.b0 * x + self.z1;
@@ -84,6 +107,28 @@ impl Biquad {
         y
     }
 
+    /// 换成 `b` 的系数，保留自己的状态（参数慢慢变化时每个控制块调一次，不会咔嗒）。
+    pub fn retune(&mut self, b: &Biquad) {
+        (self.b0, self.b1, self.b2, self.a1, self.a2) = (b.b0, b.b1, b.b2, b.a1, b.a2);
+    }
+
+    /// 频率 `f`（Hz）处的复数频响（实部, 虚部）。
+    pub fn response(&self, f: f32) -> (f32, f32) {
+        let w = 2.0 * PI * f / FS;
+        let (s1, c1) = w.sin_cos();
+        let (s2, c2) = (2.0 * w).sin_cos();
+        // e^{-jw} = c1 − j s1
+        let (nr, ni) = (self.b0 + self.b1 * c1 + self.b2 * c2, -(self.b1 * s1 + self.b2 * s2));
+        let (dr, di) = (1.0 + self.a1 * c1 + self.a2 * c2, -(self.a1 * s1 + self.a2 * s2));
+        let d2 = dr * dr + di * di;
+        ((nr * dr + ni * di) / d2, (ni * dr - nr * di) / d2)
+    }
+
+    /// 频率 `f` 处的功率增益 |H|²。
+    pub fn mag2(&self, f: f32) -> f32 {
+        let (re, im) = self.response(f);
+        re * re + im * im
+    }
 }
 
 pub const BUTTER_Q: f32 = std::f32::consts::FRAC_1_SQRT_2;

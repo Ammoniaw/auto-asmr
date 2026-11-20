@@ -140,8 +140,9 @@ impl Balancer {
     }
 
     /// 处理一块：`outs[k]` 是声音 k 的引擎输出（左, 右），前 `m` 个样本就地乘上平衡增益。`in_pos`：这一块对应的输入
-    /// 在各段里的位置（= 输出位置 − 引擎时延）；`strength`：0–1。按 64 个样本一步更新，块长是 64 的整数倍时结果与块长无关。
-    pub fn process(&mut self, data: &BalanceData, strength: f32, in_pos: i64, outs: &mut [[Vec<f32>; 2]], m: usize) {
+    /// 在时间线上的位置（= 输出位置 − 引擎时延）；`delays[k]`：声音 k 比时间线晚多少个样本（左右双人的第 2 个声音），
+    /// 它的输入响度按 `in_pos − delays[k]` 取；`strength`：0–1。按 64 个样本一步更新，块长是 64 的整数倍时结果与块长无关。
+    pub fn process(&mut self, data: &BalanceData, strength: f32, in_pos: i64, delays: &[usize], outs: &mut [[Vec<f32>; 2]], m: usize) {
         let n = outs.len().min(self.vs.len());
         let m = outs.iter().map(|o| o[0].len().min(o[1].len())).fold(m, usize::min);
         let mut s = 0;
@@ -158,7 +159,7 @@ impl Balancer {
                     let (a, b) = (v.kl.process(l[i]) as f64, v.kr.process(r[i]) as f64);
                     e += a * a + b * b;
                 }
-                let (lv, st, act) = data.at(k, p);
+                let (lv, st, act) = data.at(k, p - delays.get(k).copied().unwrap_or(0) as i64);
                 v.e_out = a_t * v.e_out + (1.0 - a_t) * e / len as f64;
                 v.e_in = a_t * v.e_in + (1.0 - a_t) * lv as f64;
                 if act && v.e_in > 1e-9 && v.e_out > 1e-12 {
@@ -274,7 +275,7 @@ mod tests {
     fn feed(bal: &mut Balancer, data: &BalanceData, strength: f32, o: usize, x: [&mut [f32]; 4]) {
         let m = x[0].len();
         let mut bufs = vec![[x[0].to_vec(), x[1].to_vec()], [x[2].to_vec(), x[3].to_vec()]];
-        bal.process(data, strength, o as i64, &mut bufs, m);
+        bal.process(data, strength, o as i64, &[], &mut bufs, m);
         let [a, b, c, d] = x;
         a.copy_from_slice(&bufs[0][0]);
         b.copy_from_slice(&bufs[0][1]);

@@ -277,6 +277,70 @@
 
 `--ku100-eq`：近耳 6–12 kHz 改用按 B 站 5 个 KU100 贴耳录音（BV1taEf6cEfi、BV1hBsP6FE1g、BV1ZndxYSE4Z、BV1UccyzWEgH、BV19t411D7tQ，只提取统计特征）标定的校正曲线，高频更收。
 
+## 背景音：雨声（`--bg rain-night`）
+
+只有 Rust 版有。背景音是可选的：音量为 0 时完全不参与，输出逐字节不变；人声本身一点不动。雨声不用录音素材，全部按雨滴落地的物理过程实时生成，实时（主播）、试听和文件转换用的是同一套代码。用法见[界面使用说明 · 背景音](app-usage.md#背景音雨声)。
+
+### 做法和依据
+
+| 部分 | 做法 | 依据 |
+|---|---|---|
+| 雨滴 | 雨量 R（mm/h）下直径按 Marshall–Palmer 谱 N(D) = 8000·e^(−ΛD) /m³/mm，Λ = 4.1·R^−0.21 /mm；下落速度 v(D) = 9.65 − 10.3·e^(−0.6D) m/s。雨越大，大雨滴越多 | Marshall & Palmer 1948；Atlas、Srivastava & Sekhon 1973 |
+| 一滴打在地上 | 一个很短的压力脉冲：开头几微秒的尖峰（水锤），再跟一个宽度等于接触时间 D/v（0.26–0.64 ms）的单周期正弦；峰值 ∝ D·v³ / 距离——大雨滴更响、更低沉。40% 落在软的表面上（树叶、草、泥土），接触时间长 2.5 倍，还带一个单极的"噗"（表面被压下去、挤开空气），声音更低。尖峰大小、软表面的比例和宽度、单极成分是对着真实录音拟合的（见下面"和真实录音对照校准"） | Miklavcic、Zita、Arvidsson 2004（DAFx）：撞击声是解析的短脉冲，强度和雨滴的动能、落点的距离有关；Metcalf 等（hardRain）：热带雨林录音里雨打植物在 0.6–1.2 kHz 和 4.4–5.6 kHz 最明显 |
+| 整片雨声 | 雨滴均匀落在以听者为中心的三个圆环里（近 0.5–3 m、中 3–12 m、远 12–50 m，耳朵离地 1.2 m），每一滴从它自己的方向（KU100 HRIR，含仰角）、按 1/距离 衰减地到达两耳，两耳之间的相关、远近的明暗都是叠加出来的。远处两个圆环有遮挡（功率 ×0.7、×0.35）；三个圆环按距离低通（10、8、6 kHz，对着录音拟合）。每个圆环每秒只逐个渲染最大的两三千滴，更小的合成能量相同、正负号随机的稀疏脉冲 | DAFx 2004 的做法：落点在两个圆之间的圆环里随机，安排的是"到达时间"而不是"撞击时间"（否则开头会有个渐强）；Välimäki 等 2013：稀疏的 ±1 脉冲（velvet noise）每秒两千个以上听起来就是平滑的噪声 |
+| 为什么不用滤波白噪声 | 雨这类纹理靠零星而集中的事件（稀疏）和各频带同步起伏才像 | McDermott & Simoncelli 2011（Neuron）：只把各频带的功率做对（相当于同频谱的噪声）时，听的人基本认不出是什么纹理；加上包络的方差 / 偏度 / 峰度和频带之间的相关才自然 |
+| 雨量起伏 | 雨量以十几秒的节奏轻轻起伏（对数正态 ±25%，时间常数 14 s） | 真实的雨不是一成不变的 |
+| 水洼里的"叮" | 落在近处、直径 2.2 mm 以上的雨滴，有水的地方（雨越大越多）一部分卷进一个气泡：频率 f₀·r₀ ≈ 3 m/s，衰减 β = π·f₀·δ（δ = 辐射阻尼 0.0138 + 热阻尼 4.5×10⁻⁴·√f₀），音调随气泡上浮往上滑：f(t) = f₀(1 + ξβt)，ξ = 0.1；幅度 ∝ ε·r₀（ε 3%–10%，按 ε^−1.5 取）。每个"叮"的能量是整片雨声 1.5 ms 的能量，在自己那个频带里比"沙沙"高约 3 dB | Minnaert 1933；Leighton 1994；van den Doel 2005（ξ ≈ 0.1 来自听感实验，Moss 等 2009 转述公式）；Medwin、Nystuen 等 1992：直径 2.2 mm 以上的雨滴在水面产生 2–10 kHz 的气泡声；Phillips、Agarwal、Jordan 2018：空气里听到的"叮"是水下的气泡带动水面振动发出的，溅水本身几乎没有声音 |
+| 屋檐滴水 | 1–3 处固定的位置，各有各的节奏（每滴 ±10% 随机，再慢慢漂移 ±20%）和音高（1.2–3.6 kHz）；大水滴落进水洼，气泡音调上滑更明显（ξ 0.25–0.55）；偶尔没卷进气泡，只有轻轻的"啪" | Zheng & James 2009（Harmonic Fluids）：真实水滴的气泡音调常上滑 2–3 倍 |
+| 近处雨滴 | 窗玻璃：一下宽频的"嗒"（0.2 ms）加窗户的几个模态——整块玻璃的低模态（约 175–475 Hz 的"咚"）、约 2 kHz 挨得很近的一簇（带一点拍频）、两个更高衰减更快的；窗台：木头的短"嗒"；树叶：短促的带通噪声；水洼：气泡。"隔窗"越大越多落在玻璃和窗台上，而且越突出（隔窗 100 时 +8 dB：它们不隔着墙）。模态的大小和突出程度对着屋里听雨打窗的录音校过 | Farnell《Designing Sound》Practical 15：玻璃窗模型是 1969–2007 Hz 的一簇共振器，另有雨打树叶、雨落水面的模型 |
+| 隔窗 | 外面的雨（含水洼、树叶）按墙和玻璃的隔声：一阶低通（每倍频程 6 dB，拐点随滑条从 20 kHz 降到 700 Hz），125 Hz 附近的共振透得多一点（最多 +14 dB），再漏 2% 进来；窗玻璃上的雨点就在玻璃上，不闷；屋檐滴水闷一半 | 质量定律：隔声量随频率升高，每倍频程约多 6 dB；双层玻璃 / 墙体在一两百赫兹有"质量-空气-质量"共振。具体数值对着两段关着窗的录音校过 |
+| 响度 | 增益按期望功率解析地算：每种雨滴的频谱 × 方向分布下的 HRIR 功率谱 × 各级滤波 × 回放补偿 × K 加权，求和；让整片雨声的积分响度 = 人声的目标响度 + 音量（dB）+ 雨量带来的 ±5 dB。近处雨滴、滴水按整片雨声的功率定响度 | ITU-R BS.1770 |
+
+### 实测
+
+- **响度**：只有整片雨声时（测试里去掉了雨量起伏），毛毛雨 / 中雨 / 大雨 / 暴雨、在外面 / 隔窗 / 偏向一侧这 4 种设置下，40 秒的积分响度和设定值相差 0.8 dB 以内；带着雨量起伏时，120 秒的实测在设定值上下约 1 dB。
+- **频谱**：见下面"和真实录音对照校准"。在外面、雨量 35（各倍频程相对总能量）：125 Hz −15、250 Hz −12、500 Hz −9、1 kHz −6、2 kHz −6、4 kHz −8、8 kHz −14、16 kHz −21 dB。
+- **稀疏程度**（2–4 kHz 包络的峰度；高斯噪声约 3.2，越大越"一滴一滴"）：只有整片雨声时，毛毛雨 8.4、中雨 9.5、暴雨 16.5（水洼里的"叮"多了）。一开始"叮"太响，峰度到了 60–100（雨声变成"咕嘟咕嘟"），降到现在的能量。
+- **两耳**：四周都有时两耳几乎不相关（相关系数小于 0.1）、左右一样响；只从正前方来时相关大于 0.6；全在左边时左耳响 6 dB 以上。隔窗 100 时 4 kHz 以上的能量占比比在外面少约 14 dB（录音：屋里约 −18 dB，室外平均约 −8 dB）。
+- **放进人声里**：雨夜比人声低 18 dB，一段 60 秒的人声转换里，限制器最多压的量从 3.5 dB 变成 6.8 dB——窗玻璃上的雨点偶尔正好碰上人声的峰值，前瞻限制器压那几毫秒。
+- **CPU**：生成 60 秒雨夜用 0.3 秒，约单核 0.5%；实时试听时一次回调（256 帧）的处理时间从约 200 µs 增加到约 250 µs（界面读数），没有断流。
+- **还没做的**：没有雷声、风声；屋檐滴水没有对照的录音；两耳相关只和双耳录音比过（另外几段是普通立体声或单声道录音）。
+
+### 和真实录音对照校准
+
+第一版是按文献和推算定的参数。之后下载了 6 段真实雨声（Freesound 页面上公开的 128 kbps 试听版，只用来测统计量，不混进任何输出；放在 `音频/rain_ref/`，git 不跟踪），用同一套指标测真实录音和合成的雨声：倍频程频谱、各频带包络的归一化方差和峰度（McDermott & Simoncelli 那一类统计量）、频带之间包络的相关、两耳相关、响度起伏、每秒"突出的一下"。
+
+| 录音 | 内容 | 许可 |
+|---|---|---|
+| [FreeToUseSounds #393535](https://freesound.org/people/FreeToUseSounds/sounds/393535/) | 开着窗录外面的雨，双耳话筒，11 分钟 | CC0 |
+| [inchadney #22132](https://freesound.org/people/inchadney/sounds/22132/) | 树林里的雨，双耳，2 分钟 | CC BY 4.0 |
+| [tim.kahn #169031](https://freesound.org/people/tim.kahn/sounds/169031/) | 安静树林里雨打树叶，9 分 46 秒 | CC BY 4.0 |
+| [lebaston100 #243628](https://freesound.org/people/lebaston100/sounds/243628/) | 大雨，2 分 37 秒（单声道） | CC BY 4.0 |
+| [fluctuating_frequency #752099](https://freesound.org/people/fluctuating_frequency/sounds/752099/) | 夜里关着窗在屋里听雨打窗，7.5 分钟 | CC0 |
+| [nicoproson #648529](https://freesound.org/people/nicoproson/sounds/648529/) | 雨打玻璃（贴着窗录），3 分钟 | CC0 |
+
+发现和改动：
+
+- **真实雨声的样子差别很大**，主要看离雨点多近、打在什么上：远处 / 开窗听到的偏闷（4 kHz 以上很快掉下去），雨打近处树叶的很亮、很稀疏，大雨又亮又密。所以"在外面"按 4 段室外录音的平均校，"隔窗"按 2 段屋里录音的平均校，稀疏还是密交给"雨量"和"近处雨滴"两个滑条。
+- **第一版高频太多、低频太少**：4–16 kHz 比录音的平均多 7–9 dB（双耳录音本来还带着耳廓在 2–5 kHz 的增益，就这样也比我们暗），125–250 Hz 少 5–12 dB。用一个快速的频谱模型（雨滴谱 × 脉冲谱 × 圆环低通）对着 4 段室外录音的平均拟合撞击脉冲的参数：撞击尖峰取大（硬表面 3.0、软表面 1.5，开头更利落），三个圆环的低通收到 10、8、6 kHz，软表面 40%、接触时间长 2.5 倍并加上单极的"噗"。拟合残差 0.8 dB；实际渲染（含 HRIR 和回放补偿）在雨量 35 时，250 Hz–8 kHz 每个倍频程和录音平均相差 1.8 dB 以内，125 Hz 少 2.6 dB（录音里这一档有风和远处的低频）。纹理也落在录音的范围里：包络的归一化方差 0.09–0.32（录音里稳定的雨 0.06–0.42）、峰度 4–15、400 ms 的响度起伏 0.6–0.8 dB（录音 0.8–3.4 dB）。
+- **隔窗**：原来的二阶低通做不出屋里录音的形状（125 Hz 有个峰、250 Hz–2 kHz 很平、2 kHz 以上滚降），改成质量定律的一阶低通 + 125 Hz 的共振峰。屋里录音里玻璃上的雨点很突出（响度起伏 3.7–5.2 dB、频带之间的相关 0.5–0.67、每秒 3–4 个"突出的一下"），原来的雨点太弱（起伏 1.1 dB、相关 0.11）：给窗玻璃加上整块玻璃的低模态、让"嗒"更宽频、把 2 kHz 那一簇调轻，隔窗时窗玻璃和窗台上的雨点再响 8 dB；去掉了窗台的金属"叮"（长长的 2.5–7.5 kHz 尾音录音里没有，调响以后 8 kHz 会多 5–7 dB）。结果：隔窗 100、近处雨滴 30 时，125 Hz–4 kHz 每个倍频程和屋里录音的平均相差 2.6 dB 以内（8 kHz 少 4 dB），响度起伏 3.4 dB、每秒 4 个"突出的一下"，频带之间的相关 0.32（录音 0.5–0.67，还偏低）。
+- **雨夜预设**改成隔窗 90、包围感 60（屋里听，雨主要从窗户那边来）；原来是隔窗 60、包围感 100，和"关着窗"的说法不一致。
+- 测试里加了一条：在外面和隔窗两种设置下，250 Hz–4 kHz 每个倍频程要在录音平均的 ±3 dB 以内，以后改参数偏离真实录音时会报出来。
+
+### 文献
+
+- Marshall & Palmer 1948, *The distribution of raindrops with size*, J. Meteorology 5；Atlas, Srivastava & Sekhon 1973, Rev. Geophys. 11
+- Miklavcic, Zita, Arvidsson 2004, [Computational real-time sound synthesis of rain](https://dafx.de/paper-archive/2004/P_169.PDF)（DAFx'04）
+- Liu, Cheng, Tong 2019, [Physically-based statistical simulation of rain sound](https://history.siggraph.org/learning/physically-based-statistical-simulation-of-rain-sound-by-liu-cheng-and-tong/)（SIGGRAPH，雨滴 = 撞击 + 卷入气泡的振荡，按材料区分）
+- McDermott & Simoncelli 2011, [Sound texture perception via statistics of the auditory periphery](https://mcdermottlab.mit.edu/papers/McDermott_Simoncelli_2011_sound_texture_synthesis.pdf)（Neuron 71）
+- van den Doel 2005, [Physically-based models for liquid sounds](https://repository.gatech.edu/entities/publication/dcc121b6-5fdb-42db-b758-971522f01c70)（ACM TAP 2(4)）；Moss 等 2009, [Sounding Liquids](https://gamma.cs.unc.edu/SoundingLiquids/soundingliquids.pdf)；Zheng & James 2009, [Harmonic Fluids](https://research.cs.cornell.edu/HarmonicFluids/harmonicfluids-lowres.pdf)；Leighton 1994, *The Acoustic Bubble*
+- Medwin, Nystuen 等 1992, [The anatomy of underwater rain noise](https://staff.washington.edu/jan4/JANystuenWebsite/Publications/j_pubs/mnjso92.html)（JASA）
+- Phillips, Agarwal, Jordan 2018, [The sound produced by a dripping tap is driven by resonant oscillations of an entrapped air bubble](https://www.repository.cam.ac.uk/handle/1810/282816)（Scientific Reports）
+- Farnell 2010, *Designing Sound*, [Practical 15: Rain](https://mitp-content-server.mit.edu/books/content/sectbyfn/books_pres_0/8375/designing_sound.zip/practical15.html)
+- Metcalf 等, [hardRain](https://e-space.mmu.ac.uk/624200/1/Metcalf%20et%20al.%20hardRain_preprint.pdf)（用录音识别雨声，雨打植物的频带）
+- Verron 等 2009, [Controlling a spatialized environmental sound synthesizer](https://hal.archives-ouvertes.fr/hal-00463220)（WASPAA；撞击 + 啁啾 + 噪声组合成雨，带空间化）
+- Välimäki、Lehtonen、Takanen 2013, *A perceptual study on velvet noise and its variants at different pulse densities*（IEEE TASLP 21）
+
 ## 和参考视频（BV1KPJDzHEVV）的区别
 
 分析原视频音频发现，它的双耳时间差（ITD）全为 0，各频段的双耳声级差（ILD）也完全一样。也就是说，它只是左右**音量声像**，在"左→中→右"之间来回切，经常把一侧直接关到 −60 dB。这样听起来像声音在耳机里面，而不是有人在耳边。

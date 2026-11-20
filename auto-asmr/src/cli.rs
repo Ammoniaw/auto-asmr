@@ -1,11 +1,12 @@
-//! 命令行：不带参数启动图形界面；`convert` 转换文件；`align` 看几段音频怎么对齐；`devices` 列出音频设备；`bench` 测处理速度。
+//! 命令行：不带参数启动图形界面；`convert` 转换文件；`align` 看几段音频怎么对齐；`bg` 只生成背景音（雨声）；
+//! `devices` 列出音频设备；`bench` 测处理速度。
 
 use crate::dsp::engine::{Engine, EngineConfig, PostMode};
 use crate::dsp::mix::{self, Voice, MAX_VOICES, PRESETS};
 use crate::dsp::params::{MotionMode, Params, Playback, Via};
 use crate::dsp::tables::tables;
 use crate::dsp::{FS, FS_USIZE, R_MAX, R_MIN};
-use crate::offline::{convert, convert_mix, default_mix_output, default_output, Channel, ConvertOptions, MixInput, MixOptions};
+use crate::offline::{convert, convert_mix, default_mix_output, default_output, Channel, ConvertOptions, Duo, MixInput, MixOptions};
 use std::path::PathBuf;
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
@@ -18,6 +19,7 @@ pub const HELP: &str = "auto-asmr —— KU100 双耳 ASMR 空间化（纯 CPU�
   auto-asmr convert <输入1> <输入2> … [选项]   批量转换：多个文件或文件夹，多线程并行
   auto-asmr convert <输入1> <输入2> --mix [选项]   多音频合成：2–4 个音频各放一个位置（默认一左一右），合成一个文件
   auto-asmr align <输入1> <输入2> … [--channel …]   只看自动对齐的结果：每段从哪里开始用、裁掉多少（不输出音频）
+  auto-asmr bg -o <文件> [--duration 秒] [--lufs L] [背景音选项]   只生成背景音（雨声），按 --lufs（默认 −20）定响度
   auto-asmr devices                  列出本机的音频输入 / 输出设备
   auto-asmr bench                    测试处理速度
 
@@ -34,15 +36,30 @@ convert 的选项（括号里是默认值）：
   --mix-gain <dB,…>       各音源的音量增减，在自动对齐响度之后再加（默认都是 0），如 0,-3
   --mix-align             自动对齐：同一首歌的几个版本（前奏长短不同、编曲不同都行），自动找到一起开始唱的地方，
                           从那里叠加，对不上的开头和结尾裁掉；--start / --duration 按对齐之后的时间算
-  --mix-balance [0–100]   自动平衡（关）：按短时响度让几段每一段时间都差不多一样响（比如一左一右时左右差不多大），
-                          在空间化之前补，忽远忽近照常；数值 = 强度 %，100 = 一样响，50 = 差距减半；不写数值 = 100
+  --mix-balance [0–100]   自动平衡（关）：让几个声音每一段时间都差不多一样响（比如一左一右时左右差不多大），
+                          按各自此刻听起来多响（空间化之后）补，最多 ±15 dB；强度越大，忽远忽近的响度起伏越小；
+                          数值 = 强度 %，100 = 一样响，50 = 差距减半；不写数值 = 100
   --mix-follow            一起移动：几个音源按 --mode 的方式（穿梭 / 随机走位 / 环绕 / 固定）一起走，彼此相隔 360°/个数
                           （两个时正好相对：一个贴左耳时另一个贴右耳，换边时一个从脸前、一个从脑后绕）；不加就是各自固定
+ 左右双人（一个音频当成两个人：同一个声音一个在左耳、一个在右耳，第 2 个晚一点；批量时每个文件都这样）
+  --duo [毫秒]            第 2 个声音晚多少毫秒（1–300；不写数值 = 80）。30 ms 以下两边容易融成一个声音，
+                          50–120 ms 像两个人一前一后地说，150 ms 以上像回声。可以和 --pos（两个位置）、--mix-gain、
+                          --mix-follow、--mix-balance 一起用；输出比原音频长出这段延迟
   --style ear|ku100|earclean   ear=贴耳加强；ku100=像真实 KU100 轻语实录（远耳听得到、真实房间、像真人一样随机走位，
                           约三分之一的停留在正面，贴耳时离耳约 2–4 cm）；earclean=掏耳（给棉签 / 挖耳勺 / 刮擦这类触发音用：伸进耳道进进出出，
                           带耳道共鸣和耳内低频，每只耳朵约 40 秒才换边，目标响度默认 −20 LUFS）
   --start <秒> --duration <秒>      只处理一段
   --channel auto|left|right|mix     立体声取哪个声道（auto=更响的那个）
+ 背景音（实时生成的雨声，不用录音素材；人声不受影响。界面里叫「背景音」）
+  --bg rain-night|off     雨夜预设：关着窗在屋里听外面的小到中雨（雨主要从窗户那边来），窗玻璃上偶尔落一滴，屋檐在滴水，比人声低约 18 dB；
+                          后面写的背景音选项再覆盖它
+  --bg-level <0–100>      音量（0 = 关）：1–100 对应比人声的目标响度低 40 … 0 dB（雨夜 55 = 低 18 dB）
+  --rain <0–100>          雨量：毛毛雨 0.3 mm/h … 暴雨 60 mm/h（对数刻度，35）
+  --bg-pan <−100–100>     雨从哪边来：−100 左、0 四周、100 右（0）
+  --bg-width <0–100>      包围感：0 只从一个方向来，100 四面八方（60）
+  --bg-indoor <0–100>     隔窗：0 站在雨里，100 关着窗在屋里（90）
+  --rain-near <0–100>     近处雨滴：窗玻璃 / 窗台 / 树叶 / 水洼上听得清的一滴一滴，100 ≈ 每秒 12 滴（30）
+  --rain-drip <0–100>     屋檐滴水：越大越快、地方越多（最多 3 处），0 = 没有（35）
  贴耳感
   --dist <米>             贴耳时嘴到头中心的距离（0.105，即离耳约 1.7 cm）
   --isolation <dB>        远耳额外压低（32）      --presence <dB>     近耳临场感（3）
@@ -92,6 +109,111 @@ convert 的选项（括号里是默认值）：
   --save-trajectory <csv> 导出实际走位（时间, 方位角, 距离, 不含忽远忽近的距离, 说话活动, 仰角, 入耳深度）
 ";
 
+/// `--bg` 的预设：rain-night（雨夜）或 off。
+fn parse_bg_preset(p: Params, v: Option<&str>) -> Result<Params, String> {
+    match v {
+        Some("rain-night") | Some("雨夜") | Some("rain") => Ok(p.bg_rain_night()),
+        Some("off") | Some("关") => Ok(Params { bg_level: 0.0, ..p }),
+        _ => Err("--bg 只能是 rain-night 或 off".into()),
+    }
+}
+
+/// 背景音的选项（convert 和 bg 共用）；是背景音选项时返回 true。
+fn parse_bg_option(p: &mut Params, name: &str, it: &mut std::iter::Peekable<std::slice::Iter<String>>) -> Result<bool, String> {
+    let mut f = |lo: f32, hi: f32| parse_f(it.next(), name).map(|v| v.clamp(lo, hi));
+    match name {
+        "--bg" => {
+            it.next();
+        }
+        "--bg-level" => p.bg_level = f(0.0, 100.0)?,
+        "--rain" => p.rain = f(0.0, 100.0)?,
+        "--bg-pan" => p.bg_pan = f(-100.0, 100.0)?,
+        "--bg-width" => p.bg_width = f(0.0, 100.0)?,
+        "--bg-indoor" => p.bg_indoor = f(0.0, 100.0)?,
+        "--rain-near" => p.rain_near = f(0.0, 100.0)?,
+        "--rain-drip" => p.rain_drip = f(0.0, 100.0)?,
+        _ => return Ok(false),
+    }
+    Ok(true)
+}
+
+/// `bg`：只生成背景音（雨声），写成双耳 WAV。默认雨夜，响度按 --lufs（默认 −20 LUFS），开头 1 秒淡入、结尾 2 秒淡出。
+fn run_bg(args: &[String]) -> Result<(), String> {
+    use crate::dsp::dynamics::{Limiter, LoudnessMeter};
+    use crate::dsp::rain::Rain;
+    let mut p = Params::default().bg_rain_night();
+    if let Some(i) = args.iter().position(|a| a == "--bg") {
+        p = parse_bg_preset(p, args.get(i + 1).map(|s| s.as_str()))?;
+    }
+    let (mut out, mut secs, mut lufs, mut bits) = (PathBuf::from("rain_bg.wav"), 60.0f32, -20.0f32, 24u16);
+    let mut it = args.iter().peekable();
+    while let Some(a) = it.next() {
+        let name = a.as_str();
+        if parse_bg_option(&mut p, name, &mut it)? {
+            continue;
+        }
+        match name {
+            "-o" | "--output" => out = PathBuf::from(it.next().ok_or("-o 后面缺少文件名")?),
+            "--duration" => secs = parse_f(it.next(), name)?.max(1.0),
+            "--lufs" => lufs = parse_f(it.next(), name)?,
+            "--bits" => bits = if parse_f(it.next(), name)? as u16 == 16 { 16 } else { 24 },
+            "--seed" => p.seed = parse_f(it.next(), name)? as u64,
+            _ => return Err(format!("bg 不认识的选项 {name}")),
+        }
+    }
+    if p.bg_level <= 0.0 {
+        return Err("背景音是关着的（--bg off 或 --bg-level 0）".into());
+    }
+    // 只要雨声本身：音量当作 0 dB，响度按 --lufs
+    p.bg_level = 100.0;
+    let cfg = EngineConfig::new(p.clone(), None);
+    let setup = cfg.derived.rain.clone().ok_or("背景音没打开")?;
+    let reference = lufs - setup.trim_db;
+    let mut rain = Rain::new(setup, p.seed, cfg.derived.playback.as_ref());
+    rain.prime_gain(reference);
+    let n = (secs * FS) as usize;
+    let spec = hound::WavSpec { channels: 2, sample_rate: FS_USIZE as u32, bits_per_sample: bits, sample_format: hound::SampleFormat::Int };
+    let mut wav = hound::WavWriter::create(&out, spec).map_err(|e| format!("无法写入 {}：{e}", out.display()))?;
+    let full = if bits == 16 { 32767.0 } else { 8_388_607.0 };
+    let mut lim = Limiter::new(6.0, 40.0);
+    let ld = lim.delay();
+    let ceiling = 10f32.powf(-1.0 / 20.0) * 0.97;
+    let mut meter = LoudnessMeter::new();
+    let (mut l, mut r) = (vec![0f32; 4096], vec![0f32; 4096]);
+    let (fi, fo) = (FS_USIZE.min(n / 4), (2 * FS_USIZE).min(n / 3));
+    let t0 = std::time::Instant::now();
+    let mut i = 0;
+    while i < n + ld {
+        let m = 4096.min(n + ld - i);
+        rain.render(reference, &mut l[..m], &mut r[..m]);
+        for k in 0..m {
+            let j = i + k;
+            let a = if j < fi { 0.5 - 0.5 * (std::f32::consts::PI * j as f32 / fi as f32).cos() } else { 1.0 };
+            let left = n.saturating_sub(j);
+            let b = if left < fo { 0.5 - 0.5 * (std::f32::consts::PI * left as f32 / fo as f32).cos() } else { 1.0 };
+            let (x, y) = lim.process(l[k] * a * b, r[k] * a * b, ceiling);
+            if j >= ld {
+                meter.push(x, y);
+                wav.write_sample((x.clamp(-1.0, 1.0) * full).round() as i32).map_err(|e| e.to_string())?;
+                wav.write_sample((y.clamp(-1.0, 1.0) * full).round() as i32).map_err(|e| e.to_string())?;
+            }
+        }
+        i += m;
+    }
+    wav.finalize().map_err(|e| e.to_string())?;
+    println!("{}", crate::dsp::rain::describe(&Params { bg_level: 55.0, ..p.clone() }, false).replace("比人声低 18 dB，", ""));
+    println!(
+        "完成：{}  ({secs:.1} s，{:.1} LUFS；近处雨滴 {} 滴，屋檐滴水 {} 滴，水洼里的\"叮\" {} 个；生成用时 {:.2} s)",
+        out.display(),
+        meter.integrated(),
+        rain.n_near,
+        rain.n_drips,
+        rain.n_plinks,
+        t0.elapsed().as_secs_f64()
+    );
+    Ok(())
+}
+
 fn parse_f(v: Option<&String>, name: &str) -> Result<f32, String> {
     v.ok_or(format!("{name} 后面缺少数值"))?.parse::<f32>().map_err(|_| format!("{name} 的值不是数字"))
 }
@@ -135,6 +257,13 @@ fn voice_text(v: &Voice) -> String {
 pub fn run(args: Vec<String>) -> i32 {
     match args[0].as_str() {
         "convert" => match run_convert(&args[1..]) {
+            Ok(()) => 0,
+            Err(e) => {
+                eprintln!("错误：{e}");
+                2
+            }
+        },
+        "bg" => match run_bg(&args[1..]) {
             Ok(()) => 0,
             Err(e) => {
                 eprintln!("错误：{e}");
@@ -222,6 +351,7 @@ fn run_convert(args: &[String]) -> Result<(), String> {
     let mut save_traj: Option<PathBuf> = None;
     let (mut mix_on, mut mix_follow, mut mix_align) = (false, false, false);
     let mut mix_balance = 0.0f32;
+    let mut duo_ms = 0.0f32;
     let (mut pos_list, mut gain_list): (Option<String>, Option<String>) = (None, None);
     // 风格先生效，后面的参数再覆盖
     if let Some(i) = args.iter().position(|a| a == "--style") {
@@ -238,10 +368,17 @@ fn run_convert(args: &[String]) -> Result<(), String> {
             _ => return Err("--style 只能是 ear、ku100 或 earclean".into()),
         }
     }
+    // 背景音的预设也先生效，后面的背景音选项再覆盖
+    if let Some(i) = args.iter().position(|a| a == "--bg") {
+        p = parse_bg_preset(p, args.get(i + 1).map(|s| s.as_str()))?;
+    }
     let mut it = args.iter().peekable();
     while let Some(a) = it.next() {
         let name = a.as_str();
         let f = |it: &mut std::iter::Peekable<std::slice::Iter<String>>| parse_f(it.next(), name);
+        if parse_bg_option(&mut p, name, &mut it)? {
+            continue;
+        }
         match name {
             "-o" | "--output" => output = Some(PathBuf::from(it.next().ok_or("-o 后面缺少文件名")?)),
             "--out-dir" => out_dir = Some(PathBuf::from(it.next().ok_or("--out-dir 后面缺少文件夹")?)),
@@ -253,6 +390,13 @@ fn run_convert(args: &[String]) -> Result<(), String> {
                 mix_balance = 100.0;
                 if let Some(v) = it.peek().and_then(|s| s.parse::<f32>().ok()) {
                     mix_balance = v.clamp(0.0, 100.0);
+                    it.next();
+                }
+            }
+            "--duo" => {
+                duo_ms = mix::DUO_DEFAULT_MS;
+                if let Some(v) = it.peek().and_then(|s| s.parse::<f32>().ok()) {
+                    duo_ms = v.clamp(0.0, mix::DUO_MAX_MS);
                     it.next();
                 }
             }
@@ -407,12 +551,48 @@ fn run_convert(args: &[String]) -> Result<(), String> {
     if earclean && !lufs_set {
         lufs = crate::dsp::params::EARCLEAN_LUFS;
     }
-    if (pos_list.is_some() || gain_list.is_some() || mix_follow || mix_align || mix_balance > 0.0) && !mix_on {
-        return Err("--pos / --mix-gain / --mix-follow / --mix-align / --mix-balance 只用于多音频合成，请同时加 --mix".into());
+    let duo_on = duo_ms > 0.0;
+    if duo_on && mix_on {
+        return Err("--duo（一个音频当成左右两个人）不能和 --mix 一起用".into());
+    }
+    if mix_align && !mix_on {
+        return Err("--mix-align 只用于多音频合成，请同时加 --mix".into());
+    }
+    if (pos_list.is_some() || gain_list.is_some() || mix_follow || mix_balance > 0.0) && !mix_on && !duo_on {
+        return Err("--pos / --mix-gain / --mix-follow / --mix-balance 只用于多音频合成（--mix）或左右双人（--duo）".into());
     }
     if mix_follow && pos_list.is_some() {
         return Err("一起移动时位置由 --mode 的走位决定，不能再用 --pos".into());
     }
+    // 左右双人：两个声音的位置和音量（默认左耳、右耳）
+    let duo = if duo_on {
+        let mut voices = [Voice::preset(0), Voice::preset(1)];
+        if let Some(s) = &pos_list {
+            let v = s.split(',').filter(|x| !x.trim().is_empty()).map(parse_pos).collect::<Result<Vec<Voice>, String>>()?;
+            if v.len() > 2 {
+                return Err(format!("左右双人只有两个声音，--pos 给了 {} 个位置", v.len()));
+            }
+            voices[..v.len()].copy_from_slice(&v);
+        }
+        if let Some(s) = &gain_list {
+            let g = s.split(',').map(|x| x.trim().parse::<f32>().map_err(|_| format!("--mix-gain 里的 {:?} 不是数字", x.trim()))).collect::<Result<Vec<f32>, String>>()?;
+            if g.len() > 2 {
+                return Err(format!("左右双人只有两个声音，--mix-gain 给了 {} 个数值", g.len()));
+            }
+            for (v, g) in voices.iter_mut().zip(g) {
+                v.gain_db = g;
+            }
+        }
+        if save_traj.is_some() {
+            return Err("左右双人不支持 --save-trajectory".into());
+        }
+        let d = Duo { voices, follow: mix_follow, balance: mix_balance / 100.0, ..Duo::new(duo_ms) };
+        let pos = if mix_follow { "一起移动，彼此相对".to_string() } else { format!("{} / {}", voice_text(&voices[0]), voice_text(&voices[1])) };
+        eprintln!("左右双人：第 2 个声音晚 {duo_ms:.0} ms（{pos}）{}", if mix_balance > 0.0 { format!("，自动平衡 {mix_balance:.0}%") } else { String::new() });
+        Some(d)
+    } else {
+        None
+    };
     if mix_on {
         if out_dir.is_some() {
             return Err("多音频合成只输出一个文件，请用 -o 指定，不能用 --out-dir".into());
@@ -472,7 +652,7 @@ fn run_convert(args: &[String]) -> Result<(), String> {
         if mix_balance > 0.0 {
             eprintln!("  自动平衡 {mix_balance:.0}%（按短时响度让几段一样响）");
         }
-        let mo = MixOptions { follow: mix_follow, align: mix_align, balance: mix_balance / 100.0 };
+        let mo = MixOptions { follow: mix_follow, align: mix_align, balance: mix_balance / 100.0, ..Default::default() };
         let rep = convert_mix(&opts, &items, &p, mo, Arc::new(AtomicBool::new(false)), |f, stage| {
             let pc = (f * 100.0) as i32;
             if pc / 10 != last / 10 {
@@ -488,6 +668,9 @@ fn run_convert(args: &[String]) -> Result<(), String> {
         }
         if !rep.balance_note.is_empty() {
             println!("{}", rep.balance_note);
+        }
+        if !rep.bg_note.is_empty() {
+            println!("{}", rep.bg_note);
         }
         println!(
             "完成：{}  ({:.1} s，{:.1} LUFS，真峰值 {:.1} dBTP，限制器最多压 {:.1} dB；说话平均占 {:.0}%，{}；用时 {:.1} s)",
@@ -535,6 +718,7 @@ fn run_convert(args: &[String]) -> Result<(), String> {
                 o.lufs = lufs;
                 o.peak_db = peak;
                 o.max_gr_db = max_gr;
+                o.duo = duo;
                 o
             })
             .collect();
@@ -575,6 +759,7 @@ fn run_convert(args: &[String]) -> Result<(), String> {
     opts.peak_db = peak;
     opts.max_gr_db = max_gr;
     opts.save_trajectory = save_traj;
+    opts.duo = duo;
     let mut last = -1i32;
     let rep = convert(&opts, &p, Arc::new(AtomicBool::new(false)), |f, stage| {
         let pc = (f * 100.0) as i32;
@@ -583,8 +768,10 @@ fn run_convert(args: &[String]) -> Result<(), String> {
             last = pc;
         }
     })?;
-    if !rep.channel_note.is_empty() {
-        println!("{}", rep.channel_note);
+    for note in [&rep.channel_note, &rep.duo_note, &rep.balance_note, &rep.bg_note] {
+        if !note.is_empty() {
+            println!("{note}");
+        }
     }
     println!(
         "完成：{}  ({:.1} s，{:.1} LUFS，真峰值 {:.1} dBTP，限制器最多压 {:.1} dB；说话占 {:.0}%，换耳 {} 次（其中从头顶绕 {} 次），往后让 {} 次，上下换位 {} 次{}；用时 {:.1} s)",
