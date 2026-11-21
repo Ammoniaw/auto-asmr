@@ -51,6 +51,81 @@
  },
  "groups": [
   {
+   "id": "duo",
+   "title": "左右双人",
+   "title_en": "Two voices",
+   "open_if": {
+    "key": "duo_ms",
+    "gt": 0
+   },
+   "items": [
+    {
+     "type": "slider",
+     "key": "duo_ms",
+     "label": "左右双人",
+     "label_en": "Two voices",
+     "tip": "把网页里的声音当成两个人：同一个声音一个在左耳、一个在右耳（各自忽远忽近），第 2 个整体晚这么多毫秒，听得出是两个人一前一后地说。30 ms 以下两边容易融成一个声音（听起来偏在先到的那一边），50–120 ms 像两个人，150 ms 以上像回声。只有第 2 个声音晚，第 1 个和平时一样及时。和电脑版「文件转换」页的左右双人是同一个设置。0 = 关闭",
+     "tip_en": "Turns the page's voice into two people: the same voice at the left ear and at the right ear (each sways near and far on its own), the second one this many milliseconds later. Below about 30 ms the two tend to fuse into one voice; 50–120 ms sounds like two people; above 150 ms it sounds like an echo. Only the second voice is delayed. Same setting as Two voices on the desktop app's File tab. 0 = off",
+     "min": 0.0,
+     "max": 300.0,
+     "decimals": 0,
+     "step": 1.0,
+     "fmt": "duo"
+    },
+    {
+     "type": "choice",
+     "key": "mix_follow",
+     "style": "chips",
+     "label": "排布",
+     "label_en": "Layout",
+     "tip": "各自固定：1 号固定在左耳、2 号固定在右耳，只做忽远忽近、上下、自然晃动，「左右移动」不起作用。一起移动：两个声音按「左右移动」的方式一起走，始终在头的两侧相对（一个贴左耳时另一个贴右耳）",
+     "tip_en": "Fixed: voice 1 stays at the left ear and voice 2 at the right, with only near / far sway, up / down and micro motion; Left / right motion is inactive. Together: both follow Left / right motion and always stay on opposite sides",
+     "options": [
+      {
+       "value": false,
+       "label": "各自固定",
+       "label_en": "Fixed"
+      },
+      {
+       "value": true,
+       "label": "一起移动",
+       "label_en": "Together"
+      }
+     ],
+     "show_if": {
+      "key": "duo_ms",
+      "gt": 0
+     }
+    },
+    {
+     "type": "slider",
+     "key": "mix_balance",
+     "label": "自动平衡",
+     "label_en": "Balance",
+     "tip": "让两个声音每一段时间听起来都差不多一样响（各自忽远忽近时，常常一个退开了另一个正贴着耳朵）。按两个声音此刻听起来多响往平均拉，最多 ±15 dB，0.25 秒平滑；停顿里不往上拉。网页没有「整段」，响度边听边算。100% = 一样响，50% = 差距减半，0 = 关闭",
+     "tip_en": "Keeps the two voices about equally loud at every moment, at most ±15 dB, smoothed over 0.25 s; voices in a pause are not lifted. Loudness is measured as the audio plays. 100% = equal, 50% = half the gap, 0 = off",
+     "min": 0.0,
+     "max": 100.0,
+     "decimals": 0,
+     "step": 1.0,
+     "fmt": "balance",
+     "show_if": {
+      "key": "duo_ms",
+      "gt": 0
+     }
+    },
+    {
+     "type": "note",
+     "text": "1 号（橙）在左耳、2 号（蓝）在右耳，位置图上能看到两个声音。各自固定时「左右移动」和手动摆位不起作用；开 / 关、换排布的那一下会重新开始。",
+     "text_en": "Voice 1 (orange) at the left ear, voice 2 (blue) at the right; both show on the map. With Fixed, Left / right motion and manual positioning are inactive; turning it on or off or changing the layout restarts it.",
+     "show_if": {
+      "key": "duo_ms",
+      "gt": 0
+     }
+    }
+   ]
+  },
+  {
    "id": "closeness",
    "title": "贴耳感",
    "title_en": "Closeness",

@@ -73,7 +73,7 @@ const fromPos = (d, pos) => {
   const t = pos / 1000;
   return round(d.log ? d.min * Math.pow(d.max / d.min, t) : d.min + t * (d.max - d.min), d.dec);
 };
-const valueOf = (d, s) => (d.derived ? s.derived[d.key] : s.params[d.key]);
+const valueOf = (d, s) => (d.derived ? s.derived[d.key] : d.doc ? s.doc[d.key] : s.params[d.key]);
 
 function labelFor(d) {
   return h('label', { textContent: d.label, title: d.tip || '' });
@@ -125,7 +125,7 @@ function choiceRow(d) {
   return {
     el: h('div', { className: 'row wide' }, labelFor(d), h('div', { className: 'seg' }, ...btns.map(([, b]) => b))),
     update(s) {
-      for (const [v, b] of btns) b.classList.toggle('on', s.params[d.key] === v);
+      for (const [v, b] of btns) b.classList.toggle('on', valueOf(d, s) === v);
     },
   };
 }
@@ -193,6 +193,7 @@ function build() {
     const det = h('details', { open: true }, h('summary', { textContent: g.title }));
     if (g.title.startsWith('入耳')) det.open = state.params.inear_cm > 0;
     if (g.title.startsWith('背景音')) det.open = state.params.bg_level > 0;
+    if (g.title === '左右双人') det.open = state.doc.duo_ms > 0;
     for (const d of g.rows) {
       const r = (BUILDERS[d.type] || sliderRow)(d);
       r.def = d;
@@ -207,8 +208,8 @@ function render(src) {
   const p = state.params;
   for (const r of rows) {
     const d = r.def;
-    r.el.hidden = !!(d.show && !d.show(p));
-    r.el.classList.toggle('off', !!(d.on && !d.on(p)));
+    r.el.hidden = !!(d.show && !d.show(p, state));
+    r.el.classList.toggle('off', !!(d.on && !d.on(p, state)));
     r.update(state, src);
   }
   for (const b of document.querySelectorAll('#dry button')) b.classList.toggle('on', String(state.dry) === b.dataset.dry);

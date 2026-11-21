@@ -59,6 +59,29 @@ pub fn delayed(x: &[f32], delay: usize, s0: usize, s1: usize) -> Vec<f32> {
     out
 }
 
+/// 边播边改延迟时，从旧的位置淡到新的位置用多少样本（20 ms），免得一下跳过去咔嗒一声。
+pub const DELAY_FADE: usize = 960;
+
+/// 各声音这一段（时间线上 `pos..pos+n`）的输入：第 k 个按"t − 它的延迟"取（左右双人的第 2 个声音晚一点）。
+/// `fading`：改了延迟后的淡变已经走了多少样本，期间是新旧两个位置的混合。`get(k, s)`：第 k 段的第 s 个样本。
+/// 试听文件、主播模式的麦克风和 [`LiveMix`]（安卓、浏览器插件的网页声音）都用它。
+pub fn read_delayed(inbs: &mut [Vec<f32>], pos: usize, n: usize, dl: &[usize; MAX_VOICES], dl_old: &[usize; MAX_VOICES], fading: Option<usize>, get: impl Fn(usize, usize) -> f32) {
+    for (k, b) in inbs.iter_mut().enumerate() {
+        let at = |t: usize, d: usize| if t >= d { get(k, t - d) } else { 0.0 };
+        let (new, old) = (dl[k], dl_old[k]);
+        for (i, v) in b[..n].iter_mut().enumerate() {
+            let t = pos + i;
+            *v = match fading {
+                Some(done) if new != old => {
+                    let w = ((done + i + 1) as f32 / DELAY_FADE as f32).min(1.0);
+                    at(t, old) * (1.0 - w) + at(t, new) * w
+                }
+                _ => at(t, new),
+            };
+        }
+    }
+}
+
 /// 一个音源的位置和音量。
 #[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 pub struct Voice {
@@ -326,7 +349,18 @@ impl Mixer {
         for e in self.engines.iter_mut() {
             e.set_live(on);
         }
+        self.set_live_balance(on);
+    }
+
+    /// 只把自动平衡的输入响度改成边听边算（[`LiveLevels`]），动作照旧：安卓和浏览器插件的网页声音是连续的录音，
+    /// 动作严格跟着说话走（同试听），但没有整段事先算好的响度。会分配内存，要在开始处理之前调用。
+    pub fn set_live_balance(&mut self, on: bool) {
         self.live_lv = on.then(LiveLevels::new);
+    }
+
+    /// 是不是"一起移动"（构造时定的，之后不变）。
+    pub fn is_follow(&self) -> bool {
+        self.follow
     }
 
     /// 换配置（在各引擎的控制块边界生效）：参数、位置、音量。不分配内存，可以在音频线程里调用；
@@ -518,6 +552,89 @@ impl Mixer {
         t.gr_db = if rt { self.limiter.gr_db } else { 0.0 };
         t.level_gain_db = if rt { self.leveler.gain_db } else { 0.0 };
         self.tele = t;
+    }
+}
+
+/// 左右双人的两个声音默认放在哪里：左耳、右耳（桌面版界面的默认位置，安卓和浏览器插件固定用它）。
+pub const DUO_VOICES: [Voice; 2] = [Voice { az: PRESETS[0].2, dist: None, gain_db: 0.0 }, Voice { az: PRESETS[1].2, dist: None, gain_db: 0.0 }];
+
+/// 边播边处理的左右双人用的合成配置：两个声音（`voices`）都是同一路输入，所以不做响度对齐；第 2 个晚 `delay_ms`；
+/// `follow`：一起移动；`balance`：自动平衡强度（0–1，输入响度由合成器边听边算）。`prev` 里没变的配置原样复用。
+pub fn duo_setup(base: &Arc<EngineConfig>, voices: &[Voice; 2], delay_ms: f32, follow: bool, balance: f32, prev: Option<&MixSetup>) -> MixSetup {
+    MixSetup::new(base, voices, &[None, None], follow, prev).with_balance(None, balance.clamp(0.0, 1.0)).with_delays(&[0, delay_samples(delay_ms)])
+}
+
+/// 边播边处理时输入留多少历史（样本，2 的幂）：要装得下最长的延迟（300 ms）再加一段 [`SCRATCH`]。
+const LIVE_HIST: usize = 1 << 15;
+const _: () = assert!(LIVE_HIST >= (DUO_MAX_MS as usize) * (FS as usize) / 1000 + SCRATCH);
+
+/// 边播边处理的左右双人：一路单声道输入进来，各声音按自己的延迟从输入的历史里取（改延迟时 20 ms 淡过去），
+/// 交给 [`Mixer`]（实时收尾：自动响度、限制器、背景音），输出双耳。安卓版和浏览器插件处理网页声音用它；
+/// 桌面版主播模式的麦克风是同一套做法（`realtime.rs`）。自动平衡的输入响度边听边算。构造时分配好，之后不分配内存。
+pub struct LiveMix {
+    mixer: Mixer,
+    hist: Vec<f32>,
+    /// 已经写进历史多少个样本（= 时间线上的位置）。
+    pos: usize,
+    dl: [usize; MAX_VOICES],
+    dl_old: [usize; MAX_VOICES],
+    dl_fade: usize,
+    inbs: Vec<Vec<f32>>,
+}
+
+impl LiveMix {
+    /// `live_motion`：动作按主播模式（停顿超过 1 秒后恢复正常速度）；网页声音是连续的录音，用 false（同试听）。
+    pub fn new(setup: &MixSetup, live_motion: bool) -> Self {
+        let mut mixer = Mixer::new(setup, PostMode::Realtime, 0.0);
+        mixer.set_live(live_motion);
+        mixer.set_live_balance(true);
+        let dl = mixer.delays();
+        let n = mixer.voices();
+        LiveMix { mixer, hist: vec![0.0; LIVE_HIST], pos: 0, dl, dl_old: dl, dl_fade: 0, inbs: (0..n).map(|_| vec![0.0; SCRATCH]).collect() }
+    }
+
+    /// 换配置：参数、位置、音量、延迟（淡过去）、自动平衡强度。音源数和排布方式以构造时为准。
+    pub fn set_setup(&mut self, setup: &MixSetup) {
+        self.mixer.set_setup(setup);
+    }
+
+    pub fn mixer(&self) -> &Mixer {
+        &self.mixer
+    }
+
+    /// 算法延时（样本）：和单个引擎的实时模式相同（只有第 2 个声音另外晚一点）。
+    pub fn latency_samples(&self) -> usize {
+        self.mixer.latency_samples()
+    }
+
+    /// 处理接下来的一段输入（任意长度），输出等长的左右声道。
+    pub fn process(&mut self, x: &[f32], out_l: &mut [f32], out_r: &mut [f32]) {
+        let n = x.len().min(out_l.len()).min(out_r.len());
+        let mask = LIVE_HIST - 1;
+        let mut o = 0;
+        while o < n {
+            let m = (n - o).min(SCRATCH);
+            for (i, &v) in x[o..o + m].iter().enumerate() {
+                self.hist[(self.pos + i) & mask] = v;
+            }
+            // 延迟变了：先把这次的淡变走完，再从旧位置淡到新位置
+            if self.dl_fade == 0 {
+                let want = self.mixer.delays();
+                if want != self.dl {
+                    self.dl_old = self.dl;
+                    self.dl = want;
+                    self.dl_fade = DELAY_FADE;
+                }
+            }
+            let fading = (self.dl_fade > 0).then(|| DELAY_FADE - self.dl_fade);
+            let (h, end) = (&self.hist, self.pos + m);
+            read_delayed(&mut self.inbs, self.pos, m, &self.dl, &self.dl_old, fading, |_, s| if end - s <= LIVE_HIST { h[s & mask] } else { 0.0 });
+            self.dl_fade = self.dl_fade.saturating_sub(m);
+            let ins: [&[f32]; MAX_VOICES] = std::array::from_fn(|k| self.inbs.get(k).map_or(&[][..], |b| &b[..m]));
+            self.mixer.process(&ins[..self.inbs.len()], &mut out_l[o..o + m], &mut out_r[o..o + m]);
+            self.pos += m;
+            o += m;
+        }
     }
 }
 
@@ -720,5 +837,102 @@ mod tests {
         }
         // 各自固定时没有偏移
         assert_eq!(MixSetup::new(&base, &voices, &[None; 4], false, None).offsets, vec![0.0; 4]);
+    }
+
+    #[test]
+    fn live_mix_delays_the_second_voice_and_does_not_depend_on_chunking() {
+        // 边播边处理的左右双人（安卓、浏览器插件）：第 2 个声音的输入逐样本等于原音频晚 80 ms（历史绕过好几圈后也一样）；
+        // 两个声音一左一右；一次给多长（128、1000、4096…）输出都一样
+        let x = test_voice(4.0);
+        let base = Arc::new(EngineConfig::new(Params { auto_level: false, ..Params::default() }, None));
+        let st = duo_setup(&base, &DUO_VOICES, 80.0, false, 0.0, None);
+        assert_eq!(st.delays, vec![0, 3840]);
+        let run = |chunks: &[usize]| {
+            let mut lm = LiveMix::new(&st, false);
+            let (mut l, mut r) = (vec![0f32; x.len()], vec![0f32; x.len()]);
+            let (mut o, mut k) = (0, 0);
+            while o < x.len() {
+                let m = chunks[k % chunks.len()].min(x.len() - o);
+                lm.process(&x[o..o + m], &mut l[o..o + m], &mut r[o..o + m]);
+                // 刚处理完的这一段：1 号的输入就是原音频，2 号是原音频晚 3840 个样本
+                for i in 0..m {
+                    let t = o + i;
+                    assert_eq!(lm.inbs[0][i], x[t]);
+                    assert_eq!(lm.inbs[1][i], if t >= 3840 { x[t - 3840] } else { 0.0 });
+                }
+                o += m;
+                k += 1;
+            }
+            (l, r, lm)
+        };
+        let (l, r, lm) = run(&[128]);
+        assert!(lm.pos > LIVE_HIST);
+        assert!(lm.mixer().engine(0).tele.az > 180.0 && lm.mixer().engine(1).tele.az < 180.0);
+        let e = |v: &[f32]| v.iter().map(|s| (s * s) as f64).sum::<f64>();
+        let lr = 10.0 * (e(&l) / e(&r)).log10();
+        assert!(lr.abs() < 3.0, "左右两边应差不多一样响：{lr:.1} dB");
+        for chunks in [&[1000usize][..], &[4096], &[7, 333, 2048, 64]] {
+            let (l2, r2, _) = run(chunks);
+            assert!(l.iter().zip(&l2).chain(r.iter().zip(&r2)).all(|(a, b)| a == b), "一次给 {chunks:?} 个样本时输出不一样");
+        }
+    }
+
+    #[test]
+    fn live_mix_changes_delay_smoothly_and_keeps_motion_strict() {
+        // 播放中改延迟：20 ms 里淡过去，第 2 个声音的输入没有跳变，之后正好是新的延迟。
+        // 动作不按主播模式（网页声音是连续的录音）：话很少时和严格跟着说话的试听一样几乎不动
+        let x = test_voice(3.0);
+        let base = Arc::new(EngineConfig::new(Params::default(), None));
+        let mut lm = LiveMix::new(&duo_setup(&base, &DUO_VOICES, 100.0, false, 0.0, None), false);
+        let (mut l, mut r) = (vec![0f32; 256], vec![0f32; 256]);
+        let mut o = 0;
+        while o + 256 <= FS as usize {
+            lm.process(&x[o..o + 256], &mut l, &mut r);
+            o += 256;
+        }
+        lm.set_setup(&duo_setup(&base, &DUO_VOICES, 50.0, false, 0.0, None));
+        let own_step = x.windows(2).map(|w| (w[1] - w[0]).abs()).fold(0f32, f32::max);
+        let mut prev = lm.inbs[1][255];
+        let mut max_step = 0f32;
+        for b in 0..10 {
+            lm.process(&x[o..o + 256], &mut l, &mut r);
+            for i in 0..256 {
+                let v = lm.inbs[1][i];
+                if b * 256 + i < DELAY_FADE {
+                    max_step = max_step.max((v - prev).abs());
+                } else {
+                    assert_eq!(v, x[o + i - 2400]);
+                }
+                prev = v;
+            }
+            o += 256;
+        }
+        assert!(max_step <= own_step * 1.01 + 1e-6, "淡变中一步跳了 {max_step}（原音频自己最多 {own_step}）");
+        // 每说 1 秒停 8 秒，一起移动：不按主播模式时 30 秒里几乎不换边（主播模式下会照常换边）
+        let v = test_voice(1.0);
+        let sparse: Vec<f32> = (0..FS as usize * 30).map(|i| if i % (FS as usize * 9) < v.len() { v[i % (FS as usize * 9)] } else { 0.0 }).collect();
+        let moves = |live: bool| {
+            let mut lm = LiveMix::new(&duo_setup(&base, &DUO_VOICES, 80.0, true, 0.0, None), live);
+            let (mut l, mut r) = (vec![0f32; sparse.len()], vec![0f32; sparse.len()]);
+            lm.process(&sparse, &mut l, &mut r);
+            lm.mixer().engine(0).tele.n_moves
+        };
+        let (strict, live) = (moves(false), moves(true));
+        assert!(live >= strict + 2, "严格跟着说话 {strict} 次，主播模式 {live} 次");
+    }
+
+    #[test]
+    fn live_mix_balance_works_without_precomputed_data() {
+        // 自动平衡（输入响度边听边算）：2 号放在右边 50 cm 外，比贴着左耳的 1 号轻得多；100% 时两个声音之间的响度差明显变小
+        let x = test_voice(16.0);
+        let base = Arc::new(EngineConfig::new(Params { auto_level: false, ..Params::default() }, None));
+        let voices = [DUO_VOICES[0], Voice { dist: Some(0.5), ..DUO_VOICES[1] }];
+        let mut lm = LiveMix::new(&duo_setup(&base, &voices, 80.0, false, 1.0, None), false);
+        let (mut l, mut r) = (vec![0f32; 512], vec![0f32; 512]);
+        for c in x.chunks_exact(512) {
+            lm.process(c, &mut l, &mut r);
+        }
+        let ((b5, _), (a5, _)) = lm.mixer().balance_stats().expect("两个声音同时出声，应有统计");
+        assert!(b5 > 4.0 && a5 < b5 / 2.0, "两个声音的响度差中位 {b5:.1} → {a5:.1} dB");
     }
 }

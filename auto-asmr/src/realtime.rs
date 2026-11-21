@@ -405,29 +405,11 @@ struct Pump {
 
 const N: usize = 64;
 /// 试听中改了延迟：从旧的位置淡到新的位置用多少样本（20 ms），免得一下跳过去咔嗒一声。
-const DL_FADE: usize = 960;
+const DL_FADE: usize = mix::DELAY_FADE;
 /// 主播模式左右双人的输入历史（样本，2 的幂）：要装得下最长的延迟（300 ms = 14400 个样本）再加一块。
 const HIST: usize = 1 << 15;
 const _: () = assert!(HIST >= (mix::DUO_MAX_MS as usize) * FS_USIZE / 1000 + N);
 
-/// 各声音这一块（时间线上 `pos..pos+N`）的输入：第 k 个按"t − 它的延迟"取（左右双人的第 2 个声音晚一点）。
-/// `fading`：改了延迟后的淡变已经走了多少样本，期间是新旧两个位置的混合。`get(k, s)`：第 k 段的第 s 个样本。
-fn read_delayed(inbs: &mut [Vec<f32>], pos: usize, dl: &[usize; MAX_VOICES], dl_old: &[usize; MAX_VOICES], fading: Option<usize>, get: impl Fn(usize, usize) -> f32) {
-    for (k, b) in inbs.iter_mut().enumerate() {
-        let at = |t: usize, d: usize| if t >= d { get(k, t - d) } else { 0.0 };
-        let (new, old) = (dl[k], dl_old[k]);
-        for (i, v) in b[..N].iter_mut().enumerate() {
-            let t = pos + i;
-            *v = match fading {
-                Some(done) if new != old => {
-                    let w = ((done + i + 1) as f32 / DL_FADE as f32).min(1.0);
-                    at(t, old) * (1.0 - w) + at(t, new) * w
-                }
-                _ => at(t, new),
-            };
-        }
-    }
-}
 
 impl Pump {
     #[cfg(test)]
@@ -538,11 +520,11 @@ impl Pump {
         }
         let fading = (self.dl_fade > 0).then(|| DL_FADE - self.dl_fade);
         match &self.src {
-            Source::Multi { data, .. } => read_delayed(&mut self.inbs, pos, &self.dl, &self.dl_old, fading, |k, s| data[k].get(s).copied().unwrap_or(0.0)),
+            Source::Multi { data, .. } => mix::read_delayed(&mut self.inbs, pos, N, &self.dl, &self.dl_old, fading, |k, s| data[k].get(s).copied().unwrap_or(0.0)),
             _ => {
                 // 麦克风的历史：只留最近 HIST 个样本（延迟最多 300 ms，远在这之内）
                 let (h, end) = (&self.hist, self.hist_pos);
-                read_delayed(&mut self.inbs, pos, &self.dl, &self.dl_old, fading, |_, s| if end - s <= HIST { h[s & (HIST - 1)] } else { 0.0 })
+                mix::read_delayed(&mut self.inbs, pos, N, &self.dl, &self.dl_old, fading, |_, s| if end - s <= HIST { h[s & (HIST - 1)] } else { 0.0 })
             }
         }
         self.dl_fade = self.dl_fade.saturating_sub(N);

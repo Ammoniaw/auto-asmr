@@ -99,8 +99,15 @@ async function poll() {
     if (me.error) lines.push(['error', me.error]);
     if (me.tele) {
       const t = me.tele;
-      const cm = Math.max(0, (t.r - 0.0875) * 100);
-      lines.push(['', `${side(t.az)} · 离头 ${cm < 10 ? cm.toFixed(1) : cm.toFixed(0)} cm${t.depthCm > 0.05 ? ` · 入耳 ${t.depthCm.toFixed(1)} cm` : ''}`]);
+      const cmOf = (r) => {
+        const cm = Math.max(0, (r - 0.0875) * 100);
+        return cm < 10 ? cm.toFixed(1) : cm.toFixed(0);
+      };
+      if (t.duo) {
+        lines.push(['', `左右双人 · 1 号（橙）${side(t.az)} ${cmOf(t.r)} cm · 2 号（蓝）${side(t.az2)} ${cmOf(t.r2)} cm`]);
+      } else {
+        lines.push(['', `${side(t.az)} · 离头 ${cmOf(t.r)} cm${t.depthCm > 0.05 ? ` · 入耳 ${t.depthCm.toFixed(1)} cm` : ''}`]);
+      }
       lines.push(['muted', `说话 ${(t.act * 100).toFixed(0)}% · 输出 ${t.outDb > -100 ? t.outDb.toFixed(0) : '—'} dB`]);
       lines.push(['muted', `延时：引擎 ${t.engineMs.toFixed(1)} ms + 输出 ${st.outputMs.toFixed(0)} ms`]);
     } else {
@@ -149,12 +156,17 @@ function drawRadar(t) {
   g.lineTo(W / 2 + 6, W / 2 - map(0.0875) * R + 2);
   g.fill();
   if (!t) return;
-  const a = (t.az * Math.PI) / 180;
-  const k = map(t.r) * R;
-  g.fillStyle = accent;
-  g.beginPath();
-  g.arc(W / 2 + Math.sin(a) * k, W / 2 - Math.cos(a) * k, 9 + 5 * Math.min(1, t.act), 0, 2 * Math.PI);
-  g.fill();
+  // 左右双人时两个点，颜色同桌面版：1 号橙、2 号蓝
+  const dot = (az, r, act, color) => {
+    const a = (az * Math.PI) / 180;
+    const k = map(r) * R;
+    g.fillStyle = color;
+    g.beginPath();
+    g.arc(W / 2 + Math.sin(a) * k, W / 2 - Math.cos(a) * k, 9 + 5 * Math.min(1, act), 0, 2 * Math.PI);
+    g.fill();
+  };
+  dot(t.az, t.r, t.act, t.duo ? '#ff7828' : accent);
+  if (t.duo) dot(t.az2, t.r2, t.act2, '#4696f0');
 }
 
 // ------------------------------------------------------------------ 打开弹窗就开始（这个标签页还没在处理时）
@@ -174,6 +186,9 @@ function render() {
   for (const b of document.querySelectorAll('#mode button')) b.classList.toggle('on', state.params.mode === b.dataset.mode);
   if (document.activeElement !== $('rain')) $('rain').value = state.params.bg_level;
   $('rain-on').classList.toggle('on', state.params.bg_level > 0);
+  if (document.activeElement !== $('duo')) $('duo').value = state.doc.duo_ms;
+  $('duo-on').classList.toggle('on', state.doc.duo_ms > 0);
+  $('duo-on').title = state.doc.duo_ms > 0 ? `第 2 个声音晚 ${state.doc.duo_ms.toFixed(0)} ms；再点一下关闭` : '同一个声音一个在左耳、一个在右耳，第 2 个晚 80 ms';
 }
 
 function change(key, value) {
@@ -194,6 +209,9 @@ for (const b of document.querySelectorAll('[data-style]')) b.addEventListener('c
 for (const b of document.querySelectorAll('#mode button')) b.addEventListener('click', () => change('mode', b.dataset.mode));
 $('rain-on').addEventListener('click', () => change('bg_preset', state.params.bg_level > 0 ? 'off' : 'rain_night'));
 $('rain').addEventListener('change', () => change('bg_level', +$('rain').value));
+// 左右双人：按钮开（80 ms，同桌面版命令行的默认值）/ 关，滑条调第 2 个声音晚多少毫秒
+$('duo-on').addEventListener('click', () => change('duo_ms', state.doc.duo_ms > 0 ? 0 : 80));
+$('duo').addEventListener('change', () => change('duo_ms', +$('duo').value));
 
 chrome.storage.onChanged.addListener((changes, area) => {
   if (area !== 'local' || !changes.config) return;

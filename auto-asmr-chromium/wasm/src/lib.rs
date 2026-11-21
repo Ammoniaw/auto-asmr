@@ -9,6 +9,9 @@
 //! 字符串用"指针 + 长度"传：JS 用 `asmr_alloc` 要一块内存把 UTF-8 写进去；返回字符串的函数把结果放进一个公共缓冲，
 //! 返回字节数（出错返回 −1），JS 从 `asmr_out_ptr()` 读（下一次调用前有效）。出错的原因用 `asmr_error` 取。
 //!
+//! 左右双人（配置文件里的 `duo_ms` 大于 0，和桌面版同一个设置）：处理器把同一路声音交给库里的 [`LiveMix`]——一个在左耳、
+//! 一个在右耳，第 2 个晚一点（和桌面版主播模式同一套做法），自动平衡的输入响度边听边算。
+//!
 //! wasm 是单线程的，全局状态放在 `thread_local` 里（电脑上跑测试时每个测试线程各有一份，互不干扰）。
 
 use std::cell::RefCell;
@@ -16,6 +19,7 @@ use std::sync::Arc;
 
 use auto_asmr::config::{self, ConfigError, Saved};
 use auto_asmr::dsp::engine::{Engine, EngineConfig, PostMode};
+use auto_asmr::dsp::mix::{self, LiveMix, MixSetup, DUO_MAX_MS, DUO_VOICES};
 use auto_asmr::dsp::params::{MotionMode, Params};
 use auto_asmr::dsp::pinna::pinnas;
 use auto_asmr::dsp::rain::RainSetup;
@@ -42,7 +46,13 @@ pub mod tele {
     pub const DEPTH_CM: usize = 6;
     /// 引擎算法延时（毫秒）
     pub const LATENCY_MS: usize = 7;
-    pub const N: usize = 8;
+    /// 是不是左右双人（0 / 1）；是的话上面的位置是 1 号声音，下面是 2 号的方位角、仰角、距离、说话活动
+    pub const DUO: usize = 8;
+    pub const AZ2: usize = 9;
+    pub const EL2: usize = 10;
+    pub const R2: usize = 11;
+    pub const ACT2: usize = 12;
+    pub const N: usize = 13;
 }
 
 // ------------------------------------------------------------------ 全局状态
@@ -53,12 +63,25 @@ struct State {
     out: Vec<u8>,
     /// 引擎配置：`asmr_engine_apply` 时由 `doc` 生成；处理器按版本号换上。
     cfg: Option<Arc<EngineConfig>>,
+    /// 左右双人打开时两个声音的合成配置（由 `cfg` 生成，位置固定在左耳、右耳），和 `cfg` 一起生成。
+    duo: Option<Arc<MixSetup>>,
     ver: u64,
     dry: bool,
 }
 
+impl State {
+    /// 用文档生成引擎配置和左右双人的合成配置（没变的部分复用）。
+    fn apply(&mut self) {
+        let cfg = Arc::new(EngineConfig::new(self.doc.params.clone(), self.cfg.as_deref()));
+        let d = &self.doc;
+        self.duo = (d.duo_ms > 0.0).then(|| Arc::new(mix::duo_setup(&cfg, &DUO_VOICES, d.duo_ms, d.mix_follow, d.mix_balance / 100.0, self.duo.as_deref())));
+        self.cfg = Some(cfg);
+        self.dry = d.dry;
+    }
+}
+
 thread_local! {
-    static ST: RefCell<State> = RefCell::new(State { doc: Saved::default(), out: Vec::new(), cfg: None, ver: 0, dry: false });
+    static ST: RefCell<State> = RefCell::new(State { doc: Saved::default(), out: Vec::new(), cfg: None, duo: None, ver: 0, dry: false });
     /// 出错原因单独放：panic hook 里也要写，那时 `ST` 可能正被借用。
     static ERR: RefCell<String> = const { RefCell::new(String::new()) };
 }
@@ -185,7 +208,8 @@ pub extern "C" fn asmr_doc_text() -> i32 {
 
 /// 界面要显示的内容（JSON）：`params`（全部参数，字段名同配置文件）、`dry`、
 /// `derived`（界面上的换算值：`ear_cm` 贴耳距离、`manual_cm` 手动摆位的离头距离、`moves_per_min` 移动频率、
-/// `denoise` 降噪滑条、`bg_db` 雨声比人声低多少 dB，关闭时为 null）。
+/// `denoise` 降噪滑条、`bg_db` 雨声比人声低多少 dB，关闭时为 null）、
+/// `doc`（配置文件里 `params` 之外、和桌面版共用的左右双人设置：`duo_ms`、`mix_follow`、`mix_balance`）。
 #[no_mangle]
 pub extern "C" fn asmr_doc_ui() -> i32 {
     let v = with(|st| {
@@ -200,6 +224,11 @@ pub extern "C" fn asmr_doc_ui() -> i32 {
                     "moves_per_min": p.moves_per_min(),
                     "denoise": p.denoise_slider(),
                     "bg_db": p.bg_db(),
+                },
+                "doc": {
+                    "duo_ms": st.doc.duo_ms,
+                    "mix_follow": st.doc.mix_follow,
+                    "mix_balance": st.doc.mix_balance,
                 }
             })
         })
@@ -216,6 +245,7 @@ pub extern "C" fn asmr_doc_ui() -> i32 {
 /// - `bg_preset`：`"rain_night"` = 雨夜，`"off"` = 关掉背景音
 /// - `ear_cm`、`manual_cm`、`moves_per_min`、`denoise`：界面上的换算值（见 `asmr_doc_ui`）
 /// - `mode`：换左右移动的方式，「响度随位置变化」跟着换成这个方式的默认值（同桌面版）
+/// - `duo_ms`（0–300，0 = 关）、`mix_follow`（true = 一起移动）、`mix_balance`（0–100）：左右双人（同桌面版配置文件）
 ///
 /// 返回 0 = 成功；名字不对、值的类型不对时返回 −1，文档不变。
 ///
@@ -263,6 +293,9 @@ fn set_field(doc: &mut Saved, key: &str, v: serde_json::Value) -> Result<(), Str
             let m: MotionMode = serde_json::from_value(v).map_err(|e| format!("mode 不对：{e}"))?;
             p.set_mode(m);
         }
+        "duo_ms" => doc.duo_ms = num()?.clamp(0.0, DUO_MAX_MS),
+        "mix_follow" => doc.mix_follow = v.as_bool().ok_or("mix_follow 要 true / false")?,
+        "mix_balance" => doc.mix_balance = num()?.clamp(0.0, 100.0),
         _ => {
             // 其余参数按名字改：转成 JSON 对象改一项再转回来，类型不对时报错、不改
             let mut obj = serde_json::to_value(&*p).map_err(|e| e.to_string())?;
@@ -306,17 +339,18 @@ pub extern "C" fn asmr_warm_up() {
 #[no_mangle]
 pub extern "C" fn asmr_engine_apply() {
     with(|st| {
-        let cfg = EngineConfig::new(st.doc.params.clone(), st.cfg.as_deref());
-        st.cfg = Some(Arc::new(cfg));
-        st.dry = st.doc.dry;
+        st.apply();
         st.ver += 1;
     });
 }
 
-/// 一个标签页的处理器：立体声下混成单声道 → `Engine::process` → 双耳；「监听原声」时输出原来的立体声
-/// （引擎照常在跑，切回效果时动作和响度是接着的）。只处理 48 kHz（插件的 AudioContext 固定 48 kHz）。
+/// 一个标签页的处理器：立体声下混成单声道 → `Engine::process`（左右双人时 [`LiveMix`]）→ 双耳；「监听原声」时输出
+/// 原来的立体声（引擎照常在跑，切回效果时动作和响度是接着的）。只处理 48 kHz（插件的 AudioContext 固定 48 kHz）。
 pub struct Processor {
+    /// 单个声音的引擎（左右双人关着时用；一直跟着换配置，关掉左右双人时接着用）。
     eng: Engine,
+    /// 左右双人打开时的两个声音。
+    duo: Option<LiveMix>,
     ver: u64,
     dry: bool,
     /// 输入输出缓冲：[左入 | 右入 | 左出 | 右出]，各 `CAP` 帧。
@@ -327,25 +361,30 @@ pub struct Processor {
 
 impl Processor {
     pub fn new() -> Self {
-        let (cfg, ver, dry) = with(|st| {
+        let (cfg, duo, ver, dry) = with(|st| {
             if st.cfg.is_none() {
-                st.cfg = Some(Arc::new(EngineConfig::new(st.doc.params.clone(), None)));
-                st.dry = st.doc.dry;
+                st.apply();
             }
-            (st.cfg.clone().unwrap(), st.ver, st.dry)
+            (st.cfg.clone().unwrap(), st.duo.clone(), st.ver, st.dry)
         });
         let mut eng = Engine::new(cfg, PostMode::Realtime, 0.0);
         // 网页内容是连续的录音：动作严格跟着说话走（同桌面版试听、安卓版），不用主播模式的"停顿 1 秒恢复"
         eng.set_live(false);
-        Processor { eng, ver, dry, io: vec![0.0; 4 * CAP].into_boxed_slice(), mono: vec![0.0; CAP].into_boxed_slice(), tele: [0.0; tele::N] }
+        let duo = duo.map(|s| LiveMix::new(&s, false));
+        Processor { eng, duo, ver, dry, io: vec![0.0; 4 * CAP].into_boxed_slice(), mono: vec![0.0; CAP].into_boxed_slice(), tele: [0.0; tele::N] }
     }
 
-    /// 配置换过了就换上（不分配内存，只换 `Arc`）。
+    /// 配置换过了就换上（只换 `Arc`）。左右双人开 / 关、换排布时重新建一份（会分配内存，只在用户改这两项的那一下）。
     fn sync(&mut self) {
-        let next = with(|st| (st.ver != self.ver).then(|| (st.cfg.clone(), st.ver, st.dry)));
-        if let Some((cfg, ver, dry)) = next {
+        let next = with(|st| (st.ver != self.ver).then(|| (st.cfg.clone(), st.duo.clone(), st.ver, st.dry)));
+        if let Some((cfg, duo, ver, dry)) = next {
             if let Some(cfg) = cfg {
                 self.eng.set_config(cfg);
+            }
+            match (duo, &mut self.duo) {
+                (Some(s), Some(d)) if d.mixer().is_follow() == (s.follow && s.cfgs.len() > 1) => d.set_setup(&s),
+                (Some(s), _) => self.duo = Some(LiveMix::new(&s, false)),
+                (None, _) => self.duo = None,
             }
             self.ver = ver;
             self.dry = dry;
@@ -362,12 +401,18 @@ impl Processor {
         for i in 0..n {
             self.mono[i] = 0.5 * (inl[i] + inr[i]);
         }
-        self.eng.process(&self.mono[..n], &mut outl[..n], &mut outr[..n]);
+        match &mut self.duo {
+            Some(d) => d.process(&self.mono[..n], &mut outl[..n], &mut outr[..n]),
+            None => self.eng.process(&self.mono[..n], &mut outl[..n], &mut outr[..n]),
+        }
         if self.dry {
             outl[..n].copy_from_slice(&inl[..n]);
             outr[..n].copy_from_slice(&inr[..n]);
         }
-        let t = &self.eng.tele;
+        let (t, t2) = match &self.duo {
+            Some(d) => (&d.mixer().engine(0).tele, Some(&d.mixer().engine(1).tele)),
+            None => (&self.eng.tele, None),
+        };
         self.tele[tele::AZ] = t.az;
         self.tele[tele::EL] = t.el;
         self.tele[tele::R] = t.r;
@@ -375,11 +420,19 @@ impl Processor {
         self.tele[tele::IN_DB] = t.in_db;
         self.tele[tele::OUT_DB] = t.out_db;
         self.tele[tele::DEPTH_CM] = t.depth_cm;
+        self.tele[tele::DUO] = if t2.is_some() { 1.0 } else { 0.0 };
+        if let Some(t2) = t2 {
+            self.tele[tele::AZ2] = t2.az;
+            self.tele[tele::EL2] = t2.el;
+            self.tele[tele::R2] = t2.r;
+            self.tele[tele::ACT2] = t2.act;
+        }
         self.tele[tele::LATENCY_MS] = self.latency_ms();
     }
 
     pub fn latency_ms(&self) -> f32 {
-        self.eng.latency_samples() as f32 * 1000.0 / FS_USIZE as f32
+        let s = self.duo.as_ref().map_or_else(|| self.eng.latency_samples(), |d| d.latency_samples());
+        s as f32 * 1000.0 / FS_USIZE as f32
     }
 
     pub fn io(&mut self) -> &mut [f32] {
@@ -438,6 +491,12 @@ pub unsafe extern "C" fn asmr_proc_process(p: *mut Processor, frames: usize) -> 
     }
     (*p).process(frames);
     0
+}
+
+/// 状态数组有几个 float（[`tele::N`]）。
+#[no_mangle]
+pub extern "C" fn asmr_tele_len() -> usize {
+    tele::N
 }
 
 /// 状态数组的地址（`tele::N` 个 float，各项见 [`tele`]），每次处理后更新。
@@ -558,6 +617,62 @@ mod tests {
     }
 
     /// 按 AudioWorklet 的方式（每次 128 帧）处理：有声音、两耳不一样；「监听原声」时原样输出；中途换配置不出错。
+    /// 左右双人：设置写进文档、应用后处理器换成两个声音（一左一右，左右两边差不多一样响），界面读得到这几项；
+    /// 改延迟只换配置，换排布时重新建，拖回 0 回到单个引擎；值不对时报错。
+    #[test]
+    fn processor_follows_the_two_voices_setting() {
+        asmr_doc_reset_params();
+        assert_eq!(set("auto_level", "false"), 0);
+        assert_eq!(set("duo_ms", "80"), 0);
+        assert_eq!(set("mix_balance", "50"), 0);
+        assert_ne!(set("mix_follow", "1"), 0);
+        let d = ui()["doc"].clone();
+        assert_eq!((d["duo_ms"].as_f64(), d["mix_follow"].as_bool(), d["mix_balance"].as_f64()), (Some(80.0), Some(false), Some(50.0)));
+        asmr_engine_apply();
+        let mut p = Processor::new();
+        assert!(p.duo.is_some());
+        let x = auto_asmr::dsp::testsig::test_voice(8.0);
+        let (mut el, mut er) = (0f64, 0f64);
+        for (j, c) in x.chunks_exact(128).enumerate() {
+            let io = p.io();
+            io[..128].copy_from_slice(c);
+            io[CAP..CAP + 128].copy_from_slice(c);
+            p.process(128);
+            let io = p.io();
+            if j * 128 > FS_USIZE * 2 {
+                el += io[2 * CAP..2 * CAP + 128].iter().map(|v| (v * v) as f64).sum::<f64>();
+                er += io[3 * CAP..3 * CAP + 128].iter().map(|v| (v * v) as f64).sum::<f64>();
+            }
+        }
+        let t = *p.tele();
+        assert_eq!(t[tele::DUO], 1.0);
+        assert!(t[tele::AZ] > 180.0 && t[tele::AZ2] < 180.0, "1 号在左、2 号在右：{t:?}");
+        assert!((10.0 * (el / er).log10()).abs() < 3.0, "左右两边应差不多一样响：{el} {er}");
+        // 改延迟：同一份，延迟换成新的
+        let before = p.duo.as_ref().map(|d| d as *const LiveMix);
+        assert_eq!(set("duo_ms", "120"), 0);
+        asmr_engine_apply();
+        p.process(128);
+        assert_eq!(p.duo.as_ref().map(|d| d as *const LiveMix), before);
+        assert_eq!(p.duo.as_ref().unwrap().mixer().delays()[1], 5760);
+        // 一起移动：重新建；拖回 0：单个引擎
+        assert_eq!(set("mix_follow", "true"), 0);
+        asmr_engine_apply();
+        p.process(128);
+        assert!(p.duo.as_ref().unwrap().mixer().is_follow());
+        assert_eq!(set("duo_ms", "0"), 0);
+        asmr_engine_apply();
+        p.process(128);
+        assert!(p.duo.is_none() && p.tele()[tele::DUO] == 0.0);
+        // 配置文件里存的就是桌面版的那几项
+        asmr_doc_text();
+        let back = config::parse(&out()).unwrap();
+        assert!(back.mix_follow && back.mix_balance == 50.0 && back.duo_ms == 0.0);
+        asmr_doc_reset_params();
+        assert_eq!(set("mix_follow", "false"), 0);
+        assert_eq!(set("mix_balance", "0"), 0);
+    }
+
     #[test]
     fn processor_spatializes_and_monitors_dry() {
         asmr_doc_reset_params();

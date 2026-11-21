@@ -46,7 +46,8 @@ void asmr_proc_free(AsmrProcessor *p);
 int asmr_proc_process(AsmrProcessor *p, float *data, int frames);
 float asmr_proc_latency_ms(const AsmrProcessor *p);
 const AsmrTele *asmr_proc_tele(const AsmrProcessor *p);
-// out[0..6]：方位角（度）、仰角（度）、距离（米）、说话活动、断流次数、是否出过错
+// out[0..6]：方位角（度）、仰角（度）、距离（米）、说话活动、断流次数、是否出过错；
+// out[6..11]：是不是左右双人（0 / 1），2 号声音的方位角、仰角、距离、说话活动（左右双人时前 4 项是 1 号）
 void asmr_tele_read(const AsmrTele *t, float *out);
 
 // 背景雨声（单独的输出流，48 kHz 立体声）

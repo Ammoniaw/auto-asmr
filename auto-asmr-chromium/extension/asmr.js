@@ -40,7 +40,7 @@ export async function loadAsmr() {
     text() {
       return str(w.asmr_doc_text());
     },
-    /** { params, dry, derived }，见 wasm/src/lib.rs 的 asmr_doc_ui。 */
+    /** { params, dry, derived, doc }，见 wasm/src/lib.rs 的 asmr_doc_ui。 */
     ui() {
       return JSON.parse(str(w.asmr_doc_ui()));
     },

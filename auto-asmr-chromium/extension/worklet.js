@@ -122,7 +122,7 @@ class AsmrProcessor extends AudioWorkletProcessor {
       this.inR = this.io.subarray(cap, 2 * cap);
       this.outL = this.io.subarray(2 * cap, 3 * cap);
       this.outR = this.io.subarray(3 * cap, 4 * cap);
-      this.tele = new Float32Array(W.memory.buffer, W.asmr_proc_tele(this.p), 8);
+      this.tele = new Float32Array(W.memory.buffer, W.asmr_proc_tele(this.p), W.asmr_tele_len());
     }
   }
 

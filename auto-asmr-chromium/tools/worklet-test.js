@@ -195,6 +195,27 @@ const errors = (msgs) => msgs.filter((m) => m.type === 'error').map((m) => (m.de
   ui.asmr_doc_reset_params();
 }
 
+// 5b. 左右双人（桌面版同一个设置）：两个声音一左一右，状态里有 2 号；左右两边差不多一样响；处理中途打开也立即生效
+{
+  uiSet('duo_ms', 80);
+  const text = uiText();
+  const r = await render({ secs: 10, config: text });
+  const tele = r.msgs.filter((m) => m.type === 'tele');
+  const last = tele.length ? tele[tele.length - 1].t : null;
+  const lr = 10 * Math.log10(energy(r.L, 2 * FS).e / energy(r.R, 2 * FS).e);
+  check(
+    '左右双人：1 号在左、2 号在右，两边差不多一样响',
+    !!last && last.length >= 13 && last[8] === 1 && last[0] > 180 && last[9] < 180 && Math.abs(lr) < 6 && !errors(r.msgs).length,
+    last ? `1 号 ${last[0].toFixed(0)}°，2 号 ${last[9].toFixed(0)}°，左比右 ${lr.toFixed(1)} dB` : '没有状态',
+  );
+  uiSet('duo_ms', 0);
+  const r2 = await render({ secs: 8, at: [[4, (node) => node.port.postMessage({ type: 'config', config: enc.encode(text), gen: 2 })]] });
+  const t2 = r2.msgs.filter((m) => m.type === 'tele');
+  const before = t2.find((m) => m.t[8] === 0);
+  const after = t2.length ? t2[t2.length - 1].t : null;
+  check('左右双人：处理中途打开', !!before && !!after && after[8] === 1 && !errors(r2.msgs).length && energy(r2.L, 5 * FS).finite, after ? `打开后 1 号 ${after[0].toFixed(0)}°，2 号 ${after[9].toFixed(0)}°` : '没有状态');
+}
+
 // 6. 同一个 AudioContext 里两个标签页（共用一个 wasm 实例）
 {
   const r = await render({ secs: 4, nodes: 2 });

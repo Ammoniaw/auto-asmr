@@ -6,12 +6,16 @@
 //!   「虚拟字段」，读写都调用库里 `Params` 的同名方法，和桌面版界面的操作完全一样；换左右移动的方式时
 //!   「响度随位置变化」跟着换成默认值，也和桌面版一样。
 //! - 风格、恢复默认、雨夜这些按钮调用库里同一个函数。
+//! - 左右双人（`duo_ms`、`mix_follow`、`mix_balance`）是配置文件里和桌面版共用的设置（不在 `params` 里；延迟是桌面版
+//!   「文件转换」页的那个，实时页的 `rt_duo_ms` 不用——网页里是录好的声音，和文件试听一样），
+//!   界面按同样的字段名读写；打开时在这里算好两个声音的合成配置（[`Global::duo`]），处理器按版本号换上。
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use auto_asmr::config::{self, ConfigError, Saved};
 use auto_asmr::dsp::engine::EngineConfig;
+use auto_asmr::dsp::mix::{self, MixSetup, DUO_MAX_MS, DUO_VOICES};
 use auto_asmr::dsp::motion::up_angle;
 use auto_asmr::dsp::params::{MotionMode, Params};
 use auto_asmr::dsp::pinna::pinnas;
@@ -25,7 +29,14 @@ pub struct Global {
     pub cfg: Arc<EngineConfig>,
     /// 去掉背景音的配置：给网页声音的处理器用。雨声单独一条输出流，网页暂停时也不断，所以引擎里不再混一份。
     pub cfg_voice: Arc<EngineConfig>,
+    /// 左右双人打开时两个声音的合成配置（由 `cfg_voice` 生成，位置固定在左耳、右耳）；关着时为 None。
+    pub duo: Option<Arc<MixSetup>>,
     pub error: String,
+}
+
+/// 左右双人的合成配置（关着时 None）。`prev` 里没变的引擎配置原样复用。
+fn duo_for(s: &Saved, base: &Arc<EngineConfig>, prev: Option<&MixSetup>) -> Option<Arc<MixSetup>> {
+    (s.duo_ms > 0.0).then(|| Arc::new(mix::duo_setup(base, &DUO_VOICES, s.duo_ms, s.mix_follow, s.mix_balance / 100.0, prev)))
 }
 
 /// 网页声音用的参数：背景音关掉，其余一样。
@@ -43,7 +54,8 @@ pub fn with_global<R>(f: impl FnOnce(&mut Global) -> R) -> R {
         let saved = Saved::default();
         let cfg = Arc::new(EngineConfig::new(saved.params.clone(), None));
         let cfg_voice = Arc::new(EngineConfig::new(voice_params(&saved.params), Some(&cfg)));
-        Global { cfg, cfg_voice, saved, error: String::new() }
+        let duo = duo_for(&saved, &cfg_voice, None);
+        Global { cfg, cfg_voice, duo, saved, error: String::new() }
     });
     f(g)
 }
@@ -62,6 +74,7 @@ pub fn full_cfg() -> Arc<EngineConfig> {
 fn commit(g: &mut Global) {
     g.cfg = Arc::new(EngineConfig::new(g.saved.params.clone(), Some(&g.cfg)));
     g.cfg_voice = Arc::new(EngineConfig::new(voice_params(&g.saved.params), Some(&g.cfg_voice)));
+    g.duo = duo_for(&g.saved, &g.cfg_voice, g.duo.as_deref());
     CFG_VER.fetch_add(1, Ordering::Release);
 }
 
@@ -72,6 +85,19 @@ pub fn update_params(f: impl FnOnce(&mut Params) -> Result<(), String>) -> Resul
         f(&mut p)?;
         if p != g.saved.params {
             g.saved.params = p;
+            commit(g);
+        }
+        Ok(())
+    })
+}
+
+/// 改配置文件里 `params` 之外的一项（左右双人那几项，见 [`DOC_KEYS`]）；真的有变化才重新生成配置。
+pub fn update_doc(key: &str, v: Value) -> Result<(), String> {
+    with_global(|g| {
+        let mut s = g.saved.clone();
+        set_doc_field(&mut s, key, v)?;
+        if (s.duo_ms, s.mix_follow, s.mix_balance) != (g.saved.duo_ms, g.saved.mix_follow, g.saved.mix_balance) {
+            g.saved = s;
             commit(g);
         }
         Ok(())
@@ -131,6 +157,9 @@ pub fn describe_config(text: &str) -> Result<String, ConfigError> {
     if let Some(db) = p.bg_db() {
         parts.push(format!("背景雨声（比人声低 {:.0} dB）", -db));
     }
+    if s.duo_ms > 0.0 {
+        parts.push(format!("左右双人（第 2 个声音晚 {:.0} ms）", s.duo_ms));
+    }
     if s.dry {
         parts.push("原声（不加效果）".to_string());
     }
@@ -147,6 +176,31 @@ pub fn export_config() -> Result<String, String> {
 /// 界面上的换算量：读写都走库里 `Params` 的同名方法（和桌面版界面一样）。
 pub const VIRTUAL: [&str; 4] = ["ear_cm", "manual_cm", "moves_per_min", "denoise_slider"];
 
+/// 配置文件里 `params` 之外、界面也按字段读写的设置：左右双人（和桌面版共用）。
+pub const DOC_KEYS: [&str; 3] = ["duo_ms", "mix_follow", "mix_balance"];
+
+/// 改 [`DOC_KEYS`] 里的一项。范围和桌面版界面一样：延迟 0–300 ms（0 = 关），自动平衡 0–100 %。
+pub fn set_doc_field(s: &mut Saved, key: &str, v: Value) -> Result<(), String> {
+    match key {
+        "duo_ms" => s.duo_ms = as_f32(&v)?.clamp(0.0, DUO_MAX_MS),
+        "mix_follow" => s.mix_follow = v.as_bool().ok_or("mix_follow 要 true / false")?,
+        "mix_balance" => s.mix_balance = as_f32(&v)?.clamp(0.0, 100.0),
+        _ => return Err(format!("没有这个设置：{key}")),
+    }
+    Ok(())
+}
+
+/// 界面要的全部字段：[`params_json`] 加上左右双人那几项。
+pub fn saved_json(s: &Saved) -> Value {
+    let mut v = params_json(&s.params, s.dry);
+    if let Some(m) = v.as_object_mut() {
+        m.insert("duo_ms".into(), json!(s.duo_ms));
+        m.insert("mix_follow".into(), json!(s.mix_follow));
+        m.insert("mix_balance".into(), json!(s.mix_balance));
+    }
+    v
+}
+
 /// 全部参数（JSON 对象，键就是 `Params` 的字段名），加上虚拟字段和 `dry`。
 pub fn params_json(p: &Params, dry: bool) -> Value {
     let mut v = serde_json::to_value(p).unwrap_or(Value::Null);
@@ -161,7 +215,7 @@ pub fn params_json(p: &Params, dry: bool) -> Value {
 }
 
 pub fn current_params_json() -> Value {
-    with_global(|g| params_json(&g.saved.params, g.saved.dry))
+    with_global(|g| saved_json(&g.saved))
 }
 
 fn as_f32(v: &Value) -> Result<f32, String> {
@@ -279,7 +333,17 @@ mod tests {
     fn ui_spec_matches_params() {
         provide_repo_data();
         let spec = ui_spec();
-        let fields = params_json(&Params::default(), false);
+        let fields = saved_json(&Saved::default());
+        // 改一项、读回来：`params` 里的走 set_field，左右双人那几项走 set_doc_field
+        let set = |key: &str, v: Value| {
+            let mut s = Saved::default();
+            if DOC_KEYS.contains(&key) {
+                set_doc_field(&mut s, key, v).unwrap();
+            } else {
+                set_field(&mut s.params, key, v).unwrap();
+            }
+            saved_json(&s)
+        };
         let mut n = 0;
         for it in items(&spec) {
             let t = it["type"].as_str().unwrap();
@@ -293,24 +357,18 @@ mod tests {
                     let (lo, hi) = (it["min"].as_f64().unwrap(), it["max"].as_f64().unwrap());
                     assert!(lo < hi, "{key} 范围");
                     for x in [lo, hi] {
-                        let mut p = Params::default();
-                        set_field(&mut p, key, json!(x)).unwrap();
-                        let back = params_json(&p, false)[key].as_f64().unwrap();
+                        let back = set(key, json!(x))[key].as_f64().unwrap();
                         assert!((back - x).abs() < 1e-3 * (1.0 + x.abs()), "{key} 设 {x} 读回 {back}");
                     }
                 }
                 "check" => {
-                    let mut p = Params::default();
-                    set_field(&mut p, key, json!(true)).unwrap();
-                    assert_eq!(params_json(&p, false)[key], json!(true));
+                    assert_eq!(set(key, json!(true))[key], json!(true));
                 }
                 "choice" => {
                     let opts = it["options"].as_array().unwrap();
                     assert!(opts.len() >= 2, "{key} 选项");
                     for o in opts {
-                        let mut p = Params::default();
-                        set_field(&mut p, key, o["value"].clone()).unwrap();
-                        assert_eq!(params_json(&p, false)[key], o["value"], "{key}");
+                        assert_eq!(set(key, o["value"].clone())[key], o["value"], "{key}");
                     }
                 }
                 "int" => {

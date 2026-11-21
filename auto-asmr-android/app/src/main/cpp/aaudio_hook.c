@@ -637,7 +637,7 @@ static int format_stats(char *out, size_t cap, bool for_log) {
         if (w < 0 || (size_t)(len + w) >= cap) break;
         len += w;
         if (c->tele) {
-            float t[6];
+            float t[11];
             asmr_tele_read(c->tele, t);
             // 处理占用 = 处理用时 / 这些帧的播放时长
             double load = dpf ? (double)dpn / ((double)dpf / c->rate * 1e9) * 100.0 : 0.0;
@@ -961,9 +961,11 @@ JNIEXPORT jfloatArray JNICALL JNI_FN(manualFromPose)(JNIEnv *env, jclass cls, jf
 // 给界面的实时状态：最近 1 秒里还在回调、建了处理器的流中最近出声的那个。
 // [0] 有没有 [1] 方位角 [2] 仰角 [3] 距离（米） [4] 说话活动 [5] 处理占用（单核 %） [6] 延迟（ms）
 // [7] 断流次数 [8] 采样率 [9] 流编号 [10] 引擎出过错
+// [11] 是不是左右双人 [12] 2 号的方位角 [13] 仰角 [14] 距离 [15] 说话活动（左右双人时 [1]–[4] 是 1 号）
+#define TELE_N 16
 JNIEXPORT jfloatArray JNICALL JNI_FN(telemetry)(JNIEnv *env, jclass cls) {
     (void)cls;
-    float out[11] = {0};
+    float out[TELE_N] = {0};
     uint64_t now = now_ns(), best = 0;
     pthread_mutex_lock(&g_report_mu);
     ctx_t *pick = NULL;
@@ -977,7 +979,7 @@ JNIEXPORT jfloatArray JNICALL JNI_FN(telemetry)(JNIEnv *env, jclass cls) {
         }
     }
     if (pick) {
-        float t[6];
+        float t[11];
         asmr_tele_read(pick->tele, t);
         uint64_t pn = LD(pick->proc_ns), pf = LD(pick->proc_frames);
         uint64_t dpn = pn - pick->u_proc_ns, dpf = pf - pick->u_proc_frames;
@@ -994,10 +996,11 @@ JNIEXPORT jfloatArray JNICALL JNI_FN(telemetry)(JNIEnv *env, jclass cls) {
         out[8] = (float)pick->rate;
         out[9] = (float)pick->id;
         out[10] = t[5];
+        for (int k = 0; k < 5; k++) out[11 + k] = t[6 + k];
     }
     pthread_mutex_unlock(&g_report_mu);
-    jfloatArray a = (*env)->NewFloatArray(env, 11);
-    if (a) (*env)->SetFloatArrayRegion(env, a, 0, 11, out);
+    jfloatArray a = (*env)->NewFloatArray(env, TELE_N);
+    if (a) (*env)->SetFloatArrayRegion(env, a, 0, TELE_N, out);
     return a;
 }
 

@@ -50,6 +50,8 @@ object SpecUi {
             if (i >= 90) f("%.0f · %.0f 分钟 · %.1f km", v, i / 60, d) else f("%.0f · %.0f s · %.1f km", v, i, d)
         }
         "plain" -> f("%.0f", v)
+        "duo" -> if (v < 0.5) "0 关" else f("%.0f ms", v)
+        "balance" -> if (v < 0.5) "0 关" else f("%.0f%%", v)
         else -> {
             val unit = item.optString("unit")
             val num = f("%.${item.optInt("decimals", 2)}f", v)

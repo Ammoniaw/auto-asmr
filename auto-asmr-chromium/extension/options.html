@@ -68,6 +68,10 @@
       .row.wide {
         grid-template-columns: 120px 1fr;
       }
+      /* 按条件隐藏的行（render 里设 hidden）：.row 的 display: grid 会盖过浏览器默认的隐藏 */
+      .row[hidden] {
+        display: none;
+      }
       .row.off {
         opacity: 0.45;
       }

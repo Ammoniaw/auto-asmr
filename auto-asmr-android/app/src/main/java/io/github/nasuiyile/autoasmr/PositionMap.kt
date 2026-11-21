@@ -53,6 +53,10 @@ object Radar {
 @Composable
 fun PositionMap(p: JSONObject, tele: FloatArray, manual: Boolean) {
     val playing = tele.isNotEmpty() && tele[0] > 0f
+    // 左右双人：两个声音（颜色同电脑版：1 号橙、2 号蓝），2 号的位置在 tele[12..16]
+    val duo = playing && tele.size >= 16 && tele[11] > 0f
+    val c1 = if (duo) Color(0xFFFF7828) else Color(0xFFE5484D)
+    val c2 = Color(0xFF4696F0)
     val accent = MaterialTheme.colorScheme.primary
     val line = MaterialTheme.colorScheme.outline
     val text = MaterialTheme.colorScheme.onSurface
@@ -116,7 +120,11 @@ fun PositionMap(p: JSONObject, tele: FloatArray, manual: Boolean) {
                 if (playing) {
                     val horiz = tele[3] * cos(Math.toRadians(tele[2].toDouble())).toFloat()
                     val pt = at(tele[1], horiz)
-                    drawCircle(Color(0xFFE5484D).copy(alpha = 0.45f + 0.55f * tele[4].coerceIn(0f, 1f)), 7.dp.toPx(), pt)
+                    drawCircle(c1.copy(alpha = 0.45f + 0.55f * tele[4].coerceIn(0f, 1f)), 7.dp.toPx(), pt)
+                }
+                if (duo) {
+                    val horiz = tele[14] * cos(Math.toRadians(tele[13].toDouble())).toFloat()
+                    drawCircle(c2.copy(alpha = 0.45f + 0.55f * tele[15].coerceIn(0f, 1f)), 7.dp.toPx(), at(tele[12], horiz))
                 }
             }
             Spacer(Modifier.width(6.dp))
@@ -142,10 +150,13 @@ fun PositionMap(p: JSONObject, tele: FloatArray, manual: Boolean) {
                 drawLine(line, Offset(x - 8.dp.toPx(), size.height / 2f), Offset(x + 8.dp.toPx(), size.height / 2f), 1.dp.toPx())
                 fun y(deg: Float) = size.height / 2f - deg / 90f * size.height / 2f
                 if (manual) drawCircle(accent, 7.dp.toPx(), Offset(x, y(mTilt)), style = Stroke(2.dp.toPx()))
-                if (playing) drawCircle(Color(0xFFE5484D), 5.dp.toPx(), Offset(x, y(tele[2].coerceIn(-80f, 85f))))
+                if (playing) drawCircle(c1, 5.dp.toPx(), Offset(x, y(tele[2].coerceIn(-80f, 85f))))
+                if (duo) drawCircle(c2, 5.dp.toPx(), Offset(x, y(tele[13].coerceIn(-80f, 85f))))
             }
         }
-        val read = if (playing) {
+        val read = if (duo) {
+            String.format(Locale.ROOT, "左右双人 · 1 号（橙）方位 %.0f° 离头 %.1f cm · 2 号（蓝）方位 %.0f° 离头 %.1f cm", tele[1], (tele[3] - Radar.HEAD_A) * 100f, tele[12], (tele[14] - Radar.HEAD_A) * 100f)
+        } else if (playing) {
             val cm = (tele[3] - Radar.HEAD_A) * 100f
             val el = tele[2]
             String.format(Locale.ROOT, "方位 %.0f° · 离头 %.1f cm · %s", tele[1], cm, if (kotlin.math.abs(el) < 1f) "与耳齐平" else if (el > 0) "上 %.0f°".format(Locale.ROOT, el) else "下 %.0f°".format(Locale.ROOT, -el))

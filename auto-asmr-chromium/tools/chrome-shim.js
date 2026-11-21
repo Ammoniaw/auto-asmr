@@ -27,7 +27,11 @@
   });
   const fakeTele = () => {
     const t = Date.now() / 1000;
-    return { az: (t * 30) % 360, el: 0, r: 0.105 + 0.05 * (1 + Math.sin(t)), act: 0.5 + 0.5 * Math.sin(t * 3), inDb: -24, outDb: -18, depthCm: 0, engineMs: 2.4 };
+    // 配置里开着左右双人时，假装有两个声音（2 号在对面）
+    const m = /duo_ms:\s*([\d.]+)/.exec(read().config || '');
+    const duo = !!m && +m[1] > 0;
+    const az = (t * 30) % 360;
+    return { az, el: 0, r: 0.105 + 0.05 * (1 + Math.sin(t)), act: 0.5 + 0.5 * Math.sin(t * 3), inDb: -24, outDb: -18, depthCm: 0, engineMs: 2.4, duo, az2: (az + 180) % 360, el2: 0, r2: 0.12, act2: 0.6 };
   };
   let capturing = false;
   window.chrome = {

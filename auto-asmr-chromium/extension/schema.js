@@ -1,12 +1,54 @@
 // 设置页的参数表：分组、名字、范围、单位与桌面版界面（auto-asmr/src/gui.rs）一致。
 // 滑块用常用范围，数字框里可以手输超出范围的值（同桌面版）。
 // `derived: true` 的项是界面上的换算值（贴耳距离、移动频率……），读写都经过 Params 自己的方法（见 wasm/src/lib.rs）。
+// `doc: true` 的项是配置文件里 `params` 之外、和桌面版共用的设置（左右双人：延迟是文件转换页的 `duo_ms`）。
+// `show` / `on` 收到 (params, 整个界面状态)，要看 doc 里的值时用第二个参数。
 
 const mode = (...ms) => (p) => ms.includes(p.mode);
 
 const offOr = (x, f) => (x < 0.5 ? '0 关' : f(x));
 
+const duoOn = (p, s) => s.doc.duo_ms > 0;
+
 export const GROUPS = [
+  {
+    title: '左右双人',
+    rows: [
+      {
+        key: 'duo_ms',
+        doc: true,
+        label: '左右双人',
+        min: 0,
+        max: 300,
+        dec: 0,
+        fmt: (x) => offOr(x, () => 'ms'),
+        tip: '把网页里的声音当成两个人：同一个声音一个在左耳、一个在右耳（各自忽远忽近），第 2 个整体晚这么多毫秒，听得出是两个人一前一后地说。30 ms 以下两边容易融成一个声音，50–120 ms 像两个人，150 ms 以上像回声。只有第 2 个声音晚，第 1 个和平时一样及时。和桌面版「文件转换」页的左右双人是同一个设置。0 = 关闭',
+      },
+      {
+        type: 'choice',
+        key: 'mix_follow',
+        doc: true,
+        label: '排布',
+        show: duoOn,
+        tip: '各自固定：1 号固定在左耳、2 号固定在右耳，只做忽远忽近、上下、自然晃动，「左右移动」不起作用。一起移动：两个声音按「左右移动」的方式一起走，始终在头的两侧相对',
+        options: [
+          [false, '各自固定'],
+          [true, '一起移动'],
+        ],
+      },
+      {
+        key: 'mix_balance',
+        doc: true,
+        label: '自动平衡',
+        min: 0,
+        max: 100,
+        dec: 0,
+        show: duoOn,
+        fmt: (x) => offOr(x, () => '%'),
+        tip: '让两个声音每一段时间听起来都差不多一样响（各自忽远忽近时，常常一个退开了另一个正贴着耳朵）。最多 ±15 dB，0.25 秒平滑；停顿里不往上拉；网页没有「整段」，响度边听边算。100% = 一样响，50% = 差距减半，0 = 关闭',
+      },
+    ],
+  },
   {
     title: '贴耳感',
     rows: [

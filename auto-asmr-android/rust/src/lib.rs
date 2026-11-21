@@ -6,6 +6,9 @@
 //! - **每个 AAudio 流一个 [`Processor`]**：Chromium 给的是立体声 float，采样率跟着片源（48 kHz、44.1 kHz……）。
 //!   左右下混成单声道 →（不是 48 kHz 时先重采样到 48 kHz）→ `Engine::process` →（再转回原采样率）→ 写回左右声道。
 //!   缓冲在创建时按 [`CHUNK`] 分配好，回调里不再分配。
+//! - **左右双人**（配置里的 `duo_ms` 大于 0）：同一路声音交给库里的 [`LiveMix`]——一个在左耳、一个在右耳，第 2 个
+//!   从输入的历史里晚一点取（和桌面版主播模式同一套做法），自动平衡的输入响度边听边算。开 / 关、换排布时在音频线程里
+//!   重新建一份（只在用户改这两项的那一下），延迟、位置、强度这些改动直接换配置。
 //! - **出错不崩溃**：导出函数都 `catch_unwind`，Rust 里出错只会让这个流改成直通。
 
 use std::ffi::{c_char, c_int, CStr};
@@ -14,6 +17,7 @@ use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, TryLockError};
 
 use auto_asmr::dsp::engine::{Engine, PostMode};
+use auto_asmr::dsp::mix::{LiveMix, MixSetup};
 use auto_asmr::dsp::params::Params;
 use auto_asmr::dsp::resample::Resampler;
 use auto_asmr::dsp::FS_USIZE;
@@ -176,7 +180,8 @@ pub unsafe extern "C" fn asmr_action(name: *const c_char) -> c_int {
 }
 
 /// 改一个参数：`key` 是 `Params` 的字段名或虚拟字段（`ear_cm`、`manual_cm`、`moves_per_min`、`denoise_slider`），
-/// `value` 是 JSON。返回 0 = 成功；失败时参数不变。
+/// 或左右双人的设置（`duo_ms`、`mix_follow`、`mix_balance`，和桌面版配置文件同名）；`value` 是 JSON。
+/// 返回 0 = 成功；失败时参数不变。
 ///
 /// # Safety
 /// `key`、`value` 是 NUL 结尾的 UTF-8 字符串。
@@ -185,7 +190,11 @@ pub unsafe extern "C" fn asmr_set_field(key: *const c_char, value: *const c_char
     let (key, value) = (from_c(key), from_c(value));
     report(catch_unwind(|| {
         let v: serde_json::Value = serde_json::from_str(&value).map_err(|e| format!("{key} 的值读不懂：{e}"))?;
-        update_params(|p| settings::set_field(p, &key, v))
+        if settings::DOC_KEYS.contains(&key.as_str()) {
+            settings::update_doc(&key, v)
+        } else {
+            update_params(|p| settings::set_field(p, &key, v))
+        }
     }))
 }
 
@@ -293,6 +302,7 @@ pub unsafe extern "C" fn asmr_last_error(buf: *mut c_char, cap: usize) -> c_int 
 // ------------------------------------------------------------------ 每个流的处理器
 
 /// 给上报线程读的状态：音频线程每次回调后写，别的线程只读（都是原子量，单独分配，不和 `Processor` 共享引用）。
+/// 左右双人时 `az`… 是 1 号声音，`duo`、`az2`… 是 2 号。
 #[derive(Default)]
 pub struct Tele {
     az: AtomicU32,
@@ -301,6 +311,11 @@ pub struct Tele {
     act: AtomicU32,
     underruns: AtomicU32,
     failed: AtomicU32,
+    duo: AtomicU32,
+    az2: AtomicU32,
+    el2: AtomicU32,
+    r2: AtomicU32,
+    act2: AtomicU32,
 }
 
 fn st(a: &AtomicU32, v: f32) {
@@ -322,7 +337,10 @@ struct Rs {
 }
 
 pub struct Processor {
+    /// 单个声音的引擎（左右双人关着时用；一直跟着换配置，关掉左右双人时接着用）。
     eng: Engine,
+    /// 左右双人打开时的两个声音。
+    duo: Option<LiveMix>,
     ver: u64,
     rate: usize,
     rs: Option<Rs>,
@@ -339,6 +357,7 @@ impl Processor {
         let mut eng = Engine::new(cfg, PostMode::Realtime, 0.0);
         // 网页内容是连续的录音：动作严格跟着说话走（同桌面版试听），不用主播模式的"停顿 1 秒恢复"
         eng.set_live(false);
+        let duo = with_global(|g| g.duo.clone()).map(|s| LiveMix::new(&s, false));
         let n48 = if rate == FS_USIZE { CHUNK } else { CHUNK * FS_USIZE / rate + 64 };
         let rs = (rate != FS_USIZE).then(|| {
             let fs = FS_USIZE as f64;
@@ -351,7 +370,16 @@ impl Processor {
             let delay_frames = PRIME + 16 * rate / FS_USIZE + 18;
             Rs { up: Resampler::new(rate as f64, fs), down: [Resampler::new(fs, rate as f64), Resampler::new(fs, rate as f64)], x48: Vec::with_capacity(n48), q, qpos: 0, delay_frames }
         });
-        Processor { eng, ver: CFG_VER.load(Ordering::Acquire), rate, rs, mono: vec![0.0; CHUNK], l: vec![0.0; n48], r: vec![0.0; n48], failed: false, tele: Arc::new(Tele::default()) }
+        Processor { eng, duo, ver: CFG_VER.load(Ordering::Acquire), rate, rs, mono: vec![0.0; CHUNK], l: vec![0.0; n48], r: vec![0.0; n48], failed: false, tele: Arc::new(Tele::default()) }
+    }
+
+    /// 左右双人的配置换上：开 / 关、换排布时重新建一份（会分配内存，只在用户改这两项的那一下），其余直接换配置。
+    fn sync_duo(&mut self, setup: Option<&Arc<MixSetup>>) {
+        match (setup, &mut self.duo) {
+            (Some(s), Some(d)) if d.mixer().is_follow() == (s.follow && s.cfgs.len() > 1) => d.set_setup(s),
+            (Some(s), _) => self.duo = Some(LiveMix::new(s, false)),
+            (None, _) => self.duo = None,
+        }
     }
 
     /// 界面换了参数：拿得到锁就换上，拿不到下次再说。
@@ -360,13 +388,17 @@ impl Processor {
         if v == self.ver {
             return;
         }
-        let g = match GLOBAL.try_lock() {
+        let guard = match GLOBAL.try_lock() {
             Ok(g) => g,
             Err(TryLockError::Poisoned(e)) => e.into_inner(),
             Err(TryLockError::WouldBlock) => return,
         };
-        if let Some(g) = g.as_ref() {
-            self.eng.set_config(g.cfg.clone());
+        // 网页声音用不带背景音的配置（雨声是单独的一条输出流）
+        let next = guard.as_ref().map(|g| (g.cfg_voice.clone(), g.duo.clone()));
+        drop(guard);
+        if let Some((cfg, duo)) = next {
+            self.eng.set_config(cfg);
+            self.sync_duo(duo.as_ref());
             self.ver = v;
         }
     }
@@ -374,7 +406,12 @@ impl Processor {
     /// 处理一段交错的立体声（原地改写）。
     fn process(&mut self, data: &mut [f32]) {
         self.sync_config();
-        let Processor { eng, rs, mono, l, r, tele, .. } = self;
+        let Processor { eng, duo, rs, mono, l, r, tele, .. } = self;
+        // 左右双人打开时交给两个声音，否则单个引擎
+        let mut run = |x: &[f32], l: &mut [f32], r: &mut [f32]| match duo {
+            Some(d) => d.process(x, l, r),
+            None => eng.process(x, l, r),
+        };
         let n = data.len() / 2;
         let mut done = 0;
         while done < n {
@@ -385,7 +422,7 @@ impl Processor {
             }
             match rs {
                 None => {
-                    eng.process(&mono[..m], &mut l[..m], &mut r[..m]);
+                    run(&mono[..m], &mut l[..m], &mut r[..m]);
                     for i in 0..m {
                         block[2 * i] = l[i];
                         block[2 * i + 1] = r[i];
@@ -395,7 +432,7 @@ impl Processor {
                     rs.x48.clear();
                     rs.up.process(&mono[..m], &mut rs.x48);
                     let k = rs.x48.len().min(l.len());
-                    eng.process(&rs.x48[..k], &mut l[..k], &mut r[..k]);
+                    run(&rs.x48[..k], &mut l[..k], &mut r[..k]);
                     if rs.qpos > 0 {
                         for q in rs.q.iter_mut() {
                             q.drain(..rs.qpos);
@@ -419,15 +456,25 @@ impl Processor {
             }
             done += m;
         }
-        let t = &eng.tele;
+        let (t, t2) = match duo {
+            Some(d) => (d.mixer().engine(0).tele, Some(d.mixer().engine(1).tele)),
+            None => (eng.tele, None),
+        };
         st(&tele.az, t.az);
         st(&tele.el, t.el);
         st(&tele.r, t.r);
         st(&tele.act, t.act);
+        st(&tele.duo, if t2.is_some() { 1.0 } else { 0.0 });
+        if let Some(t2) = t2 {
+            st(&tele.az2, t2.az);
+            st(&tele.el2, t2.el);
+            st(&tele.r2, t2.r);
+            st(&tele.act2, t2.act);
+        }
     }
 
     fn latency_ms(&self) -> f32 {
-        let algo = self.eng.latency_samples() as f32 / FS_USIZE as f32;
+        let algo = self.duo.as_ref().map_or_else(|| self.eng.latency_samples(), |d| d.latency_samples()) as f32 / FS_USIZE as f32;
         let rs = self.rs.as_ref().map_or(0.0, |rs| rs.delay_frames as f32 / self.rate as f32);
         (algo + rs) * 1000.0
     }
@@ -502,23 +549,29 @@ pub unsafe extern "C" fn asmr_proc_tele(p: *const Processor) -> *const Tele {
     Arc::as_ptr(&(*p).tele)
 }
 
-/// 读状态：out[0..6] = 方位角（度）、仰角（度）、距离（米）、说话活动（0–1）、断流次数、是否出过错。
+/// 读状态：out[0..6] = 方位角（度）、仰角（度）、距离（米）、说话活动（0–1）、断流次数、是否出过错；
+/// out[6..11] = 是不是左右双人（0 / 1），以及 2 号声音的方位角、仰角、距离、说话活动（左右双人时前面那 4 项是 1 号）。
 ///
 /// # Safety
-/// `t` 来自 `asmr_proc_tele` 且处理器还没释放；`out` 可写 6 个 float。
+/// `t` 来自 `asmr_proc_tele` 且处理器还没释放；`out` 可写 11 个 float。
 #[no_mangle]
 pub unsafe extern "C" fn asmr_tele_read(t: *const Tele, out: *mut f32) {
     if t.is_null() || out.is_null() {
         return;
     }
     let t = &*t;
-    let o = std::slice::from_raw_parts_mut(out, 6);
+    let o = std::slice::from_raw_parts_mut(out, 11);
     o[0] = ld(&t.az);
     o[1] = ld(&t.el);
     o[2] = ld(&t.r);
     o[3] = ld(&t.act);
     o[4] = t.underruns.load(Ordering::Relaxed) as f32;
     o[5] = t.failed.load(Ordering::Relaxed) as f32;
+    o[6] = ld(&t.duo);
+    o[7] = ld(&t.az2);
+    o[8] = ld(&t.el2);
+    o[9] = ld(&t.r2);
+    o[10] = ld(&t.act2);
 }
 
 // ------------------------------------------------------------------ 背景雨声（单独的输出流）
@@ -630,6 +683,105 @@ mod tests {
         assert_eq!(unsafe { asmr_set_params_ron(c"(seed: 7)".as_ptr()) }, 0);
         assert_eq!(current_cfg().params.seed, 7);
         assert_eq!(unsafe { asmr_set_params_ron(c"(seed: \"x\")".as_ptr()) }, -1);
+    }
+
+    fn set_field(key: &str, value: &str) -> c_int {
+        let (k, v) = (std::ffi::CString::new(key).unwrap(), std::ffi::CString::new(value).unwrap());
+        unsafe { asmr_set_field(k.as_ptr(), v.as_ptr()) }
+    }
+
+    fn tele_of(p: &Processor) -> [f32; 11] {
+        let mut t = [0f32; 11];
+        unsafe { asmr_tele_read(Arc::as_ptr(&p.tele), t.as_mut_ptr()) };
+        t
+    }
+
+    /// 左右双人：打开后同一路声音变成一左一右两个声音（状态里有 2 号的位置），左右两边差不多一样响；
+    /// 播放中改延迟只换配置，换排布时重新建，拖回 0 回到单个引擎；44.1 kHz 的流照样不断流。
+    #[test]
+    fn duo_follows_the_settings_while_playing() {
+        let _g = settings::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        settings::provide_repo_data();
+        update_params(|p| {
+            *p = Params { auto_level: false, ..Params::default() };
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(set_field("duo_ms", "80"), 0);
+        assert_eq!(set_field("mix_balance", "\"x\""), -1, "类型不对时报错");
+        let json = settings::current_params_json();
+        assert_eq!((json["duo_ms"].as_f64(), json["mix_follow"].as_bool()), (Some(80.0), Some(false)));
+        for rate in [48_000usize, 44_100] {
+            let mut p = Processor::new(rate);
+            assert!(p.duo.is_some());
+            let voice = auto_asmr::dsp::testsig::test_voice(8.0 * rate as f32 / 48_000.0);
+            let mut x: Vec<f32> = voice.iter().flat_map(|&v| [v, v]).collect();
+            for c in x.chunks_mut(2 * 960) {
+                p.process(c);
+            }
+            let t = tele_of(&p);
+            assert_eq!(t[6], 1.0, "{rate} Hz：状态里应是左右双人");
+            assert!(t[0] > 180.0 && t[7] < 180.0, "{rate} Hz：1 号在左、2 号在右：{t:?}");
+            assert_eq!(p.tele.underruns.load(Ordering::Relaxed), 0, "{rate} Hz 断流");
+            let tail = &x[x.len() / 4..];
+            let (el, er) = tail.chunks(2).fold((0f64, 0f64), |(a, b), s| (a + (s[0] as f64).powi(2), b + (s[1] as f64).powi(2)));
+            assert!((10.0 * (el / er).log10()).abs() < 3.0, "{rate} Hz：左右两边应差不多一样响：{el} {er}");
+        }
+        let mut p = Processor::new(48_000);
+        let mut buf = vec![0f32; 2 * 4800];
+        p.process(&mut buf);
+        // 改延迟：还是同一份（只换配置，延迟淡过去）
+        let before = p.duo.as_ref().map(|d| d as *const LiveMix);
+        assert_eq!(set_field("duo_ms", "120"), 0);
+        p.process(&mut buf);
+        assert_eq!(p.duo.as_ref().map(|d| d as *const LiveMix), before);
+        assert_eq!(p.duo.as_ref().unwrap().mixer().delays()[1], 5760);
+        // 换成一起移动：重新建
+        assert_eq!(set_field("mix_follow", "true"), 0);
+        p.process(&mut buf);
+        assert!(p.duo.as_ref().unwrap().mixer().is_follow());
+        // 拖回 0：回到单个引擎
+        assert_eq!(set_field("duo_ms", "0"), 0);
+        p.process(&mut buf);
+        assert!(p.duo.is_none());
+        assert_eq!(tele_of(&p)[6], 0.0);
+        settings::update_doc("mix_follow", serde_json::json!(false)).unwrap();
+        update_params(|p| {
+            *p = Params::default();
+            Ok(())
+        })
+        .unwrap();
+    }
+
+    /// 网页声音里没有雨声：打开雨声、再改别的参数之后，处理器换上的仍是去掉背景音的配置（雨声只在单独的输出流里），
+    /// 左右双人时也一样。
+    #[test]
+    fn web_audio_never_gets_the_rain() {
+        let _g = settings::TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        settings::provide_repo_data();
+        for duo in ["0", "80"] {
+            assert_eq!(set_field("duo_ms", duo), 0);
+            let mut p = Processor::new(48_000);
+            update_params(|q| {
+                *q = Params { bg_level: 80.0, ..Params::default() };
+                Ok(())
+            })
+            .unwrap();
+            update_params(|q| settings::set_field(q, "presence_db", serde_json::json!(5.0))).unwrap();
+            let mut buf = vec![0f32; 2 * 48_000 * 2];
+            for c in buf.chunks_mut(2 * 960) {
+                c.fill(0.0);
+                p.process(c);
+            }
+            let peak = buf[buf.len() / 2..].iter().fold(0f32, |m, v| m.max(v.abs()));
+            assert!(peak < 1e-4, "左右双人 {duo} ms：网页没有声音时输出了 {peak}（混进了雨声）");
+        }
+        assert_eq!(set_field("duo_ms", "0"), 0);
+        update_params(|p| {
+            *p = Params::default();
+            Ok(())
+        })
+        .unwrap();
     }
 
     /// 单独输出的雨声：响度和桌面版引擎里的一样（同一个式子），关掉后淡出、停下；网页声音的配置里没有雨声。
