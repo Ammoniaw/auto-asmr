@@ -597,7 +597,7 @@ impl App {
 
     /// 当前合成用的自动平衡数据（强度为 0、或音频还没准备好时没有）。
     fn cur_balance(&self) -> Option<Arc<BalanceData>> {
-        // 实时页的左右双人没有自动平衡（要事先知道整段的响度）
+        // 实时页的左右双人：输入响度由混音器边听边算，不用这份事先算好的数据
         if self.s.mix_balance <= 0.0 || self.mic_duo() {
             return None;
         }
@@ -1530,6 +1530,11 @@ impl App {
     }
 
     fn ui_realtime(&mut self, ui: &mut egui::Ui) {
+        // 左右双人和文件页一样放在设备、位置图上面，三行（延迟、两个声音、排布和自动平衡）也和文件页一模一样
+        ui.group(|ui| {
+            ui.set_width(ui.available_width());
+            self.ui_duo_block(ui, false, true);
+        });
         self.ui_devices(ui, true);
         self.ui_status(ui);
         ui.horizontal(|ui| {
@@ -1550,7 +1555,6 @@ impl App {
                 }
             }
         });
-        self.ui_rt_duo(ui);
         ui.label(
             RichText::new(t(
                 "直播时把输出设备选成虚拟声卡（如 VB-Cable / BlackHole），再在直播软件里把它当作麦克风。自己监听请戴耳机，外放听不出效果。",
@@ -1688,7 +1692,7 @@ impl App {
         });
         // 合成的排布：各自固定 / 一起移动
         if self.s.mix {
-            self.ui_layout_row(ui, busy, true);
+            self.ui_layout_row(ui, busy);
         }
         // 合成前自动对齐：同一首歌的几个版本（前奏长短不同、编曲不同），从一起开始唱的地方叠加
         if self.s.mix {
@@ -1801,9 +1805,8 @@ impl App {
         }
     }
 
-    /// 合成的排布（各自固定 / 一起移动）和自动平衡：多音频合成和左右双人共用。`balance`：显示自动平衡
-    /// （实时页的左右双人没有：它要事先知道整段的响度）。
-    fn ui_layout_row(&mut self, ui: &mut egui::Ui, busy: bool, balance: bool) {
+    /// 合成的排布（各自固定 / 一起移动）和自动平衡：多音频合成和左右双人（文件页、实时页）共用。
+    fn ui_layout_row(&mut self, ui: &mut egui::Ui, busy: bool) {
         ui.horizontal(|ui| {
             ui.label(t("排布", "Layout"));
             let mut follow = self.s.mix_follow;
@@ -1818,14 +1821,11 @@ impl App {
             if follow != self.s.mix_follow {
                 self.set_mix_follow(follow);
             }
-            if !balance {
-                return;
-            }
             // 自动平衡（0 = 关）：和排布放在一行，不多占高度
             ui.add_space(8.0);
             ui.label(t("自动平衡", "Balance")).on_hover_text(t(
-                "让几个声音每一段时间听起来都差不多一样响（比如一左一右时左右两边差不多大）。合成本来就按整段平均响度对齐，但两个声音各自忽远忽近，常常一个退开了另一个正贴着耳朵，内容本身也有响有轻。这里按每个声音此刻听起来多响（空间化之后：输入的 3 秒短时响度 + 它此刻位置带来的增益）往平均拉，最多 ±15 dB，0.25 秒平滑；停顿里的声音不往上拉。数值 = 强度：100% = 一样响，50% = 差距减半，0 = 关闭。一个声音单独退开时也会被补回一部分，所以忽远忽近的响度变化会变小（方向、远耳、音色这些远近线索照常）。试听时实时生效，合成完成后的说明里有平衡前后的响度差",
-                "Keeps the voices about equally loud at every moment (e.g. left and right sides about the same). The mix already matches their overall loudness, but each voice sways near and far on its own, so often one has pulled back while the other is at the ear, and the content itself gets louder and softer. This pulls each voice toward the average of how loud they sound right now (after spatialization: 3-second input loudness plus the gain of its current position), at most ±15 dB, smoothed over 0.25 s; voices in a pause are not lifted. Value = strength: 100% = equal, 50% = half the gap, 0 = off. A voice that pulls back on its own is partly made up for, so near / far loudness changes get smaller (direction, far-ear and tone cues remain). Works live in Preview; the report after Mix & save shows the gap before and after",
+                "让几个声音每一段时间听起来都差不多一样响（比如一左一右时左右两边差不多大）。合成本来就按整段平均响度对齐，但两个声音各自忽远忽近，常常一个退开了另一个正贴着耳朵，内容本身也有响有轻。这里按每个声音此刻听起来多响（空间化之后：输入的 3 秒短时响度 + 它此刻位置带来的增益）往平均拉，最多 ±15 dB，0.25 秒平滑；停顿里的声音不往上拉。数值 = 强度：100% = 一样响，50% = 差距减半，0 = 关闭。一个声音单独退开时也会被补回一部分，所以忽远忽近的响度变化会变小（方向、远耳、音色这些远近线索照常）。试听时实时生效，合成完成后的说明里有平衡前后的响度差。主播模式的左右双人也一样，只是响度边听边算（只能往回看），运行中实时生效",
+                "Keeps the voices about equally loud at every moment (e.g. left and right sides about the same). The mix already matches their overall loudness, but each voice sways near and far on its own, so often one has pulled back while the other is at the ear, and the content itself gets louder and softer. This pulls each voice toward the average of how loud they sound right now (after spatialization: 3-second input loudness plus the gain of its current position), at most ±15 dB, smoothed over 0.25 s; voices in a pause are not lifted. Value = strength: 100% = equal, 50% = half the gap, 0 = off. A voice that pulls back on its own is partly made up for, so near / far loudness changes get smaller (direction, far-ear and tone cues remain). Works live in Preview; the report after Mix & save shows the gap before and after. The real-time two voices work the same way, with loudness measured as it comes in (looking back only), live while running",
             ));
             ui.spacing_mut().slider_width = 90.0;
             let slider = egui::Slider::new(&mut self.s.mix_balance, 0.0..=100.0)
@@ -1837,40 +1837,59 @@ impl App {
         });
     }
 
-    /// 左右双人：一个音频当成两个人（同一个声音一左一右，第 2 个晚一点）。多音频合成生效时不显示。
-    /// 打开后下面一行是两个声音的位置 / 音量，再下面是排布和自动平衡（和多音频合成共用）。
+    /// 文件页的左右双人：一个音频当成两个人。多音频合成生效时不显示。
     fn ui_duo(&mut self, ui: &mut egui::Ui, busy: bool) {
         if self.multi() {
             return; // 多音频合成时用不上，也不占地方
         }
-        let tip = t(
-            "把一个音频当成两个人：同一个声音一个在左耳、一个在右耳（和导入两个音频的多音频合成一样，各自忽远忽近），第 2 个整体晚这么多毫秒，听得出是两个人一前一后地说。30 ms 以下两边容易融成一个声音（听起来偏在先到的那一边），50–120 ms 像两个人，150 ms 以上像回声。打开后下面可以改两个声音的位置、音量、排布和自动平衡；试听中拖这个滑条实时生效。输出比原音频长出这段延迟。列表里有几个音频时，试听的是选中的那个，「全部转换」时每个文件都这样做。0 = 关闭",
-            "Turns one file into two people: the same voice at the left ear and at the right ear (like mixing two files: each sways near and far on its own), the second one this many milliseconds later, so you hear two people speaking one after the other. Below about 30 ms the two tend to fuse into one voice (heard on the earlier side); 50–120 ms sounds like two people; above 150 ms it sounds like an echo. When on, the two voices' positions, volumes, layout and balance can be set below; dragging this slider during Preview takes effect live. The output is longer by the delay. With several files in the list, Preview plays the selected one and Convert all does this to every file. 0 = off",
-        );
+        self.ui_duo_block(ui, busy, false);
+    }
+
+    /// 左右双人这一块，文件页和实时（主播）页共用、一模一样：延迟滑条和提示；打开后下面一行是两个声音的位置 / 音量，
+    /// 再下面是排布和自动平衡（和多音频合成共用）。`live`：实时页（麦克风的声音，延迟单独记在 `rt_duo_ms`；
+    /// 运行中从 0 拖上来、拖回 0 时重新开始一下）。
+    fn ui_duo_block(&mut self, ui: &mut egui::Ui, busy: bool, live: bool) {
+        let tip = if live {
+            t(
+                "把你的声音变成两个人：同一个声音一个在左耳、一个在右耳（各自忽远忽近），第 2 个整体晚这么多毫秒，听起来是两个人一前一后地说。30 ms 以下两边容易融成一个声音（听起来偏在先到的那一边），50–120 ms 像两个人，150 ms 以上像回声。只有第 2 个声音晚，第 1 个和平时一样及时。打开后下面可以改两个声音的位置、音量、排布和自动平衡；运行中拖这个滑条实时生效，从 0 拖上来或拖回 0 时会重新开始一下。处理量约是平时的两倍。0 = 关闭",
+                "Turns your voice into two people: the same voice at the left ear and at the right ear (each sways near and far on its own), the second one this many milliseconds later, so it sounds like two people speaking one after the other. Below about 30 ms the two tend to fuse into one voice (heard on the earlier side); 50–120 ms sounds like two people; above 150 ms it sounds like an echo. Only the second voice is delayed; the first is as immediate as usual. When on, the two voices' positions, volumes, layout and balance can be set below; dragging this slider while running takes effect live, and turning it on or off restarts briefly. Uses about twice the processing. 0 = off",
+            )
+        } else {
+            t(
+                "把一个音频当成两个人：同一个声音一个在左耳、一个在右耳（和导入两个音频的多音频合成一样，各自忽远忽近），第 2 个整体晚这么多毫秒，听得出是两个人一前一后地说。30 ms 以下两边容易融成一个声音（听起来偏在先到的那一边），50–120 ms 像两个人，150 ms 以上像回声。打开后下面可以改两个声音的位置、音量、排布和自动平衡；试听中拖这个滑条实时生效。输出比原音频长出这段延迟。列表里有几个音频时，试听的是选中的那个，「全部转换」时每个文件都这样做。0 = 关闭",
+                "Turns one file into two people: the same voice at the left ear and at the right ear (like mixing two files: each sways near and far on its own), the second one this many milliseconds later, so you hear two people speaking one after the other. Below about 30 ms the two tend to fuse into one voice (heard on the earlier side); 50–120 ms sounds like two people; above 150 ms it sounds like an echo. When on, the two voices' positions, volumes, layout and balance can be set below; dragging this slider during Preview takes effect live. The output is longer by the delay. With several files in the list, Preview plays the selected one and Convert all does this to every file. 0 = off",
+            )
+        };
+        let ms = if live { self.s.rt_duo_ms } else { self.s.duo_ms };
         ui.horizontal(|ui| {
             ui.add_enabled_ui(!busy, |ui| {
                 ui.label(t("左右双人", "Two voices")).on_hover_text(tip);
                 ui.spacing_mut().slider_width = 140.0;
-                let mut v = self.s.duo_ms;
+                let mut v = ms;
                 if ui.add(duo_slider(&mut v)).on_hover_text(tip).changed() {
-                    self.set_duo(v);
+                    if live {
+                        self.set_rt_duo(v);
+                    } else {
+                        self.set_duo(v);
+                    }
                 }
             });
-            let note = if self.s.duo_ms <= 0.0 {
+            let note = if ms <= 0.0 {
                 t("同一个声音一左一右两个人说", "same voice on both sides")
-            } else if self.files.len() > 1 {
+            } else if !live && self.files.len() > 1 {
                 t("转换时每个文件都这样", "applies to every file")
             } else {
                 t("50–120 ms 最像两个人", "50–120 ms: most like two people")
             };
             ui.label(RichText::new(note).small().weak());
         });
-        if !self.duo() {
+        if !(if live { self.mic_duo() } else { self.duo() }) {
             return;
         }
-        self.ui_duo_voices(ui, busy, self.s.duo_ms);
-        if !self.s.mix {
-            self.ui_layout_row(ui, busy, true);
+        self.ui_duo_voices(ui, busy, ms);
+        // 文件页勾着多音频合成（但只有一个音频）时，排布已经在合成开关下面了
+        if live || !self.s.mix {
+            self.ui_layout_row(ui, busy);
         }
     }
 
@@ -1901,30 +1920,6 @@ impl App {
                 self.duo_voices[k] = v;
             }
         });
-    }
-
-    /// 实时（主播）页的左右双人：麦克风的声音变成一左一右两个人，第 2 个晚一点。下面是两个声音的位置 / 音量和排布
-    /// （没有自动平衡）。运行中拖滑条实时生效；从 0 拖上来、拖回 0 时重新开始一下。
-    fn ui_rt_duo(&mut self, ui: &mut egui::Ui) {
-        let tip = t(
-            "把你的声音变成两个人：同一个声音一个在左耳、一个在右耳（各自忽远忽近），第 2 个整体晚这么多毫秒，听起来是两个人一前一后地说。30 ms 以下两边容易融成一个声音（听起来偏在先到的那一边），50–120 ms 像两个人，150 ms 以上像回声。只有第 2 个声音晚，第 1 个和平时一样及时。打开后下面可以改两个声音的位置、音量和排布；运行中拖这个滑条实时生效，从 0 拖上来或拖回 0 时会重新开始一下。处理量约是平时的两倍。0 = 关闭",
-            "Turns your voice into two people: the same voice at the left ear and at the right ear (each sways near and far on its own), the second one this many milliseconds later, so it sounds like two people speaking one after the other. Below about 30 ms the two tend to fuse into one voice (heard on the earlier side); 50–120 ms sounds like two people; above 150 ms it sounds like an echo. Only the second voice is delayed; the first is as immediate as usual. When on, the two voices' positions, volumes and layout can be set below; dragging this slider while running takes effect live, and turning it on or off restarts briefly. Uses about twice the processing. 0 = off",
-        );
-        ui.horizontal(|ui| {
-            ui.label(t("左右双人", "Two voices")).on_hover_text(tip);
-            ui.spacing_mut().slider_width = 140.0;
-            let mut v = self.s.rt_duo_ms;
-            if ui.add(duo_slider(&mut v)).on_hover_text(tip).changed() {
-                self.set_rt_duo(v);
-            }
-            let note = if self.s.rt_duo_ms <= 0.0 { t("你的声音一左一右两个人说", "your voice on both sides") } else { t("50–120 ms 最像两个人", "50–120 ms: most like two people") };
-            ui.label(RichText::new(note).small().weak());
-        });
-        if !self.mic_duo() {
-            return;
-        }
-        self.ui_duo_voices(ui, false, self.s.rt_duo_ms);
-        self.ui_layout_row(ui, false, false);
     }
 
     /// 文件列表右侧的状态：等待 / 进度条 / 完成 / 失败。
@@ -2478,10 +2473,14 @@ impl App {
             let bal = self.cur_balance();
             if let Some(lufs) = lufs {
                 let strength = self.s.mix_balance / 100.0;
-                let bal_changed = self.mix_sent.as_ref().map_or(true, |(_, st)| match (&st.balance, &bal) {
-                    (None, None) => false,
-                    (Some(a), Some(b)) => !Arc::ptr_eq(a, b) || st.balance_strength != strength,
-                    _ => true,
+                // 强度单独比：实时页的左右双人没有事先算好的数据（混音器边听边算），只看强度
+                let bal_changed = self.mix_sent.as_ref().map_or(true, |(_, st)| {
+                    st.balance_strength != strength
+                        || match (&st.balance, &bal) {
+                            (None, None) => false,
+                            (Some(a), Some(b)) => !Arc::ptr_eq(a, b),
+                            _ => true,
+                        }
                 });
                 let delays_changed = self.mix_sent.as_ref().map_or(true, |(_, st)| st.delays[..] != self.mix_delays()[..st.delays.len()]);
                 if changed || bal_changed || delays_changed || self.mix_sent.as_ref().map_or(true, |(v, _)| *v != self.mix_voices()) {

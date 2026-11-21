@@ -6,7 +6,8 @@
 //!
 //! - 声音 k 此刻听起来多响 = 它输入的短时响度（以当前时刻为中心的 3 秒，K 加权，加上整段对齐的增益）
 //!   + 它此刻的"位置增益"（引擎输出与输入的 K 加权能量之比，0.3 秒平滑；只跟位置有关，不随字句起伏）。
-//!   输入的短时响度由整段事先算好（[`BalanceData`]），试听和文件转换用的是同一份。
+//!   输入的短时响度由整段事先算好（[`BalanceData`]），试听和文件转换用的是同一份；主播模式的左右双人没法事先算，
+//!   边听边算（[`LiveLevels`]：只往回看，两个声音都是麦克风，共用一份）。
 //! - 在出声的几个声音（不在自己的长停顿里）取平均作为目标，各自要补的分贝 = 目标 − 自己（最多 ±15 dB），乘上强度
 //!   （0–100%：100% = 一样响，50% = 差距减半），0.25 秒平滑地加到它的输出上。停顿里的声音沿用之前的增益，不会把底噪拉上来。
 //!
@@ -27,6 +28,12 @@ const PAUSE_DB: f32 = 15.0;
 pub const STEP: usize = 64;
 const TRANSFER_TAU: f32 = 0.3;
 const GAIN_TAU: f32 = 0.25;
+
+/// 平衡器要的输入响度：事先由整段算好的 [`BalanceData`]，或主播模式边听边算的 [`LiveLevels`]。
+pub trait Levels {
+    /// 第 k 个声音的输入在第 `sample` 个样本处的（K 加权均方, 短时响度, 是否在出声）；没有数据时是无声。
+    fn at(&self, k: usize, sample: i64) -> (f32, f32, bool);
+}
 
 /// 一段音频每 10 ms 的 K 加权均方（最后不满 10 ms 的也算一个点）。
 pub fn levels(x: &[f32]) -> Vec<f32> {
@@ -61,8 +68,10 @@ impl BalanceData {
         }
         BalanceData { lv: levels.iter().map(|l| l.to_vec()).collect(), st, active }
     }
+}
 
-    /// 第 k 段第 `sample` 个样本处的（K 加权均方, 短时响度, 是否在出声）；超出这一段时是无声。
+impl Levels for BalanceData {
+    /// 第 k 段第 `sample` 个样本处的值；超出这一段时是无声。
     fn at(&self, k: usize, sample: i64) -> (f32, f32, bool) {
         if sample < 0 {
             return (0.0, -120.0, false);
@@ -110,6 +119,113 @@ fn own_loudness(l: &[f32]) -> f32 {
     lufs(gated(rel)) as f32
 }
 
+/// 边听边算时记多少个点（5.12 秒）：要装得下短时响度的 3 秒窗，再加左右双人最长的延迟（300 ms）和引擎时延。
+const LIVE_RING: usize = 512;
+const _: () = assert!(LIVE_RING >= WIN + 2 * MOM);
+/// 边听边算的"说话响度"往上、往下跟过去的时间常数（秒）。
+const OWN_UP: f32 = 2.0;
+const OWN_DOWN: f32 = 20.0;
+
+/// 主播模式边听边算的输入响度（只能往回看）。左右双人的两个声音都是麦克风，所以只记一份时间线上的麦克风，
+/// 各声音按自己的延迟往回取（[`Levels::at`] 不看 k）。和整段事先算好的 [`BalanceData`] 的区别：
+///
+/// - 短时响度取**过去** 3 秒里出声的部分（不是以当前为中心）；是否在出声看过去 0.4 秒。
+/// - "自己的整段响度"换成慢慢跟着走的说话响度：400 ms 一块，高于 −70 LUFS、且不低于它 10 dB 的块才算
+///   （和整段响度的两道门限一样），往上 2 秒、往下 20 秒跟过去。还没有说过话时一律算停顿。
+/// - 正在攒的这 10 ms 还没有值，用最近完成的那一点代替。
+///
+/// 两个声音的短时响度相同，平衡时互相抵消，起作用的是位置增益（和文件的左右双人一样）。不分配内存，可以在音频线程里用。
+pub struct LiveLevels {
+    kw: KWeight,
+    acc: f64,
+    n: usize,
+    /// 已经完成了多少个点；各点按 `序号 % LIVE_RING` 放。
+    hops: usize,
+    lv: Vec<f32>,
+    st: Vec<f32>,
+    act: Vec<bool>,
+    blk: f64,
+    blk_n: usize,
+    own: Option<f32>,
+}
+
+impl Default for LiveLevels {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl LiveLevels {
+    pub fn new() -> Self {
+        LiveLevels { kw: KWeight::new(), acc: 0.0, n: 0, hops: 0, lv: vec![0.0; LIVE_RING], st: vec![-120.0; LIVE_RING], act: vec![false; LIVE_RING], blk: 0.0, blk_n: 0, own: None }
+    }
+
+    /// 送进时间线上接下来的输入样本（从第 0 个样本起连续送）。
+    pub fn feed(&mut self, x: &[f32]) {
+        for &v in x {
+            let y = self.kw.process(v) as f64;
+            self.acc += y * y;
+            self.n += 1;
+            if self.n == HOP {
+                self.push((self.acc / HOP as f64) as f32);
+                self.acc = 0.0;
+                self.n = 0;
+            }
+        }
+    }
+
+    /// 完成一个点（10 ms 的 K 加权均方 `ms`）：更新说话响度，算这一点是否在出声、短时响度。
+    fn push(&mut self, ms: f32) {
+        let h = self.hops;
+        let i = h % LIVE_RING;
+        self.lv[i] = ms;
+        self.blk += ms as f64;
+        self.blk_n += 1;
+        if self.blk_n == MOM {
+            let l = lufs(self.blk / MOM as f64);
+            match self.own {
+                _ if l <= -70.0 => {}
+                None => self.own = Some(l),
+                Some(o) if l > o - 10.0 => {
+                    let tau = if l > o { OWN_UP } else { OWN_DOWN };
+                    let a = 1.0 - (-((MOM * HOP) as f32) / FS / tau).exp();
+                    self.own = Some(o + a * (l - o));
+                }
+                Some(_) => {}
+            }
+            self.blk = 0.0;
+            self.blk_n = 0;
+        }
+        // 往回第 j 个点（0 = 这一点）放在哪
+        let have = (h + 1).min(LIVE_RING);
+        let back = move |j: usize| (h + LIVE_RING - j) % LIVE_RING;
+        let nm = have.min(MOM);
+        let mom = lufs((0..nm).map(|j| self.lv[back(j)] as f64).sum::<f64>() / nm as f64);
+        self.act[i] = self.own.is_some_and(|o| mom > o - PAUSE_DB) && mom > -60.0;
+        let (mut s, mut c) = (0f64, 0usize);
+        for b in (0..have.min(WIN)).map(back).filter(|&b| self.act[b]) {
+            s += self.lv[b] as f64;
+            c += 1;
+        }
+        self.st[i] = lufs(if c == 0 { 0.0 } else { s / c as f64 });
+        self.hops = h + 1;
+    }
+}
+
+impl Levels for LiveLevels {
+    fn at(&self, _k: usize, sample: i64) -> (f32, f32, bool) {
+        if sample < 0 || self.hops == 0 {
+            return (0.0, -120.0, false);
+        }
+        let j = (sample as usize / HOP).min(self.hops - 1);
+        if self.hops - j > LIVE_RING {
+            return (0.0, -120.0, false);
+        }
+        let i = j % LIVE_RING;
+        (self.lv[i], self.st[i], self.act[i])
+    }
+}
+
 /// 一个声音的运行状态。
 #[derive(Clone)]
 struct VoiceState {
@@ -142,7 +258,7 @@ impl Balancer {
     /// 处理一块：`outs[k]` 是声音 k 的引擎输出（左, 右），前 `m` 个样本就地乘上平衡增益。`in_pos`：这一块对应的输入
     /// 在时间线上的位置（= 输出位置 − 引擎时延）；`delays[k]`：声音 k 比时间线晚多少个样本（左右双人的第 2 个声音），
     /// 它的输入响度按 `in_pos − delays[k]` 取；`strength`：0–1。按 64 个样本一步更新，块长是 64 的整数倍时结果与块长无关。
-    pub fn process(&mut self, data: &BalanceData, strength: f32, in_pos: i64, delays: &[usize], outs: &mut [[Vec<f32>; 2]], m: usize) {
+    pub fn process(&mut self, data: &impl Levels, strength: f32, in_pos: i64, delays: &[usize], outs: &mut [[Vec<f32>; 2]], m: usize) {
         let n = outs.len().min(self.vs.len());
         let m = outs.iter().map(|o| o[0].len().min(o[1].len())).fold(m, usize::min);
         let mut s = 0;
@@ -198,6 +314,11 @@ impl Balancer {
             }
             s += len;
         }
+    }
+
+    /// 各声音的平衡增益都已回到 0 dB 附近（±0.05 dB）：强度调到 0 之后，到这时就可以不再处理了。
+    pub fn settled(&self) -> bool {
+        self.vs.iter().all(|v| v.gain_db.abs() < 0.05 && (v.g - 1.0).abs() < 0.006)
     }
 
     /// 几个声音都在出声时，最响和最轻相差多少：平衡前、后的（中位数, 90% 分位）dB；还没有数据时为 None。
@@ -329,5 +450,75 @@ mod tests {
             }
         }
         assert!(max_gain < 1.0, "停顿里增益到了 {max_gain:.1} dB");
+    }
+
+    /// 主播模式的左右双人：两个声音是同一个输入 `x`，2 号晚 `d` 个样本，输出 = 输入 × 位置增益，每 64 个样本处理一次。
+    /// `live`：输入响度边听边算（[`LiveLevels`]），否则由整段事先算好。返回平衡器（统计）和 `hold` 这段时间里 2 号增益变了多少。
+    fn run_duo(x: &[f32], d: usize, pa: &[(f32, f32)], pb: &[(f32, f32)], live: bool, hold: (f32, f32)) -> (Balancer, f32) {
+        let y: Vec<f32> = (0..x.len()).map(|i| if i >= d { x[i - d] } else { 0.0 }).collect();
+        let lv = levels(x);
+        let data = BalanceData::new(&[&lv, &lv], &[0.0, 0.0]);
+        let mut live_lv = LiveLevels::new();
+        let (a, b) = (shaped(x, pa), shaped(&y, pb));
+        let mut bal = Balancer::new(2);
+        let (h0, h1) = ((hold.0 * FS) as usize, (hold.1 * FS) as usize);
+        let (mut g_lo, mut g_hi) = (f32::MAX, f32::MIN);
+        for o in (0..x.len()).step_by(STEP) {
+            let e = (o + STEP).min(x.len());
+            let mut bufs = vec![[a[o..e].to_vec(), a[o..e].to_vec()], [b[o..e].to_vec(), b[o..e].to_vec()]];
+            if live {
+                live_lv.feed(&x[o..e]);
+                bal.process(&live_lv, 1.0, o as i64, &[0, d], &mut bufs, e - o);
+            } else {
+                bal.process(&data, 1.0, o as i64, &[0, d], &mut bufs, e - o);
+            }
+            if o >= h0 && o < h1 {
+                (g_lo, g_hi) = (g_lo.min(bal.gain_db(1)), g_hi.max(bal.gain_db(1)));
+            }
+        }
+        (bal, g_hi - g_lo)
+    }
+
+    #[test]
+    fn live_levels_balance_like_the_precomputed_ones() {
+        // 同一个声音，2 号晚 80 ms；它的"位置"在 6–14 秒退开 9 dB，其间 10–13 秒两个都停顿（无声）。
+        // 边听边算的输入响度（只能往回看）和整段事先算好的平衡效果差不多；停顿里 2 号的增益不动
+        let v = test_voice(24.0);
+        let x = shaped(&v, &[(10.0, 0.0), (3.0, -90.0), (11.0, 0.0)]);
+        let pa = [(24.0, 0.0)];
+        let pb = [(6.0, 0.0), (8.0, -9.0), (10.0, 0.0)];
+        let (pre, _) = run_duo(&x, 3840, &pa, &pb, false, (0.0, 0.0));
+        let (live, moved) = run_duo(&x, 3840, &pa, &pb, true, (10.6, 13.0));
+        let ((b5, b9), (p5, p9)) = pre.stats().unwrap();
+        let ((_, _), (l5, l9)) = live.stats().unwrap();
+        println!("左右双人的自动平衡：响度差 中位 / 90% {b5:.1} / {b9:.1} dB → 整段事先算 {p5:.1} / {p9:.1}，边听边算 {l5:.1} / {l9:.1}；停顿里 2 号增益变了 {moved:.2} dB");
+        assert!(b9 > 8.0 && l5 < 1.0 && l9 < p9 + 1.5, "{b5:.1} / {b9:.1} → 事先 {p5:.1} / {p9:.1}，边听边算 {l5:.1} / {l9:.1}");
+        assert!(moved < 0.5, "停顿里 2 号增益变了 {moved:.2} dB");
+    }
+
+    #[test]
+    fn live_levels_look_back_only_and_detect_pauses() {
+        // 边听边算：还没送到的时刻用最近完成的点；停顿开始后 0.4 秒内判为停顿，说话恢复后 0.4 秒内判为出声；
+        // 超过记得住的范围（5 秒多）就当无声
+        let v = test_voice(12.0);
+        let x = shaped(&v, &[(5.0, 0.0), (3.0, -90.0), (4.0, 0.0)]);
+        let mut lv = LiveLevels::new();
+        assert_eq!(lv.at(0, 0), (0.0, -120.0, false));
+        lv.feed(&x);
+        let sec = |s: f32| (s * FS) as i64;
+        assert_eq!(lv.at(0, sec(12.0) + 10_000), lv.at(1, sec(12.0) - 1));
+        assert_eq!(lv.at(0, sec(4.5)), (0.0, -120.0, false), "5 秒多以前的不再记得");
+        // 测试人声每 2.2 秒有 0.7 秒的小停顿，9.6 秒在一句话中间
+        assert!(lv.at(0, sec(9.6)).2);
+        let mut lv = LiveLevels::new();
+        let mut act = Vec::new();
+        for c in x.chunks(HOP) {
+            lv.feed(c);
+            act.push(lv.at(0, i64::MAX / 2).2);
+        }
+        let t = |s: f32| (s * 100.0) as usize;
+        assert!(act[t(2.0)..t(5.0)].iter().filter(|&&a| a).count() > t(2.1), "说话时大多判为出声");
+        assert!(act[t(5.4)..t(8.0)].iter().all(|&a| !a), "停顿 0.4 秒后都判为停顿");
+        assert!(act[t(8.4)..t(9.0)].iter().any(|&a| a), "说话恢复后 0.4 秒内判为出声");
     }
 }

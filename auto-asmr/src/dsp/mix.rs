@@ -15,7 +15,7 @@
 //! 各音源先按输入响度（BS.1770 积分响度）对齐到同样响，再加上各自的音量增减；相加之后整体收尾——
 //! 文件转换是两遍精确归一化（与转换单个文件相同），试听是自动响度 + 限制器（与单个文件的实时引擎相同）。
 
-use super::balance::{BalanceData, Balancer};
+use super::balance::{BalanceData, Balancer, LiveLevels};
 use super::dynamics::{Leveler, Limiter, LoudnessMeter};
 use super::engine::{sync_rain, Engine, EngineConfig, PostMode, Telemetry};
 use super::rain::Rain;
@@ -145,7 +145,8 @@ pub struct MixSetup {
     pub offsets: Vec<f32>,
     /// 一起移动：几个音源共用一个说话时钟、同一套走位，位置按 `offsets` 错开。
     pub follow: bool,
-    /// 自动平衡：各音源事先由整段算好的输入响度（None = 不平衡）和强度（0–1）。
+    /// 自动平衡：各音源事先由整段算好的输入响度（None = 不平衡）和强度（0–1）。主播模式（[`Mixer::set_live`]）
+    /// 的输入响度由混音器边听边算，不看 `balance`，只看强度。
     pub balance: Option<Arc<BalanceData>>,
     pub balance_strength: f32,
     /// 各音源比时间线晚多少个样本（左右双人：[0, 延迟]；多音频合成全是 0）。延迟由读输入的一方加
@@ -249,6 +250,8 @@ pub struct Mixer {
     bal_data: Option<Arc<BalanceData>>,
     bal_strength: f32,
     balancer: Balancer,
+    /// 主播模式：边听边算的输入响度（1 号声音的输入就是时间线上的麦克风）。
+    live_lv: Option<LiveLevels>,
     pos: usize,
     /// 各音源的延迟（样本，见 [`MixSetup::delays`]）。
     delays: [usize; MAX_VOICES],
@@ -285,6 +288,7 @@ impl Mixer {
             bal_data: setup.balance.clone(),
             bal_strength: setup.balance_strength,
             balancer: Balancer::new(n),
+            live_lv: None,
             pos: 0,
             delays: delay_array(&setup.delays),
             out_pk: 0.0,
@@ -316,10 +320,13 @@ impl Mixer {
 
     /// 主播模式（麦克风）：每个声音的引擎都按 [`Engine::set_live`]——停顿超过 1 秒后动作恢复正常速度。
     /// 一起移动时几个引擎共用说话时钟（各自数停顿，但数的是同一个说话活动），所以仍然同步。
+    /// 自动平衡的输入响度改成边听边算（[`LiveLevels`]，各声音的输入都是同一个麦克风、按自己的延迟取）。
+    /// 会分配内存，要在开始处理之前调用。
     pub fn set_live(&mut self, on: bool) {
         for e in self.engines.iter_mut() {
             e.set_live(on);
         }
+        self.live_lv = on.then(LiveLevels::new);
     }
 
     /// 换配置（在各引擎的控制块边界生效）：参数、位置、音量。不分配内存，可以在音频线程里调用；
@@ -421,9 +428,15 @@ impl Mixer {
             }
         }
         // 自动平衡：各音源空间化之后、相加之前，按此刻听起来多响补增益（引擎有时延：这一块输出对应更早的输入）
-        if let Some(d) = &self.bal_data {
-            let in_pos = (self.pos + o) as i64 - self.engines[0].latency_samples() as i64;
-            self.balancer.process(d, self.bal_strength, in_pos, &self.delays, &mut self.buf, m);
+        let in_pos = (self.pos + o) as i64 - self.engines[0].latency_samples() as i64;
+        if let Some(lv) = &mut self.live_lv {
+            // 主播模式：输入响度边听边算（一直记着，随时打开都有过去几秒的数据）；强度调到 0 后增益慢慢回到 0 dB 再停
+            lv.feed(input(0));
+            if self.bal_strength > 0.0 || !self.balancer.settled() {
+                self.balancer.process(lv, self.bal_strength, in_pos, &self.delays, &mut self.buf, m);
+            }
+        } else if let Some(d) = &self.bal_data {
+            self.balancer.process(d.as_ref(), self.bal_strength, in_pos, &self.delays, &mut self.buf, m);
         }
         out_l.fill(0.0);
         out_r.fill(0.0);

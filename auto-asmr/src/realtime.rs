@@ -1263,6 +1263,51 @@ mod tests {
     }
 
     #[test]
+    fn mic_duo_balance_evens_out_the_two_voices_live() {
+        // 一左一右、2 号放远（离头 0.6 m）：不平衡时右边明显轻。自动平衡 100%（输入响度边听边算）后两个声音差不多一样响，
+        // 左右差也小了很多；运行中把强度调回 0，增益慢慢回到 0 dB，之后不再处理（和从没打开过的输出逐样本相同）
+        use crate::dsp::mix::Voice;
+        let x = crate::cli::test_voice(16.0);
+        let base = Arc::new(EngineConfig::new(Params { auto_level: false, ..Params::default() }, None));
+        let voices = [Voice::preset(0), Voice { dist: Some(0.6), ..Voice::preset(1) }];
+        let setup = |s: f32| Arc::new(MixSetup::new(&base, &voices, &[None, None], false, None).with_delays(&[0, 3840]).with_balance(None, s));
+        let run = |strength: f32, off_at: Option<usize>| {
+            let (mut pump, mut tx, _) = mic_duo_pump(&setup(strength), true);
+            let (mut l, mut r) = (vec![0f32; 256], vec![0f32; 256]);
+            let (mut el, mut er) = (0f64, 0f64);
+            let mut out: Vec<f32> = Vec::new();
+            for (j, c) in x.chunks_exact(256).enumerate() {
+                if Some(j) == off_at {
+                    if let Proc::Mix(m) = &mut pump.proc {
+                        m.set_setup(&setup(0.0));
+                    }
+                }
+                tx.push_slice(c);
+                pump.fill(&mut l, &mut r);
+                if j > 4 * FS_USIZE / 256 {
+                    el += l.iter().map(|v| (v * v) as f64).sum::<f64>();
+                    er += r.iter().map(|v| (v * v) as f64).sum::<f64>();
+                }
+                out.extend(l.iter().chain(&r));
+            }
+            let Proc::Mix(m) = &pump.proc else { unreachable!() };
+            (10.0 * (el / er).log10(), m.balance_stats(), out)
+        };
+        let (lr_off, _, plain) = run(0.0, None);
+        let (lr_on, stats, _) = run(1.0, None);
+        let ((b5, b9), (a5, a9)) = stats.expect("两个声音同时出声，应有统计");
+        println!("主播模式左右双人（2 号离头 0.6 m）：左比右 不平衡 {lr_off:.1} dB → 平衡 {lr_on:.1} dB；两个声音的响度差 中位 / 90% {b5:.1} / {b9:.1} → {a5:.1} / {a9:.1} dB");
+        assert!(b5 > 4.0 && a5 < 1.5 && a9 < b9 / 3.0, "响度差 {b5:.1} / {b9:.1} → {a5:.1} / {a9:.1} dB");
+        assert!(lr_off > 3.0 && lr_on.abs() < lr_off / 2.0, "左比右 {lr_off:.1} → {lr_on:.1} dB");
+        // 第 6 秒把强度调回 0：几秒后增益回到 0 dB（±0.05 dB 以内就停下不再处理），输出和从没打开过的一样
+        let (_, _, out) = run(1.0, Some(6 * FS_USIZE / 256));
+        let tail = 12 * FS_USIZE * 2;
+        let max_d = out[tail..].iter().zip(&plain[tail..]).map(|(a, b)| (a - b).abs()).fold(0f32, f32::max);
+        let peak = plain[tail..].iter().fold(0f32, |m, v| m.max(v.abs()));
+        assert!(max_d < peak * 0.01, "调回 0 后与从没打开过的输出相差 {max_d}（峰值 {peak}）");
+    }
+
+    #[test]
     fn mic_duo_keeps_moving_when_speech_is_sparse_and_stays_opposite() {
         // 一起移动 + 话很少（每说 1 秒停 8 秒）：主播模式的两个声音照常换边，而且始终在头的两侧相对；
         // 严格跟着说话走（试听的做法）时几乎不动
